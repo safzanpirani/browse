@@ -16,8 +16,9 @@ skill only gets a working connection.
 ~/.agents/skills/browse-remote/scripts/mac-relays.sh up       # tunnels every profile in the Mac's profiles.json
 ~/.agents/skills/browse-remote/scripts/mac-relays.sh status   # processes, then each relay's /extension/status
 
-browse profiles list                                          # relay and extension state per profile
-browse --profile work session adopt --target-url figma.com --session figma
+browse find                                                   # every profile: relay, extension, attached tabs
+browse find figma.com                                         # which profile has it, and the command to run next
+browse --profile work session adopt --tab-id 123 --session figma
 browse --profile work execute --session figma 'return page.url()'
 browse --profile work session delete figma
 
@@ -25,17 +26,21 @@ browse --profile work session delete figma
 ```
 
 `up` copies the Mac's profiles into `~/.opencode-browser-mac/profiles.json` with the ampere ports, so
-`browse --profile <name>` and `OPENCODE_BROWSER_PROFILE=<name>` work as on the Mac; `OPENCODE_BROWSER_PORT=<Mac port +
-10000>` does too. A profile added on the Mac appears after the next `up`. `profiles list` here marks every extension
-folder missing: the folders live on the Mac, ignore that line.
+`browse --profile <name>` (or an email from the profile's label), `OPENCODE_BROWSER_PROFILE=<name>` and `browse find`
+work as on the Mac; `OPENCODE_BROWSER_PORT=<Mac port + 10000>` does too. A profile added on the Mac appears after the
+next `up`. `profiles list` here marks every extension folder missing: the folders live on the Mac, ignore that line.
+`find` here shows live tabs but no visited sites, since the session journals stay on the Mac.
+
+Each profile keeps its Mac port + 10000. The profile table is in the `browse` skill, which `sync` installs here from
+the Mac:
 
 | Mac port | Ampere port (proxy) | Tunnel |
 |---|---|---|
-| 19960-19966 | 29960-29966 | 39960-39966 |
+| 19960-19966 (profiles) | 29960-29966 | 39960-39966 |
 | 19988 (plain `dist/`, `up 19988`) | 29988 | 39988 |
 
-Never tunnel or start 19989-19995 with this skill: those are browser-control's relays (skill `browser-control-remote`);
-the script refuses them. Ampere's 19990 is Rakhi's proxy.
+Never tunnel or start 19989-19995 with this skill: those are browser-control's relays, and the script refuses them.
+Ampere's 19990 is Rakhi's proxy.
 
 ## What `browse` is here
 
@@ -59,10 +64,12 @@ that follows it sends the token to whatever listens on that port here.
 `mac-relays.sh sync` copies the Mac's installed CLI (the one its `~/.local/bin/browse` runs: `dist/`,
 `package.json`, `bun.lock`, this skill) into a new `~/apps/browse/releases/<stamp>`, runs `bun install --production`
 when the dependencies changed, then points the `~/apps/browse/cli` symlink at it; it also copies the relay token and
-rewrites the launcher and this skill. One sync runs at a time (`~/apps/browse/.sync.lock`). Run it after every rebuild
-or install on the Mac. A different build on the same client protocol is only a warning; a protocol change fails until
-you sync. If `~/apps/browse/cli` is ever missing after an interrupted first sync of an old plain-folder install, put
-it back with `mv ~/apps/browse/releases/00000000-legacy-* ~/apps/browse/cli`.
+rewrites the launcher and this skill. It installs the Mac's `~/.agents/skills/browse` (the driving API) as
+`~/.agents/skills/browse` here too, with a note on this host; a browse skill here that `sync` didn't write is left
+alone. One sync runs at a time (`~/apps/browse/.sync.lock`). Run it after every rebuild or install on the Mac. A
+different build on the same client protocol is only a warning; a protocol change fails until you sync. If
+`~/apps/browse/cli` is ever missing after an interrupted first sync of an old plain-folder install, put it back with
+`mv ~/apps/browse/releases/00000000-legacy-* ~/apps/browse/cli`.
 
 First time on a new host (the skill isn't there yet):
 
@@ -93,7 +100,6 @@ open the profile; do not drive the others in his place.
   Cancel a stray multiplexed forward with `ssh -O cancel -L <spec> mac`, using the spec it was created with.
 - **`No current window`**: Chrome on the Mac has no window. Ask Safzan to open one.
 - **`status` starts with `Setup: not installed` and `omp: not set up`**: expected here, nothing is installed on
-  ampere but the CLI copy. Don't run `install`. These lines come before the JSON of `status --json` too, so parse
-  from the first `{`.
+  ampere but the CLI copy. Don't run `install`. `status --json` prints only the JSON.
 
 Logs and pids: `~/.opencode-browser-mac/mac-relays/` (`ssh.log`, `proxy.log`).

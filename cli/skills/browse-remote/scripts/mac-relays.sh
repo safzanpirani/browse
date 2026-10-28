@@ -2,7 +2,7 @@
 # Run on ampere (any Linux host with the `mac` ssh alias). Lets `browse` here drive the Mac's browser profiles:
 # ssh tunnels to the Mac's browse relays plus relay-proxy.mjs, which rewrites Host back to the Mac port.
 #
-#   mac-relays.sh sync                 # pull the Mac's built CLI, its relay token and this skill; deps when changed
+#   mac-relays.sh sync                 # pull the Mac's built CLI, its relay token, this skill and the browse skill
 #   mac-relays.sh up [port...]         # tunnel every profile in the Mac's profiles.json (or the given Mac ports)
 #   mac-relays.sh status               # tunnel and proxy processes, each relay's /extension/status (with the token)
 #   mac-relays.sh start-mac <port>...  # start (or restart) a relay on the Mac with the Mac's browse
@@ -13,21 +13,26 @@
 # profiles into this host's data root with those ports, so `browse --profile <name>` needs no port. The relay token is
 # sent only to listeners this script started and confirmed (the proxy's ready marker, the tunnel's own sockets).
 # Overrides: BROWSE_MAC_HOST (mac), BROWSE_MAC_LAUNCHER (the Mac's ~/.local/bin/browse), BROWSE_MAC_HOME (the Mac's
-# data root, ~/.local/share/opencode-browser), BROWSE_APP (~/apps/browse here).
+# data root, ~/.local/share/opencode-browser), BROWSE_MAC_SKILL (the Mac's installed ~/.agents/skills/browse),
+# BROWSE_APP (~/apps/browse here).
 set -uo pipefail
 
 mac="${BROWSE_MAC_HOST:-mac}"
 # Expanded by the Mac's shell.
 mac_launcher="${BROWSE_MAC_LAUNCHER:-\$HOME/.local/bin/browse}"
 mac_home="${BROWSE_MAC_HOME:-\$HOME/.local/share/opencode-browser}"
+mac_skill="${BROWSE_MAC_SKILL:-\$HOME/.agents/skills/browse}"
 # This host's OPENCODE_BROWSER_HOME: the Mac's token and profiles, never a local relay's.
 home="$HOME/.opencode-browser-mac"
 app="${BROWSE_APP:-$HOME/apps/browse}"
 launcher="$HOME/.local/bin/browse"
 skill="$HOME/.agents/skills/browse-remote"
+browse_skill="$HOME/.agents/skills/browse"
 state="$home/mac-relays"
 here="$(cd "$(dirname "$0")" && pwd)"
 marker="# Written by browse-remote's mac-relays.sh sync, which rewrites it."
+# The browse skill's own line, in place of the Mac install's marker; a browse skill without it is left alone.
+skill_marker="<!-- Written by browse-remote's mac-relays.sh sync, which rewrites it. -->"
 
 mkdir -p "$state" && chmod 700 "$home" "$state" || { echo "cannot create $state" >&2; exit 1; }
 
@@ -35,6 +40,16 @@ on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$mac" "$@"; }
 die() { echo "$*" >&2; exit 1; }
 # One shell word, for a command line the Mac's shell or this host's launcher parses.
 shq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
+# Replaces folder <dest> with folder <new> by rename, so this running script and readers never see it half-written.
+swap_in() {
+  rm -rf "$2.old"
+  if [[ -d $2 ]]; then mv "$2" "$2.old" || die "cannot move $2 aside"; fi
+  if ! mv "$1" "$2"; then
+    [[ -d $2.old ]] && mv "$2.old" "$2"
+    die "cannot install $2"
+  fi
+  rm -rf "$2.old"
+}
 
 # A Mac relay port: plain decimal (no leading zero, which bash would read as octal), and never browser-control's.
 check_port() {
@@ -175,6 +190,8 @@ export OPENCODE_BROWSER_AUTOSTART=false
 export OPENCODE_BROWSER_HOME="\$HOME/.opencode-browser-mac"
 # Updates come from \`mac-relays.sh sync\`, not this copy.
 export OPENCODE_BROWSER_UPDATE_CHECK=0
+# Commands the CLI prints (next steps, hints) start with this name.
+export OPENCODE_BROWSER_COMMAND=browse
 exec $(shq "$(command -v node)") $(shq "$live/dist/cli.mjs") "\$@"
 EOF
       chmod 755 "$launcher.tmp" && mv "$launcher.tmp" "$launcher" || die "cannot install $launcher"
@@ -183,15 +200,32 @@ EOF
 
     # Swapped in by rename, so this running script keeps reading its old copy.
     mkdir -p "$(dirname "$skill")" || die "cannot create $(dirname "$skill")"
-    rm -rf "$skill.new" "$skill.old"
+    rm -rf "$skill.new"
     cp -R "$live/skills/browse-remote" "$skill.new" || die "cannot copy the skill to $skill.new"
-    if [[ -d $skill ]]; then mv "$skill" "$skill.old" || die "cannot move $skill aside"; fi
-    if ! mv "$skill.new" "$skill"; then
-      [[ -d $skill.old ]] && mv "$skill.old" "$skill"
-      die "cannot install $skill"
-    fi
-    rm -rf "$skill.old"
+    swap_in "$skill.new" "$skill"
     echo "✓ skill at $skill"
+
+    # The Mac's installed browse skill (the driving API, with its profile table), with this script's marker and a note
+    # on this host in place of the Mac install's marker. A browse skill here without the marker is someone else's.
+    if [[ -e $browse_skill ]] && ! grep -qxF "$skill_marker" "$browse_skill/SKILL.md" 2>/dev/null; then
+      echo "! $browse_skill exists and isn't this script's; left it alone" >&2
+    else
+      rm -rf "$browse_skill.new" && mkdir -p "$browse_skill.new" || die "cannot create $browse_skill.new"
+      on_mac "COPYFILE_DISABLE=1 tar -C \"$mac_skill\" -czf - ." | tar --warning=no-unknown-keyword -xzf - -C "$browse_skill.new" \
+        && [[ -s $browse_skill.new/SKILL.md ]] \
+        || { rm -rf "$browse_skill.new"; die "cannot copy the browse skill from $mac:$mac_skill (\`browse install --client omp\` writes it there)"; }
+      note="> **On $(hostname -s):** \`browse\` drives the Mac's profiles through \`~/.agents/skills/browse-remote/scripts/mac-relays.sh up\`, at Mac port + 10000; \`--profile <name>\` and \`browse find\` work unchanged, but journals and \`files.write()\` output stay on the Mac. Never run \`browse install\`, \`update\` or \`profiles add|remove|sync\` here (skill browse-remote)."
+      awk -v marker="$skill_marker" -v note="$note" '
+        /^<!-- Written by `opencode-browser install/ { next }
+        { print }
+        $0 == "---" && ++fences == 2 { print marker; print ""; print note }
+      ' "$browse_skill.new/SKILL.md" > "$browse_skill.new/SKILL.md.tmp" \
+        && mv "$browse_skill.new/SKILL.md.tmp" "$browse_skill.new/SKILL.md" \
+        && grep -qxF "$skill_marker" "$browse_skill.new/SKILL.md" \
+        || { rm -rf "$browse_skill.new"; die "the browse skill from $mac:$mac_skill has no frontmatter to mark"; }
+      swap_in "$browse_skill.new" "$browse_skill"
+      echo "✓ browse skill at $browse_skill"
+    fi
     ;;
   up)
     shift
