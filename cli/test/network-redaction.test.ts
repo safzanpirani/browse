@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { looksLikeTokenSegment, SecretCollector } from "../src/network-redaction.ts"
+import { looksLikeTokenSegment, redactKnownValues, SecretCollector } from "../src/network-redaction.ts"
 
 // The HAR export protects each entry structurally (names that look secret), then replaces known values wherever
 // else they appear in URLs and headers (network-capture.ts redactEntryKnownValues, minimum length 8).
@@ -80,5 +80,26 @@ describe("SecretCollector", () => {
     const body = collector.protectBody(JSON.stringify({ data: { access_token: "at_1234567890abcdef", name: "ada" } }), "application/json", "response")
     expect(JSON.parse(body ?? "{}")).toEqual({ data: { access_token: "${BC_SECRET_1}", name: "ada" } })
     expect(collector.slots().map((slot) => slot.value)).toEqual(["at_1234567890abcdef"])
+  })
+
+  test("leaves ordinary text alone when known values are too short to be credentials", () => {
+    const slots = [
+      { ref: "BC_SECRET_9", value: "0" },
+      { ref: "BC_SECRET_4", value: "1" },
+      { ref: "BC_SECRET_2", value: "dark" },
+      { ref: "BC_SECRET_3", value: "session-cookie-value" },
+    ]
+    expect(redactKnownValues("Flat 30% off, rated 4.1, dark mode", slots)).toBe("Flat 30% off, rated 4.1, dark mode")
+    expect(redactKnownValues("with 10 client headers sid=session-cookie-value", slots)).toBe("with 10 client headers sid=${BC_SECRET_3}")
+  })
+
+  test("execute output keeps short typed values and redacts longer ones", () => {
+    const collector = new SecretCollector([
+      { ref: "BC_SECRET_1", value: "1", sources: ["request.header.cookie.count"] },
+      { ref: "BC_SECRET_2", value: "90817263", sources: ["request.header.cookie.uid"] },
+      { ref: "BC_SECRET_3", value: "false", sources: ["request.body.flag"] },
+    ])
+    expect(collector.redactValue({ count: 1, flag: false, price: "Flat 10% off", uid: 90817263 }))
+      .toEqual({ count: 1, flag: false, price: "Flat 10% off", uid: "${BC_SECRET_2}" })
   })
 })

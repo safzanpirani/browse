@@ -405,8 +405,16 @@ function sourceName(requestScope: string, location: string, occurrence = 0): str
   return occurrence === 0 ? base : `${base}.${occurrence}`
 }
 
+/**
+ * Output redaction replaces every occurrence of a known value. Values this short
+ * ("1", "0", "true", "dark") match ordinary text far more often than they protect
+ * a credential, so they stay profile slots but are never rewritten in output.
+ */
+const minimumOutputRedactionLength = 6
+
 export function redactKnownValues(text: string, slots: readonly RedactionSlot[]): string {
-  return [...slots]
+  return slots
+    .filter((slot) => slot.value.length >= minimumOutputRedactionLength)
     .sort((left, right) => right.value.length - left.value.length)
     .reduce((output, slot) => replaceOutsideReferences(output, slot.value, `\${${slot.ref}}`), text)
 }
@@ -414,7 +422,9 @@ export function redactKnownValues(text: string, slots: readonly RedactionSlot[])
 function redactKnownValue(value: unknown, slots: readonly RedactionSlot[]): unknown {
   if (Predicate.isString(value)) return redactKnownValues(value, slots)
   if (Predicate.isNumber(value) || Predicate.isBoolean(value)) {
-    const slot = slots.find((candidate) => candidate.value === String(value))
+    const serialized = String(value)
+    if (serialized.length < minimumOutputRedactionLength) return value
+    const slot = slots.find((candidate) => candidate.value === serialized)
     return slot ? `\${${slot.ref}}` : value
   }
   if (Array.isArray(value)) return value.map((item) => redactKnownValue(item, slots))
