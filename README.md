@@ -83,20 +83,26 @@ A relay drives one browser profile, so each profile gets its own relay and its o
 node cli/dist/cli.mjs profiles add work --label "Chrome: Work"   # copies the extension, pinned to port 19960
 node cli/dist/cli.mjs profiles list                              # ports, folders, relay and extension status
 node cli/dist/cli.mjs --profile work status                      # any command; or OPENCODE_BROWSER_PROFILE=work
+node cli/dist/cli.mjs find github.com                            # which profile has a tab on it, and the next command
 ```
 
 Load each profile's folder (`<data dir>/profiles/<name>/extension`) unpacked in that browser profile, in place of the
 usual folder: every copy has the same extension ID. `add` picks the next free port in 19960-19966 unless you pass
 `--port`. Install refreshes the copies' pairing code; after a rebuild, `profiles sync` re-copies the build and
 reloads the connected copies. Without `--profile`, commands use `OPENCODE_BROWSER_PORT` or 19988 as before.
+`--profile` also takes a part of exactly one profile's label, such as an email in it.
+
+`find [query]` asks every profile's relay (starting none) for its extension state and attached tabs. With a query it
+lists the matching tabs with the command to adopt or continue each, and the profiles whose sessions visited that host
+before (from the session journals). The omp skill install writes carries a table of the profiles it found.
 
 ### From another machine
 
 The relays listen on `127.0.0.1` only. `cli/skills/browse-remote` (a skill plus `scripts/mac-relays.sh` and
 `relay-proxy.mjs`) lets a Linux host drive them over ssh: `mac-relays.sh sync` copies this machine's built CLI, its
-relay token (into `~/.opencode-browser-mac`, mode 0600) and the skill there and writes a `browse` launcher with
-`OPENCODE_BROWSER_AUTOSTART=false`; `up` tunnels every profile's port to port + 10000 through a proxy that rewrites the
-`Host` header the relay checks. Its `SKILL.md` has the details.
+relay token (into `~/.opencode-browser-mac`, mode 0600), the skill and the installed `browse` skill there and writes a
+`browse` launcher with `OPENCODE_BROWSER_AUTOSTART=false`; `up` tunnels every profile's port to port + 10000 through a
+proxy that rewrites the `Host` header the relay checks. Its `SKILL.md` has the details.
 
 ## Using it
 

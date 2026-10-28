@@ -249,6 +249,24 @@ describe("--profile", () => {
     expect(selectProfile(["status"], { OPENCODE_BROWSER_PROFILE: "work", OPENCODE_BROWSER_PORT: "19963" }, root).profile?.port).toBe(19963)
   })
 
+  test("takes an email or browser profile folder from exactly one profile's label", () => {
+    const { root, source } = sandbox()
+    addProfile({ root, name: "patty", port: 19963, label: "Patty (Profile 2, june@example.com)", source, code: CODE })
+    addProfile({ root, name: "safzan", port: 19962, label: "Safzan (Default, s@example.com)", source, code: CODE })
+    addProfile({ root, name: "other", port: 19965, label: "Safzan (Profile 6, o@example.com)", source, code: CODE })
+    expect(selectProfile(["--profile", "june@example.com", "status"], {}, root).profile?.name).toBe("patty")
+    expect(selectProfile(["--profile=PROFILE 2", "status"], {}, root).profile?.name).toBe("patty")
+    expect(selectProfile(["status"], { OPENCODE_BROWSER_PROFILE: "default" }, root).profile?.name).toBe("safzan")
+    // A name wins over a label part, and a substring of a part is no match.
+    expect(selectProfile(["--profile", "safzan", "status"], {}, root).profile?.port).toBe(19962)
+    const ambiguous = refusal(() => selectProfile(["--profile", "Safzan", "status"], {}, root))
+    expect(ambiguous).toMatch(/"Safzan" is in the label of safzan and other/)
+    expect(ambiguous).toContain("  patty  Patty (Profile 2, june@example.com)")
+    const unknown = refusal(() => selectProfile(["--profile", "june@example", "status"], {}, root))
+    expect(unknown).toMatch(/No profile "june@example" \(by name or label\)/)
+    expect(unknown).toContain("  other  Safzan (Profile 6, o@example.com)")
+  })
+
   describe("applyProfileSelection", () => {
     const saved = process.env.OPENCODE_BROWSER_HOME
     afterEach(() => {

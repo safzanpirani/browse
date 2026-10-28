@@ -448,6 +448,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
           warnings: record.result.warnings,
           diagnostic: record.result.diagnostic,
           handoffs: record.result.aftermath?.handoffs,
+          port,
         })
         return appendJournalEntry({ baseDir: journalBaseDir, entry })
       },

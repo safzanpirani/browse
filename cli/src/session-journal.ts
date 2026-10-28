@@ -31,6 +31,8 @@ export const JournalEntry = Schema.Struct({
   warnings: Schema.optionalKey(Schema.Array(Schema.String)),
   diagnostic: Schema.optionalKey(Schema.String),
   handoffs: Schema.optionalKey(Schema.Number),
+  /** The relay port that ran it; session ids are per relay, so this tells profiles' journals apart (`find`). */
+  port: Schema.optionalKey(Schema.Number),
 })
 
 export interface JournalEntry extends Schema.Schema.Type<typeof JournalEntry> {}
@@ -98,6 +100,7 @@ export function makeJournalEntry(options: {
   readonly warnings?: readonly string[] | undefined
   readonly diagnostic?: string | undefined
   readonly handoffs?: number | undefined
+  readonly port?: number | undefined
 }): JournalEntry {
   return {
     ts: new Date().toISOString(),
@@ -113,6 +116,7 @@ export function makeJournalEntry(options: {
     ...(options.warnings && options.warnings.length > 0 ? { warnings: options.warnings.map(redactJournalText) } : {}),
     ...(options.diagnostic ? { diagnostic: truncateForJournal(redactJournalText(options.diagnostic), maxJournalDiagnosticLength) } : {}),
     ...(options.handoffs ? { handoffs: options.handoffs } : {}),
+    ...(options.port === undefined ? {} : { port: options.port }),
   }
 }
 

@@ -20,6 +20,9 @@ if (invokedAs === "opencode-browser-mcp") {
 } else if (command === "update") {
   const { runUpdateCommand } = await import("./update.ts")
   await runUpdateCommand(process.argv.slice(3))
+} else if (command === "find") {
+  const { runFindCommand } = await import("./find.ts")
+  await runFindCommand(process.argv.slice(3))
 } else if (command && setupCommands.has(command)) {
   const { runSetup } = await import("./setup.ts")
   await runSetup(command, process.argv.slice(3))
@@ -51,7 +54,11 @@ PROFILES (one relay and one extension copy per browser profile)
   profiles sync [--no-reload]    Copy the current build and pairing code into every profile (after a
                                  rebuild) and reload the connected extensions
   --profile <name>               On any command: use that profile's relay (OPENCODE_BROWSER_PROFILE works
-                                 too; without either, OPENCODE_BROWSER_PORT or 19988)
+                                 too; without either, OPENCODE_BROWSER_PORT or 19988). An email or browser
+                                 profile folder from exactly one profile's label works as the name
+  find [query] [--json]          Every profile's relay, extension and attached tabs; with a query, the
+                                 matching tabs, the profiles that visited it before, and the command to run
+                                 next. Starts no relay
 
 `)
   }

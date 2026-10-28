@@ -7,7 +7,8 @@
 //   profiles remove <name>                      forget a profile and delete the folder add created
 //   profiles sync [--no-reload]                 re-copy the current build and pairing code into every profile's folder
 // `--profile <name>` (or OPENCODE_BROWSER_PROFILE) on any command selects that profile's relay: it sets
-// OPENCODE_BROWSER_PORT. Without either, commands use OPENCODE_BROWSER_PORT or the default 19988.
+// OPENCODE_BROWSER_PORT. A part of exactly one profile's label (an email, "Profile 2") works as the name too. Without
+// either, commands use OPENCODE_BROWSER_PORT or the default 19988.
 // Every copy has the same extension ID (the manifest key), so a browser profile loads at most one of them.
 import { closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync, writeSync } from "node:fs"
 import path from "node:path"
@@ -280,20 +281,54 @@ const relayRequest = (root: string, port: number, pathname: string, init: Reques
     signal: AbortSignal.timeout(1_500),
   })
 
+/** What a profile's relay answered at /extension/status: running (with the status body), stopped, or foreign. */
+export type RelayProbe = { relay: "running"; status: Record<string, unknown> } | { relay: "stopped" | "foreign" }
+
+/**
+ * Asks a relay for /extension/status with this install's token, never starting one. A refused token (401) is another
+ * install's relay; no answer, or any other failure (a tunnel proxy's 502 when the far relay is down), is stopped.
+ */
+export async function probeRelay(port: number, root = dataRoot()): Promise<RelayProbe> {
+  const response = await relayRequest(root, port, "/extension/status").catch(() => undefined)
+  if (!response) return { relay: "stopped" }
+  if (!response.ok) return { relay: response.status === 401 ? "foreign" : "stopped" }
+  const status: unknown = await response.json().catch(() => undefined)
+  if (typeof status !== "object" || status === null || Array.isArray(status)) return { relay: "foreign" }
+  return { relay: "running", status: Object.fromEntries(Object.entries(status)) }
+}
+
 /** Asks each profile's relay (never starting one) whether its extension is connected and what it has attached. */
 export function profileStatuses(profiles: readonly ProfileRecord[], root = dataRoot()): Promise<ProfileStatus[]> {
   return Promise.all(profiles.map(async (profile): Promise<ProfileStatus> => {
     const base = { ...profile, connected: false, attachedTabs: 0, sessions: 0, folderMissing: !existsSync(path.join(profile.extension, "manifest.json")) }
-    const response = await relayRequest(root, profile.port, "/extension/status").catch(() => undefined)
-    if (!response) return { ...base, relay: "stopped" }
-    if (!response.ok) return { ...base, relay: "foreign" }
-    const status: unknown = await response.json().catch(() => undefined)
-    if (typeof status !== "object" || status === null) return { ...base, relay: "foreign" }
-    const connected = "connected" in status && status.connected === true
-    const attachedTabs = "activeTargets" in status && typeof status.activeTargets === "number" ? status.activeTargets : 0
-    const sessions = "sessions" in status && Array.isArray(status.sessions) ? status.sessions.length : 0
+    const probe = await probeRelay(profile.port, root)
+    if (probe.relay !== "running") return { ...base, relay: probe.relay }
+    const { status } = probe
+    const connected = status.connected === true
+    const attachedTabs = typeof status.activeTargets === "number" ? status.activeTargets : 0
+    const sessions = Array.isArray(status.sessions) ? status.sessions.length : 0
     return { ...base, relay: "running", connected, attachedTabs, sessions }
   }))
+}
+
+/**
+ * The profile `value` names: a profile name, else a part of exactly one profile's label, matched case-insensitively.
+ * A label's parts are split at parentheses, commas and semicolons, so "Patty (Profile 2, june19925@gmail.com)" answers
+ * to Patty, Profile 2 and the email. Unknown and ambiguous values fail, listing the profiles.
+ */
+export function resolveProfile(profiles: readonly ProfileRecord[], value: string): ProfileRecord {
+  const named = profiles.find((profile) => profile.name === value)
+  if (named) return named
+  const wanted = value.trim().toLowerCase()
+  const matches = profiles.filter((profile) =>
+    profile.label?.split(/[(),;]/).some((part) => part.trim().toLowerCase() === wanted),
+  )
+  if (matches.length === 1) return matches[0]!
+  if (profiles.length === 0) throw new ProfileError(`No profile "${value}": there are none. \`${cliCommand("profiles add <name>")}\` adds one.`)
+  const list = profiles.map((profile) => `  ${profile.name}${profile.label ? `  ${profile.label}` : ""}`).join("\n")
+  if (matches.length > 1)
+    throw new ProfileError(`"${value}" is in the label of ${matches.map((profile) => profile.name).join(" and ")}. Pass a profile name:\n${list}`)
+  throw new ProfileError(`No profile "${value}" (by name or label). Profiles:\n${list}`)
 }
 
 /**
@@ -318,8 +353,7 @@ export function selectProfile(args: readonly string[], env: Env, root = dataRoot
   }
   const name = flag ?? env.OPENCODE_BROWSER_PROFILE
   if (!name) return { args: rest }
-  const profile = readProfiles(root).find((entry) => entry.name === name)
-  if (!profile) throw new ProfileError(`No profile "${name}". \`${cliCommand("profiles list")}\` shows them.`)
+  const profile = resolveProfile(readProfiles(root), name)
   if (flag === undefined && env.OPENCODE_BROWSER_PORT && Number(env.OPENCODE_BROWSER_PORT) !== profile.port)
     throw new ProfileError(`OPENCODE_BROWSER_PROFILE=${name} is port ${profile.port}, but OPENCODE_BROWSER_PORT is ${env.OPENCODE_BROWSER_PORT}. Unset one.`)
   return { args: rest, profile }
