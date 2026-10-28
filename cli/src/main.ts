@@ -42,8 +42,11 @@ if (invokedAs === "opencode-browser-mcp") {
 `)
   }
   if (command === "status") {
+    // `--client` selects which setup to report; the relay status that follows doesn't take it.
+    const client = process.argv.findIndex((arg, index) => index > 2 && (arg === "--client" || arg.startsWith("--client=")))
+    const selector = client === -1 ? [] : process.argv.splice(client, process.argv[client] === "--client" ? 2 : 1)
     const { printSetupStatus } = await import("./setup.ts")
-    printSetupStatus()
+    printSetupStatus(selector)
   }
   await import("./cli.ts")
 }

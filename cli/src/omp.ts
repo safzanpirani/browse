@@ -190,17 +190,13 @@ function readConfig(file: string): { text: string; servers: Record<string, Serve
   return { text, servers: typeof servers === "object" && servers !== null && !Array.isArray(servers) ? (servers as Record<string, Server>) : {} }
 }
 
-/** A `browse` server install wrote: its env carries the runtime fingerprint. Uninstall removes only these. */
+/**
+ * A `browse` server install wrote: its env carries the runtime fingerprint. Install refreshes and uninstall removes
+ * only these; any other `browse` server, even a hand-added one running browse, is the user's.
+ */
 function writtenServer(server: Server | undefined): boolean {
   const env = server?.env
   return typeof env === "object" && env !== null && RUNTIME_KEY in env && typeof env[RUNTIME_KEY] === "string"
-}
-
-/** A `browse` server install may refresh: its own, or one added by hand that runs a browse bundle (the README's). */
-function ownedServer(server: Server | undefined): boolean {
-  if (!server || writtenServer(server)) return !!server
-  const args = Array.isArray(server.args) ? server.args : []
-  return args.includes("mcp") && args.some((arg) => typeof arg === "string" && /cli\.mjs$/.test(arg))
 }
 
 /** The file's own indentation and line endings, so the edit matches the rest of it. */
@@ -268,8 +264,8 @@ export function checkOmpInstallable(paths: OmpPaths, mcp: boolean): void {
     conflicts.push(`${paths.skill} exists and wasn't written by install. Move it away, or pass --skills-dir <dir>.`)
   try {
     const existing = readConfig(paths.mcpConfig)?.servers[NAME]
-    if (mcp && existing && !ownedServer(existing))
-      conflicts.push(`${paths.mcpConfig} already has a "${NAME}" MCP server that doesn't run OpenCode Browser. Rename or remove it, then run install again.`)
+    if (mcp && existing && !writtenServer(existing))
+      conflicts.push(`${paths.mcpConfig} already has a "${NAME}" MCP server install didn't write. Rename or remove it, then run install again.`)
   } catch (error) {
     if (mcp) conflicts.push(errorMessage(error))
   }

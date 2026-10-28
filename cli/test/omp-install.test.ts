@@ -181,18 +181,17 @@ describe("omp's mcp.json", () => {
     })
   })
 
-  test("adopts a hand-added browse server that runs a browse bundle", () => {
-    const paths = withConfig(`{\n  "mcpServers": {\n    "browse": { "command": "node", "args": ["/old/browse/cli/dist/cli.mjs", "mcp"] }\n  }\n}\n`)
-    install(paths, true)
-    expect(readJson(paths.mcpConfig).mcpServers.browse.args).toEqual([runtime.entry, "mcp"])
-  })
-
-  test("refuses another program's browse server, and writes nothing", () => {
-    const foreign = `{\n  "mcpServers": {\n    "browse": { "command": "some-other-browse" }\n  }\n}\n`
+  test.each([
+    ["a hand-added browse server, even one running a browse bundle", `{ "command": "node", "args": ["/old/browse/cli/dist/cli.mjs", "mcp"] }`],
+    ["another program's browse server", `{ "command": "some-other-browse" }`],
+  ])("refuses %s, leaves it byte for byte and writes nothing", (_, server) => {
+    const foreign = `{\n  "mcpServers": {\n    "browse": ${server}\n  }\n}\n`
     const paths = withConfig(foreign)
-    expect(() => install(paths, true)).toThrow(/already has a "browse" MCP server/)
+    expect(() => install(paths, true)).toThrow(/already has a "browse" MCP server install didn't write/)
     expect(fs.readFileSync(paths.mcpConfig, "utf8")).toBe(foreign)
     expect(fs.existsSync(paths.launcher)).toBe(false)
+    expect(uninstallOmp(paths)).toEqual([])
+    expect(fs.readFileSync(paths.mcpConfig, "utf8")).toBe(foreign)
   })
 
   test("refuses a file that isn't JSON", () => {
@@ -251,6 +250,31 @@ describe("status", () => {
       `           skill ${paths.skill}`,
       "           MCP server not configured (install --client omp --mcp adds it)",
     ])
+  })
+
+  test.each(["--client omp", "--client=omp"])("`status %s` reports omp and the relay status still runs", (selector) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "browse-omp-status-"))
+    temps.push(home)
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      HOME: home,
+      XDG_CONFIG_HOME: path.join(home, ".config"),
+      OPENCODE_BROWSER_HOME: path.join(home, "data"),
+      // Not installed, so only --client omp makes status report it.
+      OPENCODE_BROWSER_OMP_DIR: path.join(home, "no-omp"),
+      OPENCODE_BROWSER_PORT: "29988",
+      OPENCODE_BROWSER_AUTOSTART: "false",
+      OPENCODE_BROWSER_UPDATE_CHECK: "0",
+    }
+    delete env.PI_CODING_AGENT_DIR
+    const status = (...args: string[]) => Bun.spawnSync([process.execPath, path.join(import.meta.dir, "..", "src", "main.ts"), "status", ...args], { env })
+    const result = status(...selector.split(" "))
+    const output = result.stdout.toString() + result.stderr.toString()
+    expect(output).toContain("omp:       not set up. Run install with --client omp.")
+    expect(output).toContain("Relay: stopped (http://127.0.0.1:29988)")
+    expect(output).not.toMatch(/unrecognized|unknown (?:option|flag)/i)
+    // Plain `status` exits 1 while the relay is stopped; the selector doesn't change that.
+    expect(result.exitCode).toBe(status().exitCode)
   })
 })
 

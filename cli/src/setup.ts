@@ -474,15 +474,16 @@ export function installedRuntime(settings: Settings | undefined, server: Servers
   return { entry, version, source }
 }
 
-/** Printed before the relay's status by `opencode-browser status`. */
-export function printSetupStatus() {
+/** Printed before the relay's status by `opencode-browser status`; `--client omp` reports omp even when it isn't found. */
+export function printSetupStatus(args: string[] = []) {
+  const omp = ompStep(() => clientFlag(args))?.includes("omp") ?? false
   const settings = readJson<Settings>(files.settings)
   const runtime = installedRuntime(settings, mcpServers()[MCP_NAME])
   log(runtime ? `Setup:     installed${runtime.source ? " (from source)" : ""}` : `Setup:     not installed. Run \`${installCommand()}\`.`)
   log(`Version:   ${runtime ? `${runtime.version ?? "unknown"} (${runtime.entry})` : "not installed"}`)
   log(`opencode:  ${settings?.opencode ?? findOpencode([]) ?? "not found"}`)
   log(mcpServers()[MCP_NAME] ? `MCP:       "${MCP_NAME}" configured` : "MCP:       not configured")
-  for (const line of ompStatus(ompPaths(root), existsSync(ompAgentDir()))) log(line)
+  for (const line of ompStatus(ompPaths(root), omp || existsSync(ompAgentDir()))) log(line)
   log(`Logs:      ${path.join(files.dir, "logs")}`)
   log("")
 }
