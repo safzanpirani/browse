@@ -54,10 +54,12 @@ that follows it sends the token to whatever listens on that port here.
 ## Both sides run the same build
 
 `mac-relays.sh sync` copies the Mac's installed CLI (the one its `~/.local/bin/browse` runs: `dist/`,
-`package.json`, `bun.lock`, this skill) to `~/apps/browse/cli`, runs `bun install --production` when the
-dependencies changed, copies the relay token, and rewrites the launcher and this skill. Run it after every rebuild or
-install on the Mac. A different build on the same client protocol is only a warning; a protocol change fails until you
-sync.
+`package.json`, `bun.lock`, this skill) into a new `~/apps/browse/releases/<stamp>`, runs `bun install --production`
+when the dependencies changed, then points the `~/apps/browse/cli` symlink at it; it also copies the relay token and
+rewrites the launcher and this skill. One sync runs at a time (`~/apps/browse/.sync.lock`). Run it after every rebuild
+or install on the Mac. A different build on the same client protocol is only a warning; a protocol change fails until
+you sync. If `~/apps/browse/cli` is ever missing after an interrupted first sync of an old plain-folder install, put
+it back with `mv ~/apps/browse/releases/00000000-legacy-* ~/apps/browse/cli`.
 
 First time on a new host (the skill isn't there yet):
 

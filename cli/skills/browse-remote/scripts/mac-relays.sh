@@ -107,12 +107,24 @@ case "${1:-status}" in
     entry="$(mac_entry)" || exit 1
     cli="${entry%/dist/cli.mjs}"
     live="$app/cli"
+    # One sync at a time, through the whole run (release, token, launcher, skill, cleanup): they share these paths.
+    mkdir -p "$app/releases" || die "cannot create $app/releases"
+    exec 9>"$app/.sync.lock" || die "cannot open $app/.sync.lock"
+    if ! flock -n 9; then
+      echo "another mac-relays.sh sync holds $app/.sync.lock; waiting up to 10 min" >&2
+      flock -w 600 9 || die "gave up waiting for $app/.sync.lock"
+    fi
     # The new CLI is assembled in its own release folder; $app/cli, a symlink, switches to it in one rename once it
     # is complete, so an interrupted sync leaves the old CLI working and the next sync starts over.
-    mkdir -p "$app/releases" || die "cannot create $app/releases"
     next="$app/releases/$(date +%Y%m%d-%H%M%S)-$$"
+    link="$app/cli.tmp.$$"
     mkdir "$next" || die "cannot create $next"
-    trap 'rm -rf "$next"' EXIT
+    # Never removes the release $app/cli points at, even when this sync fails after switching to it.
+    discard() {
+      [[ $(readlink -f "$live") == "$(readlink -f "$next")" ]] || rm -rf "$next"
+      rm -f "$link"
+    }
+    trap discard EXIT
     on_mac "COPYFILE_DISABLE=1 tar -C $(shq "$cli") -czf - dist package.json bun.lock skills/browse-remote" \
       | tar --warning=no-unknown-keyword -xzf - -C "$next" \
       || die "cannot copy the built CLI from $mac:$cli"
@@ -132,13 +144,16 @@ case "${1:-status}" in
       legacy="$app/releases/00000000-legacy-$$"
       mv "$live" "$legacy" || die "cannot move $live aside"
     fi
-    if ! { ln -sfn "releases/${next##*/}" "$app/cli.tmp" && mv -T "$app/cli.tmp" "$live"; }; then
+    if ! { ln -sfn "releases/${next##*/}" "$link" && mv -T "$link" "$live"; }; then
       [[ -n $legacy ]] && mv "$legacy" "$live"
       die "cannot switch $live to $next"
     fi
     trap - EXIT
-    # The previous release stays, for a command still running from it.
-    ls -1d "$app/releases"/* | sort | head -n -2 | while read -r old; do rm -rf "$old"; done
+    # The previous release stays, for a command still running from it; the one $app/cli points at always stays.
+    active="$(readlink -f "$live")"
+    ls -1d "$app/releases"/* | sort | head -n -2 | while read -r old; do
+      [[ $(readlink -f "$old") == "$active" ]] || rm -rf "$old"
+    done
     echo "✓ CLI from $mac:$cli at $live → releases/${next##*/} ($(md5sum < "$live/dist/cli.mjs" | cut -c1-12))"
 
     # The token goes through ssh stdout into a 0600 file; it is never printed or passed as an argument.
