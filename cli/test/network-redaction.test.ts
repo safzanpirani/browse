@@ -40,7 +40,7 @@ describe("SecretCollector", () => {
     expect(header?.value).toBe("${BC_SECRET_1}")
   })
 
-  test("stores no slot for the host, CORS headers or cookie priority", () => {
+  test("stores no slot for the host, CORS headers, the account index or cookie priority", () => {
     const collector = new SecretCollector()
     const headers = collector.protectHeaders(
       [
@@ -48,6 +48,7 @@ describe("SecretCollector", () => {
         { name: "access-control-allow-credentials", value: "true" },
         { name: "access-control-allow-headers", value: "authorization, x-csrf-token" },
         { name: "set-cookie", value: "SIDCC=abcdef123456; expires=Thu, 28-Oct-2027 14:02:16 GMT; path=/; domain=.google.com; priority=high; Partitioned" },
+        { name: "x-goog-authuser", value: "0" },
       ],
       "response",
     )
@@ -56,7 +57,9 @@ describe("SecretCollector", () => {
       "true",
       "authorization, x-csrf-token",
       "SIDCC=${BC_SECRET_1}; expires=Thu, 28-Oct-2027 14:02:16 GMT; path=/; domain=.google.com; priority=high; Partitioned",
+      "0",
     ])
+    expect(collector.protectUrl("https://play.google.com/log?format=json&authuser=0")).toBe("https://play.google.com/log?format=json&authuser=0")
     expect(collector.slots().map((slot) => slot.value)).toEqual(["abcdef123456"])
   })
 

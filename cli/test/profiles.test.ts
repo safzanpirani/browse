@@ -105,6 +105,17 @@ describe("profiles add", () => {
     expect(fs.existsSync(`${profilesFile(root)}.lock`)).toBe(false)
   })
 
+  test("refuses a lock left by a dead process instead of taking it over", async () => {
+    const { root, source } = sandbox()
+    const dead = Bun.spawn(["true"])
+    await dead.exited
+    fs.mkdirSync(root, { recursive: true })
+    fs.writeFileSync(`${profilesFile(root)}.lock`, `${dead.pid}\n`)
+    expect(refusal(() => addProfile({ root, name: "work", source, code: CODE }))).toMatch(/no longer running/)
+    expect(fs.existsSync(`${profilesFile(root)}.lock`)).toBe(true)
+    expect(readProfiles(root)).toEqual([])
+  })
+
   test("needs a built extension, and leaves a folder it didn't record alone", () => {
     const { root, source } = sandbox()
     expect(refusal(() => addProfile({ root, name: "work", source: path.join(source, "assets"), code: CODE }))).toMatch(/no built extension/)

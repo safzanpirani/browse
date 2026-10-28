@@ -25,14 +25,18 @@ const secretHeaders = new Set([
 ])
 
 // Standard headers whose names match secretNamePattern but whose values are not credentials: the host,
-// and CORS metadata that lists header names (`authorization`) or says `true`.
+// CORS metadata that lists header names (`authorization`) or says `true`, and Google's signed-in account index.
 const nonSecretHeaders = new Set([
   ":authority",
   "access-control-allow-credentials",
   "access-control-allow-headers",
   "access-control-expose-headers",
   "access-control-request-headers",
+  "x-goog-authuser",
 ])
+// Query and fragment fields whose names match secretNamePattern but hold an account index, not a credential.
+const nonSecretParams = new Set(["authuser"])
+const isSecretParam = (name: string) => secretNamePattern.test(name) && !nonSecretParams.has(name.toLowerCase())
 
 export class SecretCollector {
   private readonly slotsByRef = new Map<string, MutableCredentialSlot>()
@@ -386,7 +390,7 @@ function protectSearchParams(
   for (const [name, value] of params) {
     const occurrence = occurrences.get(name) ?? 0
     occurrences.set(name, occurrence + 1)
-    result.append(name, value && secretNamePattern.test(name) ? protect(name, value, occurrence) : value)
+    result.append(name, value && isSecretParam(name) ? protect(name, value, occurrence) : value)
   }
   return result
 }
@@ -403,7 +407,7 @@ function protectFragment(
     if (!entry) return part
     const [name, value] = entry
     // Recognize parameter names, not route/anchor text containing token-like words.
-    if (!/^[\w.-]+$/.test(name) || !secretNamePattern.test(name)) return part
+    if (!/^[\w.-]+$/.test(name) || !isSecretParam(name)) return part
     const occurrence = occurrences.get(name) ?? 0
     occurrences.set(name, occurrence + 1)
     return value ? `${part.slice(0, separator + 1)}${protect(name, value, occurrence)}` : part
@@ -422,11 +426,10 @@ function sourceName(requestScope: string, location: string, occurrence = 0): str
  */
 const minimumOutputRedactionLength = 6
 /**
- * `secrets run` output comes from a command holding the real values, so it redacts short credentials
- * (a 5-character password) too. One- and two-character slots (an account index such as `0`) stay
- * readable; rewriting them would replace every digit in the output.
+ * `secrets run` output comes from a command holding the real values, so every nonempty profile value is
+ * redacted there, however short. Non-credentials such as the account index never become slots.
  */
-export const minimumSecretRunRedactionLength = 3
+export const minimumSecretRunRedactionLength = 1
 
 export function redactKnownValues(text: string, slots: readonly RedactionSlot[], minimumLength = minimumOutputRedactionLength): string {
   return slots

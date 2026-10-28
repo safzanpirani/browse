@@ -50,9 +50,13 @@ export class ProfileError extends Error {}
 const lockWaitMs = 10_000
 const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 
-function lockOwnerAlive(lock: string): boolean {
+/** The pid recorded in a lock file; undefined while it is still being written. */
+function lockOwner(lock: string): number | undefined {
   const pid = Number.parseInt(readFileSync(lock, "utf8"), 10)
-  if (!Number.isSafeInteger(pid) || pid <= 0) return true // being written, or unreadable: treat as live
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined
+}
+
+function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
     return true
@@ -63,7 +67,8 @@ function lockOwnerAlive(lock: string): boolean {
 
 /**
  * Runs a registry change (read, pick a port, copy, publish) under one lock file, so concurrent `profiles add`
- * calls in separate processes never pick the same port or drop each other's records. A dead owner's lock is removed.
+ * calls in separate processes never pick the same port or drop each other's records. A dead owner's lock is
+ * refused, never taken over: two waiters could both see it dead, and the second would delete the first's new lock.
  */
 function withProfilesLock<A>(root: string, change: () => A): A {
   ensurePrivateDirectory(root)
@@ -80,23 +85,28 @@ function withProfilesLock<A>(root: string, change: () => A): A {
       break
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+      let owner: number | undefined
       try {
-        if (!lockOwnerAlive(lock)) {
-          rmSync(lock, { force: true })
-          continue
-        }
+        owner = lockOwner(lock)
       } catch (readError) {
         if ((readError as NodeJS.ErrnoException).code === "ENOENT") continue
         throw readError
       }
-      if (Date.now() > deadline) throw new ProfileError(`Another browse process holds ${lock}. Retry, or delete it if no browse command is running.`)
+      if (owner !== undefined && !processAlive(owner))
+        throw new ProfileError(`${lock} was left by pid ${owner}, which is no longer running. Delete it if no browse command is running, then retry.`)
+      if (Date.now() > deadline) throw new ProfileError(`Another browse process (pid ${owner ?? "unknown"}) holds ${lock}. Retry when it finishes.`)
       sleepSync(50)
     }
   }
   try {
     return change()
   } finally {
-    rmSync(lock, { force: true })
+    // Remove only our own lock, in case it was deleted by hand and another process took it.
+    try {
+      if (lockOwner(lock) === process.pid) rmSync(lock, { force: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    }
   }
 }
 

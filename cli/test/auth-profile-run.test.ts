@@ -38,17 +38,17 @@ describe("AuthProfile.run working directory", () => {
   })
 })
 
-test("secrets run output redacts a short credential but leaves a one-character index", async () => {
+test("secrets run output redacts every credential, however short", async () => {
   const result = await Effect.runPromise(Effect.gen(function* () {
     yield* AuthProfile.write({
       name: "short",
       baseDir,
       slots: [
         { ref: "BC_SECRET_1", value: "p4ss!", sources: ["password"] },
-        { ref: "BC_SECRET_2", value: "0", sources: ["authuser"] },
+        { ref: "BC_SECRET_2", value: "s!", sources: ["request.header.x-api-key"] },
       ],
     })
-    return yield* AuthProfile.run({ name: "short", baseDir, command: "/bin/sh", args: ["-c", 'echo "$BC_SECRET_1 page 0"'] })
+    return yield* AuthProfile.run({ name: "short", baseDir, command: "/bin/sh", args: ["-c", 'echo "$BC_SECRET_1 $BC_SECRET_2 page 0"'] })
   }))
-  expect(result.stdout.trim()).toBe("${BC_SECRET_1} page 0")
+  expect(result.stdout.trim()).toBe("${BC_SECRET_1} ${BC_SECRET_2} page 0")
 })
