@@ -421,6 +421,7 @@ export const AuthRunRequest = Schema.Struct({
   command: Schema.NonEmptyString,
   args: Schema.optionalKey(Schema.Array(Schema.String)),
   cwd: Schema.optionalKey(Schema.String),
+  cwdFallback: Schema.optionalKey(Schema.Boolean),
   timeoutMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
 })
 export interface AuthRunRequest extends Schema.Schema.Type<typeof AuthRunRequest> {}

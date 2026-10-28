@@ -526,6 +526,7 @@ function makeToolSpecs(relay: RelayClient.Interface, currentSession: CurrentSess
           command: requiredStringField(object, "command"),
           ...(args ? { args } : {}),
           cwd: path.resolve(cwd ?? process.cwd()),
+          cwdFallback: cwd === undefined,
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         })
       },

@@ -1007,6 +1007,7 @@ const secretsRun = Command.make(
       command: executable,
       args,
       cwd: path.resolve(Option.getOrElse(cwd, () => process.cwd())),
+      cwdFallback: Option.isNone(cwd),
       ...(Option.isSome(timeoutMs) ? { timeoutMs: timeoutMs.value } : {}),
     })
     yield* Effect.sync(() => {
