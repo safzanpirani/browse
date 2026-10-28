@@ -11,6 +11,7 @@ import { cliCommand } from "./paths.ts"
 import * as RelayClient from "./relay-client.ts"
 import { parseAdditionalExtensionOrigins } from "./relay-helpers.ts"
 import * as RelayLifecycle from "./relay-lifecycle.ts"
+import * as AuthProfile from "./auth-profile.ts"
 import type { ExecuteAftermath, ExecuteLogEntry, ExecuteResponse, NetworkStatusResponse, NetworkStopResponse, RecordingQuality, SettingsGetResponse } from "./relay-schema.ts"
 import { startRelay } from "./relay.ts"
 import { defaultJournalBaseDir, formatJournalEntry, readJournalEntries } from "./session-journal.ts"
@@ -952,8 +953,10 @@ const secretsStatus = Command.make(
   },
   Effect.fn("Cli.secretsStatus")(function* ({ name, json }) {
     const relay = yield* RelayClient.Service
-    yield* ensureCliRelay()
-    const result = yield* relay.authStatus({ name })
+    // Observational: ask a relay that is already up (on ampere the profile files live on the Mac behind it),
+    // otherwise read this host's profile file. Never start a relay just to read metadata.
+    const relayUp = yield* relay.version.pipe(Effect.as(true), Effect.orElseSucceed(() => false))
+    const result = relayUp ? yield* relay.authStatus({ name }) : yield* AuthProfile.status(name)
     if (json) {
       yield* Console.log(JSON.stringify(result, null, 2))
       return
