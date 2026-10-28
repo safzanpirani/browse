@@ -68,7 +68,7 @@ record() {
 # Prints the recorded pid while it is still that process; fails (and signals nothing) otherwise.
 owned() {
   local pid started
-  read -r pid started < "$state/$1.pid" 2>/dev/null || return 1
+  [[ -s $state/$1.pid ]] && read -r pid started < "$state/$1.pid" || return 1
   [[ -n $started && $(start_time "$pid") == "$started" ]] && printf '%s' "$pid"
 }
 stop() {
@@ -80,8 +80,9 @@ stop() {
   rm -f "$state/ready"
 }
 
-# Whether <pid> holds the listening socket on 127.0.0.1:<port>.
-listens() { ss -Hltnp "sport = :$1" 2>/dev/null | grep -q "pid=$2,"; }
+# Whether <pid> holds the listening socket on 127.0.0.1:<port>. (Not `ss | grep -q`: with pipefail, grep's early exit
+# fails the pipeline.)
+listens() { [[ $(ss -Hltnp "sport = :$1" 2>/dev/null) == *"pid=$2,"* ]]; }
 # Sets ssh_pid and proxy_pid when both are this script's and the proxy confirmed every port in $state/ports.
 confirmed() {
   local ports
@@ -213,18 +214,17 @@ EOF
     READY_FILE="$state/ready" nohup node "$here/relay-proxy.mjs" "${ports[@]}" >"$state/proxy.log" 2>&1 &
     record proxy $!
     # Up means confirmed: the proxy wrote its ready marker after binding every port, and each tunnel port is the ssh
-    # client's own socket. Anything else (a port another program holds, a dead process) stops both.
-    for (( tries = 0; tries < 100; tries++ )); do
-      if confirmed; then
-        all=1
-        for p in "${ports[@]}"; do port_ours "$p" || { all=0; break; }; done
-        (( all )) && break
-      fi
+    # client's own socket. Anything else (a port another program holds, a dead process) stops both. ssh to the Mac
+    # has taken 12-45 s to authenticate when the Mac is busy, hence the long deadline.
+    deadline=$((SECONDS + 120))
+    until
+      confirmed && all=1 && for p in "${ports[@]}"; do port_ours "$p" || { all=0; break; }; done && (( all ))
+    do
       owned ssh >/dev/null || { echo "ssh tunnel failed:" >&2; cat "$state/ssh.log" >&2; stop; exit 1; }
       owned proxy >/dev/null || { echo "proxy failed:" >&2; cat "$state/proxy.log" >&2; stop; exit 1; }
-      sleep 0.1
+      (( SECONDS < deadline )) || { echo "tunnel and proxy not confirmed within 120 s:" >&2; cat "$state/ssh.log" "$state/proxy.log" >&2; stop; exit 1; }
+      sleep 0.2
     done
-    (( tries < 100 )) || { echo "tunnel and proxy not confirmed within 10 s:" >&2; cat "$state/ssh.log" "$state/proxy.log" >&2; stop; exit 1; }
     "$0" status
     ;;
   down)
