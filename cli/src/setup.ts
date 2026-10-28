@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url"
 import { applyEdits, modify, parse } from "jsonc-parser"
 import { checkOmpInstallable, clientFlag, installOmp, ompAgentDir, OmpError, ompPaths, ompStatus, resolveClients, uninstallOmp, type Client } from "./omp.ts"
 import { cliCommand, dataRoot, installCommand, STORE_LISTED } from "./paths.ts"
+import { refreshProfileCopies, runProfilesCommand } from "./profiles.ts"
 import { formatPairingCode, pairingCode, relayAuthorization, writeExtensionPairing } from "./relay-secrets.ts"
 import { opencodeBrowserVersion } from "./version.ts"
 
@@ -501,11 +502,12 @@ function extension() {
   log(`Load unpacked from: ${folder}`)
 }
 
-/** Writes the pairing code into every unpacked extension folder this install manages. */
+/** Writes the pairing code into every unpacked extension folder this install manages, profile copies included. */
 function pairUnpacked() {
   const code = pairingCode()
   for (const directory of [files.extension, ...checkoutExtensionDirs])
     if (existsSync(path.join(directory, "manifest.json"))) writeExtensionPairing(directory, code)
+  for (const line of refreshProfileCopies(unpackedFolder(), code)) log(line)
 }
 
 function pair() {
@@ -937,4 +939,5 @@ export async function runSetup(command: string, args: string[]) {
   if (command === "extension") return extension()
   if (command === "uninstall") return uninstall(args)
   if (command === "pair") return pair()
+  if (command === "profiles") return runProfilesCommand(args, unpackedFolder())
 }
