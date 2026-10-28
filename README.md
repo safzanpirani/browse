@@ -232,6 +232,7 @@ Escape hatches. Set them in the environment you start opencode (or your MCP clie
 
 ```sh
 bun install && bun run dev       # rebuilds dist/ on change; reload the extension to pick it up
+bun run build                    # builds into a temp dir, then swaps it into dist/; a failed build leaves dist/ as it was
 bun run typecheck
 bun run test                     # the extension and cli/ test suites (bun test), no browser needed
 cd cli && bun src/main.ts status # the CLI from source
