@@ -59,6 +59,22 @@ proves it knows that code (see [Security](#security)). A Chrome Web Store build 
 }
 ```
 
+### omp
+
+For [omp](https://github.com/can1357/oh-my-pi), which drives browse as a CLI through its skill:
+
+```sh
+bun run setup                                    # when opencode isn't installed and ~/.omp/agent exists
+node cli/dist/cli.mjs install --client omp       # or explicitly; --client opencode,omp sets up both
+```
+
+This writes a `browse` launcher to `~/.local/bin` (a sh script running the installed CLI) and the browse skill,
+rewritten for `browse` commands, to `~/.agents/skills/browse/SKILL.md`. Add `--mcp` to also put a `browse` stdio
+server in `~/.omp/agent/mcp.json`; the rest of that file is left as it is. `--bin-dir`, `--skills-dir` and `--omp-dir`
+(or `OPENCODE_BROWSER_BIN_DIR`, `OPENCODE_BROWSER_SKILLS_DIR`, `OPENCODE_BROWSER_OMP_DIR`) move them. Install never
+overwrites a file it didn't write, later installs and `update` rewrite the same files, `status` reports them, and
+`uninstall` removes them (`uninstall --client omp` removes only those).
+
 ## Using it
 
 - **Agents open their own tabs** in the background of the window you last used, grouped at the start of your tab strip
