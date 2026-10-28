@@ -190,7 +190,7 @@ export class SecretCollector {
         if (separator < 1) return part
         const cookieName = part.slice(0, separator).trim()
         const cookieValue = part.slice(separator + 1)
-        if (lower === "set-cookie" && index > 0 && /^(domain|path|expires|max-age|samesite)$/i.test(cookieName)) {
+        if (lower === "set-cookie" && index > 0 && /^(domain|path|expires|max-age|samesite|priority|partitioned)$/i.test(cookieName)) {
           return part
         }
         if (!cookieValue) return part
@@ -206,6 +206,9 @@ export class SecretCollector {
       const match = /^(\S+)\s+(.+)$/.exec(value)
       if (match) return `${match[1]} ${this.reference(match[2] ?? "", source)}`
     }
+    // Pseudo-headers (`:authority` is the host) and CORS headers (they list header names such as
+    // `authorization`, or say `true`) only match secretNamePattern by their names.
+    if (lower.startsWith(":") || lower.startsWith("access-control-")) return value
     if (secretHeaders.has(lower) || secretNamePattern.test(lower)) {
       return this.reference(value, source)
     }
