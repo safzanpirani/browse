@@ -180,6 +180,7 @@ Each browser profile has its own relay and its own copy of the extension.
 - Human-like input paces every click and key. A speed-sensitive script (5 s click timeouts) runs against a relay
   started with \`OPENCODE_BROWSER_HUMAN_INPUT=0\`.
 - Bound a script that might stall with \`${NAME} execute --timeout-ms <ms>\`; the session stays usable.
+- Stop a relay you started with \`${NAME} [--profile <name>] relay stop\`; it drains like \`relay restart\` and leaves tabs open.
 - From another machine (ampere), the \`browse-remote\` skill tunnels to these relays.`
 
 /**

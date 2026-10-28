@@ -212,6 +212,54 @@ export const restartRelay = Effect.fn("RelayLifecycle.restartRelay")(function* (
   return { version: replacement, started, waitForReconnect: true } satisfies RelayReadiness
 })
 
+/** Drain and stop a managed relay without starting a replacement. Resolves false when none was running. */
+export const stopRelay = Effect.fn("RelayLifecycle.stopRelay")(function* (options: {
+  readonly relay: RelayClient.Interface
+  readonly clientKind?: RelayShutdownRequest["client"]["kind"]
+}) {
+  const initial = yield* Effect.result(options.relay.version)
+  if (Result.isFailure(initial)) {
+    if (isRelayUnreachable(initial.failure)) return false
+    return yield* initial.failure
+  }
+  const original = initial.success
+  if (original.managed !== true || !original.instanceId) {
+    return yield* Effect.fail(new Error("Cannot stop a foreground or unidentified relay; stop it from the terminal that runs it."))
+  }
+  if (original.shutdownProtocol !== 2) {
+    return yield* Effect.fail(new Error("This legacy relay does not support safe shutdown protocol 2; stop its process manually."))
+  }
+  const request = yield* RelayShutdownRequest.makeEffect({
+    instanceId: original.instanceId,
+    requestId: crypto.randomUUID(),
+    reason: "explicit-stop",
+    client: { kind: options.clientKind ?? "sdk", instanceId: clientInstanceId, buildId: opencodeBrowserBuildId },
+  })
+  const shutdown = yield* Effect.result(options.relay.shutdown(request))
+  if (Result.isFailure(shutdown) && !isRelayUnreachable(shutdown.failure) && !isRelayInstanceChanged(shutdown.failure)) {
+    // Relays built before `explicit-stop` existed reject it as an invalid request.
+    const rejectedReason = shutdown.failure instanceof RelayClient.RelayRejected && shutdown.failure.status === 400
+    if (rejectedReason && isNewerBuild(opencodeBrowserBuildId, original.buildId)) {
+      return yield* Effect.fail(new Error(`This relay (build ${original.buildId}) predates \`relay stop\`. Run \`${cliCommand("relay restart")}\` once, then stop it.`, { cause: shutdown.failure }))
+    }
+    return yield* shutdown.failure
+  }
+  // A dropped request (reset connection, broken tunnel) proves nothing: confirm the instance is gone.
+  const replacement = yield* waitForRelayExitOrReplacement({ relay: options.relay, version: original }).pipe(
+    Effect.mapError((error) => error instanceof RelayStillRunning
+      ? new Error(`OpenCode Browser relay at ${options.relay.endpoint} is still running; the stop request may not have arrived or work is still draining.`)
+      : error),
+  )
+  if (replacement) {
+    return yield* Effect.fail(new Error(`Another relay instance (${replacement.instanceId ?? "unidentified"}) started at ${options.relay.endpoint} while stopping; it was left running.`))
+  }
+  // Unreachable after an unacknowledged request can be a dead tunnel in front of a live relay.
+  if (Result.isFailure(shutdown)) {
+    return yield* Effect.fail(new Error(`Could not confirm that the relay at ${options.relay.endpoint} stopped: the stop request was not acknowledged and the relay no longer answers. Check its process or rerun \`${cliCommand("status")}\`.`))
+  }
+  return true
+})
+
 function waitForRelayExitOrReplacement(options: {
   readonly relay: RelayClient.Interface
   readonly version: RelayVersion

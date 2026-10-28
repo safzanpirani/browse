@@ -310,7 +310,7 @@ const RelayBuildId = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-
 export const RelayShutdownRequest = Schema.Struct({
   instanceId: RelayIdentity,
   requestId: RelayIdentity,
-  reason: Schema.Literal("explicit-restart"),
+  reason: Schema.Literals(["explicit-restart", "explicit-stop"]),
   client: Schema.Struct({
     kind: Schema.Literals(["cli", "mcp", "sdk"]),
     instanceId: RelayIdentity,

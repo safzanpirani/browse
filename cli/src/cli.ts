@@ -268,9 +268,19 @@ const relayRestart = Command.make(
   }),
 ).pipe(Command.withDescription("Explicitly drain and restart the managed relay using this installation"))
 
+const relayStop = Command.make(
+  "stop",
+  {},
+  Effect.fn("Cli.relayStop")(function* () {
+    const relay = yield* RelayClient.Service
+    const stopped = yield* RelayLifecycle.stopRelay({ relay, clientKind: "cli" })
+    yield* Console.log(stopped ? `Stopped OpenCode Browser relay at ${relay.endpoint}` : `No relay running at ${relay.endpoint}`)
+  }),
+).pipe(Command.withDescription("Drain and stop the managed relay; browser tabs stay open"))
+
 const relay = Command.make("relay").pipe(
   Command.withDescription("Manage the local relay lifecycle"),
-  Command.withSubcommands([relayRestart]),
+  Command.withSubcommands([relayRestart, relayStop]),
 )
 
 const execute = Command.make(
