@@ -31,7 +31,11 @@ function sandbox(): OmpPaths & { root: string } {
   return { ...paths, root }
 }
 
-const install = (paths: OmpPaths, mcp = false) => installOmp({ paths, runtime, skill: upstreamSkill, mcp })
+const profiles = [
+  { name: "work", port: 19960, label: "Work (Profile 5, work@example.com)", extension: "/x/work/extension", createdAt: "" },
+  { name: "plain", port: 19961, extension: "/x/plain/extension", createdAt: "" },
+]
+const install = (paths: OmpPaths, mcp = false) => installOmp({ paths, runtime, skill: upstreamSkill, profiles, mcp })
 const readJson = (file: string) => JSON.parse(fs.readFileSync(file, "utf8"))
 
 describe("launcher", () => {
@@ -47,9 +51,16 @@ describe("launcher", () => {
 
   test("runs under sh with the arguments it was given", () => {
     const paths = sandbox()
-    installOmp({ paths, runtime: { ...runtime, node: "/bin/echo", entry: "entry" }, skill: upstreamSkill, mcp: false })
+    installOmp({ paths, runtime: { ...runtime, node: "/bin/echo", entry: "entry" }, skill: upstreamSkill, profiles, mcp: false })
     const result = Bun.spawnSync([paths.launcher, "status", "--json", "a b"])
     expect(result.stdout.toString()).toBe("entry status --json a b\n")
+  })
+
+  test("names itself, so the commands the CLI prints start with browse", () => {
+    const paths = sandbox()
+    installOmp({ paths, runtime: { ...runtime, node: "/bin/sh", entry: "-c" }, skill: upstreamSkill, profiles, mcp: false })
+    const result = Bun.spawnSync([paths.launcher, 'printf %s "$OPENCODE_BROWSER_COMMAND"'])
+    expect(result.stdout.toString()).toBe("browse")
   })
 
   test("refuses a file it didn't write, and writes nothing", () => {
@@ -73,14 +84,14 @@ describe("launcher", () => {
   test("rewrites its own launcher when the runtime moves", () => {
     const paths = sandbox()
     install(paths)
-    const lines = installOmp({ paths, runtime: { ...runtime, entry: "/new/cli.mjs" }, skill: upstreamSkill, mcp: false })
+    const lines = installOmp({ paths, runtime: { ...runtime, entry: "/new/cli.mjs" }, skill: upstreamSkill, profiles, mcp: false })
     expect(lines[0]).toContain("updated")
     expect(launcherTarget(paths.launcher)).toBe("/new/cli.mjs")
   })
 })
 
 describe("skill", () => {
-  const skill = ompSkill(upstreamSkill)
+  const skill = ompSkill(upstreamSkill, profiles)
 
   test("keeps the frontmatter first and marks the file as install's", () => {
     expect(skill.startsWith("---\nname: browse\n")).toBe(true)
@@ -101,14 +112,20 @@ describe("skill", () => {
     expect(skill).toContain("restarts omp")
   })
 
-  test("ends with the port table and the limits omp scripts hit", () => {
-    const section = skill.slice(skill.lastIndexOf("\n## "))
-    expect(section).toStartWith("\n## Profiles, ports and limits (omp)\n")
-    expect(section).toContain("| 19960-19966 | profiles: `browse --profile <name> <command>` or `OPENCODE_BROWSER_PROFILE=<name>` |")
-    expect(section).toContain("| 19989-19995 | browser-control's relays")
-    for (const text of ["files.write()", "OPENCODE_BROWSER_ALLOW_NODE=1", "idleMinutes=never", "OPENCODE_BROWSER_HUMAN_INPUT=0", "--timeout-ms", "browse-remote"])
+  test("ends with the installed profiles, how to find a tab, and the habits and limits omp scripts hit", () => {
+    const section = skill.slice(skill.indexOf("\n## Profiles, habits and limits (omp)\n"))
+    expect(section).toStartWith("\n## Profiles, habits and limits (omp)\n")
+    expect(section).toContain("| Profile | Port | Browser profile |\n|---|---|---|\n| work | 19960 | Work (Profile 5, work@example.com) |\n| plain | 19961 |  |\n")
+    expect(section).toContain("`browse --profile work@example.com status`")
+    for (const text of ["browse find figma.com", "19989-19995", "Never sleep", "timeout: 5000", "signed-in account", "files.write()", "OPENCODE_BROWSER_ALLOW_NODE=1", "idleMinutes=never", "OPENCODE_BROWSER_HUMAN_INPUT=0", "--timeout-ms", "browse-remote", "timed out waiting for active execute"])
       expect(section).toContain(text)
-    expect(skill.endsWith("tunnels to these relays.\n")).toBe(true)
+    expect(skill.endsWith("ask the user to click the toolbar button again. |\n")).toBe(true)
+  })
+
+  test("says how to add a profile when there are none", () => {
+    const bare = ompSkill(upstreamSkill, [])
+    expect(bare).toContain("No profiles were set up when this was installed; `browse profiles add <name>` adds one.")
+    expect(bare).toContain("`browse --profile <email> status`")
   })
 
   test("names only commands and flags the CLI has", () => {
@@ -182,7 +199,7 @@ describe("omp's mcp.json", () => {
     config.mcpServers.browse.env.OPENCODE_BROWSER_PORT = "19989"
     fs.writeFileSync(paths.mcpConfig, JSON.stringify(config, null, "\t") + "\n")
     expect(install(paths, true)).toContain('✓ omp MCP server "browse" is up to date')
-    installOmp({ paths, runtime: { ...runtime, fingerprint: "fedcba9876543210" }, skill: upstreamSkill, mcp: false })
+    installOmp({ paths, runtime: { ...runtime, fingerprint: "fedcba9876543210" }, skill: upstreamSkill, profiles, mcp: false })
     expect(readJson(paths.mcpConfig).mcpServers.browse).toEqual({
       command: runtime.node,
       args: [runtime.entry, "mcp"],

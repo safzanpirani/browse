@@ -203,7 +203,7 @@ export function formatFindReport(report: FindReport): string {
       const id = tab.tabId === undefined ? "" : `tab=${tab.tabId}`
       const session = tab.session ? `session=${tab.session}` : ""
       lines.push(`    ${(tab.owner ?? "").padEnd(5)} ${id.padEnd(14)} ${session.padEnd(24)} ${(tab.url || "about:blank").slice(0, 110)}${flags}`)
-      if (tab.title) lines.push(`          ${tab.title.slice(0, 110)}`)
+      if (tab.title && tab.title !== tab.url) lines.push(`          ${tab.title.slice(0, 110)}`)
     }
     if (profile.visited.length > 0) lines.push(`    visited before: ${profile.visited.slice(0, 8).join(", ")}`)
   }

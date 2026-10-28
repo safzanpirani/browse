@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url"
 import { applyEdits, modify, parse } from "jsonc-parser"
 import { checkOmpInstallable, clientFlag, installOmp, ompAgentDir, OmpError, ompPaths, ompStatus, resolveClients, uninstallOmp, type Client } from "./omp.ts"
 import { cliCommand, dataRoot, installCommand, STORE_LISTED } from "./paths.ts"
-import { refreshProfileCopies, runProfilesCommand } from "./profiles.ts"
+import { ProfileError, readProfiles, refreshProfileCopies, runProfilesCommand, type ProfileRecord } from "./profiles.ts"
 import { formatPairingCode, pairingCode, relayAuthorization, writeExtensionPairing } from "./relay-secrets.ts"
 import { opencodeBrowserVersion } from "./version.ts"
 
@@ -372,7 +372,14 @@ async function install(args: string[]) {
   if (omp) {
     const skill = readFileSync(path.join(packageRoot, "skills", "browse", "SKILL.md"), "utf8")
     const runtime = { node, entry, fingerprint: fingerprint(entry) }
-    for (const line of ompStep(() => installOmp({ paths: omp, runtime, skill, mcp: args.includes("--mcp") }))) log(line)
+    // The skill's profile table; a broken profiles.json is reported by the profile refresh, so the table is just empty.
+    let profiles: ProfileRecord[] = []
+    try {
+      profiles = readProfiles()
+    } catch (error) {
+      if (!(error instanceof ProfileError)) throw error
+    }
+    for (const line of ompStep(() => installOmp({ paths: omp, runtime, skill, profiles, mcp: args.includes("--mcp") }))) log(line)
   }
   const mcp = clients.includes("opencode") ? configureOpencode(opencode, entry) : undefined
   for (const line of restartOutdatedRelay(entry, node) ?? []) log(line)

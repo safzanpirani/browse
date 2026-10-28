@@ -15,6 +15,7 @@ import { homedir } from "node:os"
 import path from "node:path"
 import { isDeepStrictEqual } from "node:util"
 import { applyEdits, modify, parse, type FormattingOptions, type ParseError } from "jsonc-parser"
+import type { ProfileRecord } from "./profiles.ts"
 
 /** The launcher's file name, the skill's folder and the MCP server's name. */
 export const NAME = "browse"
@@ -106,6 +107,8 @@ export function launcherScript(runtime: { node: string; entry: string }): string
     "#!/bin/sh",
     "# browse: the OpenCode Browser CLI, for omp and other agents that run commands.",
     `# ${MARKER}`,
+    "# Commands the CLI prints (next steps, hints) start with this name.",
+    `export OPENCODE_BROWSER_COMMAND=${NAME}`,
     `exec ${shellQuote(runtime.node)} ${shellQuote(runtime.entry)} "$@"`,
     "",
   ].join("\n")
@@ -157,39 +160,93 @@ const OMP_NOTE = `> **In omp:** run browse as shell commands through bash: \`${N
 > MCP tool (\`session_new\`, \`tabs_cleanup\`, \`settings { … }\`, \`network_*\`), run the matching \`${NAME}\` command
 > instead; the \`${NAME}\` MCP server is optional. Pass \`--json\` when you need structured output.
 > With several browser profiles, each has its own relay: \`${NAME} profiles list\` shows them, and
-> \`${NAME} --profile <name> <command>\` (or \`OPENCODE_BROWSER_PROFILE=<name>\`) drives that profile's browser. Ports and
-> limits that matter in omp are in the last section.`
+> \`${NAME} --profile <name> <command>\` (or \`OPENCODE_BROWSER_PROFILE=<name>\`) drives that profile's browser;
+> \`${NAME} find <site>\` says which profile has it. Profiles, habits and limits that matter in omp are in the last section.`
 
-/** Appended after the upstream text: the fork's port layout and the limits omp's scripts and watchers hit. */
-const OMP_SECTION = `## Profiles, ports and limits (omp)
+/**
+ * Appended after the upstream text: the profiles install found (rendered from the profiles registry, so the table
+ * matches this machine), how to find a tab, the habits that saved agents turns, and the limits omp's scripts and
+ * watchers hit.
+ */
+export function ompSection(profiles: readonly ProfileRecord[]): string {
+  const table = profiles.length === 0
+    ? `No profiles were set up when this was installed; \`${NAME} profiles add <name>\` adds one.`
+    : [
+        "| Profile | Port | Browser profile |",
+        "|---|---|---|",
+        ...profiles.map((profile) => `| ${profile.name} | ${profile.port} | ${(profile.label ?? "").replaceAll("|", "\\|")} |`),
+      ].join("\n")
+  // An email from a label, for the --profile alias example; this machine's own, not a made-up one.
+  const email = profiles.flatMap((profile) => profile.label?.match(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/) ?? [])[0] ?? "<email>"
+  return `## Profiles, habits and limits (omp)
 
-Each browser profile has its own relay and its own copy of the extension.
-\`${NAME} profiles add <name>\` makes the copy (load it unpacked in that profile) and pins it to the next free port in
-19960-19966; \`${NAME} profiles list\` shows each profile's port and whether its relay and extension are up.
+Each browser profile has its own relay and its own copy of the extension. The profiles when this skill was installed
+(\`${NAME} profiles list\` shows the live state):
 
-| Port | Relay |
-|---|---|
-| 19960-19966 | profiles: \`${NAME} --profile <name> <command>\` or \`OPENCODE_BROWSER_PROFILE=<name>\` |
-| 19988 | the plain \`dist/\` extension (no profile selected) |
-| 19989-19995 | browser-control's relays: never point \`${NAME}\` at them |
+${table}
+
+- Pass \`--profile\` on every command; shell variables don't persist between calls. Without it a command goes to 19988,
+  the plain \`dist/\` extension. It takes the name, or an email or browser profile folder that appears in exactly one
+  label (\`${NAME} --profile ${email} status\`).
+- Never point \`${NAME}\` at 19989-19995: those are browser-control's relays.
+- \`${NAME} profiles add <name>\` makes a copy for one more browser profile (load it unpacked there) on the next free
+  port in 19960-19966.
+- From another machine (ampere), the \`browse-remote\` skill tunnels to these relays at port + 10000.
+
+### Find the tab first
+
+\`\`\`bash
+${NAME} find              # every profile: relay, extension, attached tabs, sites its sessions visited
+${NAME} find figma.com    # which profile has it attached, and the exact command to run next
+\`\`\`
+
+\`find\` starts no relay. A tab is usable only after the user clicks the toolbar button on it; when nothing matches,
+\`find\` names the profiles whose sessions visited the site, so ask the user to open and attach it there.
+
+### Habits that save turns
+
+- Check the app's own signed-in account before acting, not the profile label. One browser profile can hold several
+  Google accounts and web-app logins (2026-10-13: the insideiim profile's Gemini and claude.ai tabs were signed in as
+  other accounts). Read the account from the page (\`a[aria-label^="Google Account"]\`, the app's account menu), and
+  never use or override another person's account.
+- Batch every step you can already name into one execute and end with what changed (\`snapshot({ delta: true })\`).
+  Start a new call only when you need to see UI you haven't seen yet.
+- Never sleep. Wait for what you expect (\`locator.waitFor()\`, \`page.waitForURL()\`), not \`waitForTimeout()\`.
+- Give actions short timeouts in dynamic UI: \`click({ timeout: 5000 })\`. The 30 s default costs 30 s per miss.
+- Return small values (counts, URLs, \`.slice(0, 3000)\` of text), and keep each execute under about a minute.
+- Prefer an in-page request in an adopted tab (\`page.evaluate(() => fetch(...))\`) to opening a page. Keep tokens in
+  the page and return only the fields you need.
+- Search page text with word boundaries (\`\\bargon\\b\`; \`argon\` matched "jargon"). A label missing from the scripts
+  may arrive by RPC; check a network capture before calling it absent.
+- A watcher that depends on an attached tab stops when the Mac sleeps. It fails closed and says so, never pings.
+
+### Limits and fixes (omp)
 
 - Execute code has no \`fs\`: save with \`files.write()\`, or run the relay with \`OPENCODE_BROWSER_ALLOW_NODE=1\` for full
   Node.
 - Tabs a session opened close after 10 untouched minutes. A watcher that runs longer adopts a tab the user shared
   (\`${NAME} session adopt\`), or the user sets \`${NAME} settings set idleMinutes=never\`.
-- Human-like input paces every click and key. A speed-sensitive script (5 s click timeouts) runs against a relay
-  started with \`OPENCODE_BROWSER_HUMAN_INPUT=0\`.
+- Human-like input paces every click and key: a mouse move takes up to about a second. A script that must be fast runs
+  against a relay started with \`OPENCODE_BROWSER_HUMAN_INPUT=0\`.
 - Bound a script that might stall with \`${NAME} execute --timeout-ms <ms>\`; the session stays usable.
 - Stop a relay you started with \`${NAME} [--profile <name>] relay stop\`; it drains like \`relay restart\` and leaves tabs open.
-- From another machine (ampere), the \`browse-remote\` skill tunnels to these relays.`
+
+| Symptom | Do this |
+|---|---|
+| Extension not connected | Run \`${NAME} find\`; use a profile whose extension is connected, or tell the user which profile needs it. Run one relay-backed command, which waits up to 35 s for the extension; don't loop \`status\`. |
+| Every execute on a session times out; \`session delete\`/\`reset\` say "timed out waiting for active execute" | A \`handoff()\` still waits for Continue, and killing the CLI doesn't cancel it. Ask the user to press Continue in that tab. For an OAuth popup, register no handoff: ask the user to sign in, then check \`page.url()\` in a fresh execute. |
+| "Multiple attached pages ... match URL" | A session's own page sits next to the user's tab on that site. Delete that helper session, or adopt by \`--tab-id\` from \`${NAME} find\`. Never leave a helper page open between a watcher's steps. |
+| \`page.route\` / \`page.unroute\` fails with "Session with given id not found" | Interception in an adopted tab is fragile. Use in-page \`fetch\` or read the page's own data instead. |
+| A user tab is gone from \`${NAME} find\` after a session delete or closing a page | Cleanup can detach the user's tab. Run \`${NAME} find <site>\` after cleanup and ask the user to click the toolbar button again. |`
+}
 
 /**
  * The browse skill for omp: the upstream skill with `opencode-browser` commands renamed to the `browse` launcher, a
- * note mapping its MCP references to the CLI, a closing section on profiles, ports and limits, and the marker. Paths
+ * note mapping its MCP references to the CLI, a closing section on profiles, habits and limits, and the marker. Paths
  * and package names that contain `opencode-browser` (`~/.local/share/opencode-browser`, `opencode-browser-cli`) are
  * left as they are.
  */
-export function ompSkill(upstream: string): string {
+export function ompSkill(upstream: string, profiles: readonly ProfileRecord[]): string {
   const frontmatter = upstream.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)?.[0] ?? ""
   const body = upstream
     .slice(frontmatter.length)
@@ -199,7 +256,7 @@ export function ompSkill(upstream: string): string {
   // The note goes after the title, or first when the skill has none.
   const title = body.match(/^# .*\n/m)
   const at = title ? (title.index ?? 0) + title[0].length : 0
-  return `${frontmatter}<!-- ${MARKER} -->\n${body.slice(0, at)}\n${OMP_NOTE}\n${title ? "" : "\n"}${body.slice(at)}${body.endsWith("\n") ? "" : "\n"}\n${OMP_SECTION}\n`
+  return `${frontmatter}<!-- ${MARKER} -->\n${body.slice(0, at)}\n${OMP_NOTE}\n${title ? "" : "\n"}${body.slice(at)}${body.endsWith("\n") ? "" : "\n"}\n${ompSection(profiles)}\n`
 }
 
 // ---- omp's mcp.json -------------------------------------------------------------------------------
@@ -309,6 +366,8 @@ export function installOmp(options: {
   runtime: { node: string; entry: string; fingerprint: string }
   /** The upstream SKILL.md text. */
   skill: string
+  /** The profiles registry, rendered as the skill's profile table. */
+  profiles: readonly ProfileRecord[]
   mcp: boolean
 }): string[] {
   const { paths, runtime } = options
@@ -318,7 +377,7 @@ export function installOmp(options: {
   lines.push(`✓ omp launcher ${launcher === "unchanged" ? "is up to date at" : `${launcher} at`} ${paths.launcher}`)
   const pathDirs = (process.env.PATH ?? "").split(path.delimiter).map((dir) => path.resolve(dir))
   if (!pathDirs.includes(path.dirname(paths.launcher))) lines.push(`! ${path.dirname(paths.launcher)} isn't on PATH; add it so \`${NAME}\` runs.`)
-  const skill = writeOwned(paths.skill, ompSkill(options.skill))
+  const skill = writeOwned(paths.skill, ompSkill(options.skill, options.profiles))
   lines.push(`✓ omp skill ${skill === "unchanged" ? "is up to date at" : `${skill} at`} ${paths.skill}`)
   const previous = readManifest(paths.manifest)
   // An MCP server written before is kept current, so an update doesn't leave omp running the old runtime.
