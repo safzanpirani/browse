@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { findTabs, formatFindReport, matchQuery, sessionNameFor, visitedHosts, type FoundProfile } from "../src/find.ts"
+import { findTabs, formatFindReport, matchQuery, sessionHistory, sessionNameFor, type FoundProfile } from "../src/find.ts"
 import { relayToken } from "../src/relay-secrets.ts"
 
 const temps: string[] = []
@@ -34,8 +34,8 @@ const profile = (name: string, overrides: Partial<FoundProfile> = {}): FoundProf
   ...overrides,
 })
 
-describe("visitedHosts", () => {
-  test("counts each profile's hosts by the entry's port, else by the session catalogs", () => {
+describe("sessionHistory", () => {
+  test("counts each profile's hosts by the entry's port, else by the session catalogs, and lists every session id", () => {
     const root = dataRoot([{ name: "work", port: 19960 }, { name: "patty", port: 19963 }])
     journal(root, "a", [
       { port: 19960, startUrl: "about:blank", endUrl: "https://www.figma.com/file/1", navigations: ["https://figma.com/x"] },
@@ -47,10 +47,11 @@ describe("visitedHosts", () => {
     ])
     journal(root, "legacy", [{ endUrl: "https://figma.com/" }])
     fs.mkdirSync(path.join(root, "relays", "19963"), { recursive: true })
-    fs.writeFileSync(path.join(root, "relays", "19963", "sessions.json"), JSON.stringify({ version: 1, sessions: [{ id: "legacy" }] }))
-    const visited = visitedHosts([{ name: "work", port: 19960, extension: "", createdAt: "" }, { name: "patty", port: 19963, extension: "", createdAt: "" }], root)
-    expect(visited.get("work")).toEqual(["figma.com", "mail.google.com", "myaccount.google.com"])
-    expect(visited.get("patty")).toEqual(["figma.com"])
+    fs.writeFileSync(path.join(root, "relays", "19963", "sessions.json"), JSON.stringify({ version: 1, sessions: [{ id: "legacy" }, { id: "no-journal" }] }))
+    const history = sessionHistory([{ name: "work", port: 19960, extension: "", createdAt: "" }, { name: "patty", port: 19963, extension: "", createdAt: "" }], root)
+    expect(history.visited.get("work")).toEqual(["figma.com", "mail.google.com", "myaccount.google.com"])
+    expect(history.visited.get("patty")).toEqual(["figma.com"])
+    expect([...history.sessionIds].sort()).toEqual(["a", "legacy", "no-journal"])
   })
 })
 
@@ -62,29 +63,64 @@ describe("matchQuery", () => {
   ]
 
   test("matches tabs by URL or title, and prints the command to adopt or continue each", () => {
-    const result = matchQuery(profiles, "Figma")
-    expect(result.matches.map(({ profile, tab, next }) => ({ profile, tab: tab.tabId, next: next.replace(/^.*? --profile/, "--profile") }))).toEqual([
-      { profile: "work", tab: 7, next: "--profile work session adopt --tab-id 7 --session figma" },
-      { profile: "patty", tab: 9, next: "--profile patty execute --session gh 'return page.url()'" },
+    const result = matchQuery(profiles, "Figma", new Set())
+    expect(result.matches.map(({ profile, tab, next, note }) => ({ profile, tab: tab.tabId, next: next.replace(/^.*? --profile/, "--profile"), note }))).toEqual([
+      { profile: "work", tab: 7, next: "--profile work session adopt --tab-id 7 --session figma", note: undefined },
+      { profile: "patty", tab: 9, next: "--profile patty execute --session gh 'return page.url()'", note: undefined },
     ])
     expect(result.visitedBy).toEqual(["ananya"])
     expect(result.advice).toBeUndefined()
   })
 
+  test("adopts into a session id no profile uses yet, one per matching tab", () => {
+    const two = [
+      profile("work", { sessions: ["figma"], tabs: [{ tabId: 1, url: "https://figma.com/a", title: "", owner: "user" }] }),
+      profile("patty", { port: 19963, tabs: [{ tabId: 2, url: "https://figma.com/b", title: "", owner: "user" }] }),
+    ]
+    // figma is live on work, figma-2 has a journal (sessionHistory's ids), so the two tabs get figma-3 and figma-4.
+    const result = matchQuery(two, "figma.com", new Set(["figma-2"]))
+    expect(result.matches.map((match) => match.next.replace(/^.*? --profile/, "--profile"))).toEqual([
+      "--profile work session adopt --tab-id 1 --session figma-3",
+      "--profile patty session adopt --tab-id 2 --session figma-4",
+    ])
+  })
+
+  test("names the exact tab when its session has several pages, or says it can't", () => {
+    const popup = profile("work", {
+      tabs: [
+        { tabId: 1, url: "https://app.example/home", title: "", owner: "relay", session: "app" },
+        { tabId: 2, url: "https://app.example/login", title: "Sign in", owner: "relay", session: "app" },
+      ],
+    })
+    const [match] = matchQuery([popup], "Sign in", new Set()).matches
+    expect(match?.next).toEndWith("--profile work execute --session app --target-url https://app.example/login 'return page.url()'")
+    expect(match?.note).toBeUndefined()
+    const twins = profile("work", {
+      tabs: [
+        { tabId: 1, url: "https://app.example/", title: "", owner: "relay", session: "app" },
+        { tabId: 2, url: "https://app.example/", title: "Sign in", owner: "relay", session: "app" },
+      ],
+    })
+    const [twin] = matchQuery([twins], "Sign in", new Set()).matches
+    expect(twin?.next).toEndWith("--profile work execute --session app 'return context.pages().map((p) => p.url())'")
+    expect(twin?.note).toContain("drives its default page, which may not be tab 2")
+  })
+
   test("without a matching tab, names the profiles whose sessions visited the host", () => {
-    const result = matchQuery(profiles, "https://myaccount.google.com/security")
+    const result = matchQuery(profiles, "https://myaccount.google.com/security", new Set())
     expect(result.matches).toEqual([])
     expect(result.visitedBy).toEqual(["work"])
     expect(result.advice).toContain("Sessions on work visited it before")
-    expect(matchQuery(profiles, "myaccount").visitedBy).toEqual(["work"])
-    expect(matchQuery(profiles, "netflix.com").visitedBy).toEqual([])
-    expect(matchQuery(profiles, "netflix.com").advice).toContain("No session visited it before")
+    expect(matchQuery(profiles, "myaccount", new Set()).visitedBy).toEqual(["work"])
+    expect(matchQuery(profiles, "netflix.com", new Set()).visitedBy).toEqual([])
+    expect(matchQuery(profiles, "netflix.com", new Set()).advice).toContain("No session visited it before")
   })
 
-  test("names a session after the query's host", () => {
-    expect(sessionNameFor("https://www.figma.com/file/x")).toBe("figma")
-    expect(sessionNameFor("My Account")).toBe("my")
-    expect(sessionNameFor("..")).toBe("tab")
+  test("names a session after the query's host, numbered past taken ids", () => {
+    expect(sessionNameFor("https://www.figma.com/file/x", new Set())).toBe("figma")
+    expect(sessionNameFor("My Account", new Set())).toBe("my")
+    expect(sessionNameFor("..", new Set())).toBe("tab")
+    expect(sessionNameFor("figma.com", new Set(["figma", "figma-2"]))).toBe("figma-3")
   })
 })
 

@@ -31,7 +31,8 @@ export type FoundProfile = {
   visited: string[]
 }
 
-export type FindMatch = { profile: string; tab: FoundTab; next: string }
+/** A matching tab and the command to run next; `note` says when that command can't name exactly this tab. */
+export type FindMatch = { profile: string; tab: FoundTab; next: string; note?: string }
 
 export type FindReport = {
   query?: string
@@ -60,10 +61,12 @@ function webHost(url: string): string | undefined {
 }
 
 /**
- * Hosts each profile's sessions visited, most visits first, from `<root>/sessions/<id>/journal.jsonl`. An entry names
- * its relay port; an older one without it counts for every profile whose session catalog lists its session.
+ * What the data root records about past sessions: the hosts each profile's sessions visited, most visits first, from
+ * `<root>/sessions/<id>/journal.jsonl`, and every session id in use or with a journal (a new id must avoid them all,
+ * or it would join a live session or an old journal). A journal entry names its relay port; an older one without it
+ * counts for every profile whose session catalog lists its session.
  */
-export function visitedHosts(profiles: readonly ProfileRecord[], root = dataRoot()): Map<string, string[]> {
+export function sessionHistory(profiles: readonly ProfileRecord[], root = dataRoot()): { visited: Map<string, string[]>; sessionIds: Set<string> } {
   const byPort = new Map(profiles.map((profile) => [profile.port, profile.name]))
   const catalogs = new Map<string, string[]>()
   for (const profile of profiles) {
@@ -79,9 +82,11 @@ export function visitedHosts(profiles: readonly ProfileRecord[], root = dataRoot
       catalogs.set(entry.id, [...(catalogs.get(entry.id) ?? []), profile.name])
     }
   }
+  const sessionIds = new Set(catalogs.keys())
   const counts = new Map<string, Map<string, number>>()
   const sessionsDir = path.join(root, "sessions")
   for (const id of existsSync(sessionsDir) ? readdirSync(sessionsDir) : []) {
+    sessionIds.add(id)
     let text: string
     try {
       text = readFileSync(path.join(sessionsDir, id, "journal.jsonl"), "utf8")
@@ -106,31 +111,60 @@ export function visitedHosts(profiles: readonly ProfileRecord[], root = dataRoot
       }
     }
   }
-  return new Map([...counts].map(([name, tally]) => [name, [...tally].sort((a, b) => b[1] - a[1]).map(([host]) => host)]))
+  const visited = new Map([...counts].map(([name, tally]) => [name, [...tally].sort((a, b) => b[1] - a[1]).map(([host]) => host)]))
+  return { visited, sessionIds }
 }
 
-/** A session id made from the query: its host's first label, or its first word ("figma.com/file/x" gives figma). */
-export function sessionNameFor(query: string): string {
+/**
+ * A session id made from the query (its host's first label, or its first word: "figma.com/file/x" gives figma) that
+ * isn't in `taken`, numbered when it is (figma-2). Adopting into an existing session would close that session's page.
+ */
+export function sessionNameFor(query: string, taken: ReadonlySet<string>): string {
   const base = query.toLowerCase().replace(/^[a-z]+:\/\//, "").replace(/^www\./, "").split(/[./:?#\s]/)[0] ?? ""
-  return base.replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "tab"
+  const name = base.replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "tab"
+  let candidate = name
+  for (let n = 2; taken.has(candidate); n++) candidate = `${name}-${n}`
+  return candidate
 }
 
-/** The tab's next command: continue its session, else adopt it (a user tab), else select it for one execute. */
-function nextCommand(profile: string, tab: FoundTab, query: string): string {
-  const prefix = `--profile ${profile}`
-  if (tab.session) return cliCommand(`${prefix} execute --session ${quoted(tab.session)} 'return page.url()'`)
-  if (tab.owner === "user" && tab.tabId !== undefined)
-    return cliCommand(`${prefix} session adopt --tab-id ${tab.tabId} --session ${sessionNameFor(query)}`)
-  return cliCommand(`${prefix} execute --target-url ${quoted(tab.url)} 'return page.url()'`)
+/**
+ * The tab's next command: continue its session, else adopt it into a new session (a user tab), else select it for one
+ * execute. A session with several pages drives its default page unless told which, so a tab in one gets
+ * `--target-url` with its URL when no other tab of the profile contains that URL, and a note when one does.
+ */
+function nextStep(profile: FoundProfile, tab: FoundTab, query: string, taken: Set<string>): Pick<FindMatch, "next" | "note"> {
+  const prefix = `--profile ${profile.name}`
+  const unique = profile.tabs.filter((other) => other.url.includes(tab.url)).length === 1
+  const tabName = tab.tabId === undefined ? "this tab" : `tab ${tab.tabId}`
+  if (tab.session) {
+    const shared = profile.tabs.filter((other) => other.session === tab.session).length > 1
+    if (!shared) return { next: cliCommand(`${prefix} execute --session ${quoted(tab.session)} 'return page.url()'`) }
+    if (unique) return { next: cliCommand(`${prefix} execute --session ${quoted(tab.session)} --target-url ${quoted(tab.url)} 'return page.url()'`) }
+    return {
+      next: cliCommand(`${prefix} execute --session ${quoted(tab.session)} 'return context.pages().map((p) => p.url())'`),
+      note: `Session ${tab.session} has several pages and another tab shares this URL, so --session alone drives its default page, which may not be ${tabName}; pick the page from context.pages().`,
+    }
+  }
+  if (tab.owner === "user" && tab.tabId !== undefined) {
+    const session = sessionNameFor(query, taken)
+    taken.add(session)
+    return { next: cliCommand(`${prefix} session adopt --tab-id ${tab.tabId} --session ${session}`) }
+  }
+  const next = cliCommand(`${prefix} execute --target-url ${quoted(tab.url)} 'return page.url()'`)
+  return unique ? { next } : { next, note: `Another tab contains this URL, so --target-url won't pick ${tabName} alone; use a longer URL.` }
 }
 
-/** The query's part of the report: matching tabs (URL or title), profiles that visited its host, and advice. */
-export function matchQuery(profiles: readonly FoundProfile[], query: string): Pick<FindReport, "matches" | "visitedBy" | "advice"> {
+/**
+ * The query's part of the report: matching tabs (URL or title), profiles that visited its host, and advice.
+ * `sessionIds` are the ids already in use (sessionHistory); a suggested new session avoids them and every live one.
+ */
+export function matchQuery(profiles: readonly FoundProfile[], query: string, sessionIds: ReadonlySet<string>): Pick<FindReport, "matches" | "visitedBy" | "advice"> {
   const wanted = query.toLowerCase()
+  const taken = new Set([...sessionIds, ...profiles.flatMap((profile) => [...profile.sessions, ...profile.tabs.flatMap((tab) => tab.session ?? [])])])
   const matches = profiles.flatMap((profile) =>
     profile.tabs
       .filter((tab) => tab.url.toLowerCase().includes(wanted) || tab.title.toLowerCase().includes(wanted))
-      .map((tab) => ({ profile: profile.name, tab, next: nextCommand(profile.name, tab, query) })),
+      .map((tab): FindMatch => ({ profile: profile.name, tab, ...nextStep(profile, tab, query, taken) })),
   )
   const wantedHost = wanted.replace(/^[a-z]+:\/\//, "").replace(/^www\./, "").split(/[/?#]/)[0] ?? ""
   const visitedBy = wantedHost
@@ -149,7 +183,7 @@ export function matchQuery(profiles: readonly FoundProfile[], query: string): Pi
 /** Reads each profile's relay (never starting one) and journals into a report. */
 export async function findTabs(query: string | undefined, root = dataRoot()): Promise<FindReport> {
   const records = readProfiles(root)
-  const visited = visitedHosts(records, root)
+  const history = sessionHistory(records, root)
   const profiles = await Promise.all(records.map(async (record): Promise<FoundProfile> => {
     const probe = await probeRelay(record.port, root)
     const base = {
@@ -157,7 +191,7 @@ export async function findTabs(query: string | undefined, root = dataRoot()): Pr
       port: record.port,
       ...(record.label ? { label: record.label } : {}),
       relay: probe.relay,
-      visited: visited.get(record.name) ?? [],
+      visited: history.visited.get(record.name) ?? [],
     }
     if (probe.relay !== "running") return { ...base, connected: false, tabs: [], sessions: [] }
     const { status } = probe
@@ -183,7 +217,7 @@ export async function findTabs(query: string | undefined, root = dataRoot()): Pr
     return { ...base, connected: status.connected === true, tabs, sessions }
   }))
   if (!query) return { profiles, matches: [], visitedBy: [] }
-  return { query, profiles, ...matchQuery(profiles, query) }
+  return { query, profiles, ...matchQuery(profiles, query, history.sessionIds) }
 }
 
 function describeRelay(profile: FoundProfile): string {
@@ -210,8 +244,10 @@ export function formatFindReport(report: FindReport): string {
   }
   if (report.query) {
     lines.push("")
-    for (const match of report.matches)
+    for (const match of report.matches) {
       lines.push(`"${report.query}" is attached on ${match.profile}${match.tab.tabId === undefined ? "" : ` (tab ${match.tab.tabId})`}: ${match.tab.url}`, `  ${match.next}`)
+      if (match.note) lines.push(`  ${match.note}`)
+    }
     if (report.advice) lines.push(report.advice)
   }
   return lines.join("\n")
