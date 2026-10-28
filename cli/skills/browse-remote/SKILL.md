@@ -46,6 +46,9 @@ the script refuses them. Ampere's 19990 is Rakhi's proxy.
 - `OPENCODE_BROWSER_HOME=~/.opencode-browser-mac`: the Mac's relay token (mode 0600) and the shifted profiles, apart
   from any local relay's data. Every call except `/version` needs that token; without it the relay answers 401.
 
+Ubuntu ships `/usr/bin/browse` as a link to `xdg-open`. A non-login shell (`ssh ampere 'browse …'`) has no
+`~/.local/bin` on PATH and runs that instead, so call `~/.local/bin/browse` by full path there.
+
 Execute code, `files.write()`, network captures and `secrets run` all run on the Mac relay, so files they write are on
 the Mac. Never run `browse install`, `update`, or `profiles add|remove|sync` here; those belong on the Mac. Don't use
 the `webSocketDebuggerUrl` from `/json/version` on ampere: it names the Mac port and carries the token, so a client
