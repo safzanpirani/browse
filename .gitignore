@@ -5,3 +5,5 @@ release/
 relay-pairing.json
 # Per-profile relay port written into profile copies by `profiles add` (see cli/src/profiles.ts)
 relay-port.json
+# Publish lock the extension build holds while it swaps a build into dist/ (see scripts/build-extension.ts)
+/dist.lock*
