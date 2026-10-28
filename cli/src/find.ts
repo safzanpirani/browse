@@ -5,7 +5,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import path from "node:path"
 import { cliCommand, dataRoot } from "./paths.ts"
-import { probeRelay, ProfileError, readProfiles, type ProfileRecord } from "./profiles.ts"
+import { probeRelay, ProfileError, readProfiles, reservedPortProblem, type ProfileRecord } from "./profiles.ts"
 
 export type FoundTab = {
   tabId?: number
@@ -23,7 +23,7 @@ export type FoundProfile = {
   name: string
   port: number
   label?: string
-  relay: "running" | "stopped" | "foreign"
+  relay: "running" | "stopped" | "foreign" | "reserved"
   connected: boolean
   tabs: FoundTab[]
   sessions: string[]
@@ -189,6 +189,7 @@ export async function findTabs(query: string | undefined, root = dataRoot()): Pr
 function describeRelay(profile: FoundProfile): string {
   if (profile.relay === "stopped") return "relay not running"
   if (profile.relay === "foreign") return "port held by another relay (it refused this install's token)"
+  if (profile.relay === "reserved") return `not asked: ${reservedPortProblem(profile.port)} Fix its port in profiles.json`
   if (!profile.connected) return "relay running, extension not connected"
   const count = profile.tabs.length
   return `extension connected, ${count} attached tab${count === 1 ? "" : "s"}`

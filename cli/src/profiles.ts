@@ -35,8 +35,11 @@ export type ProfileRecord = {
 }
 
 export type ProfileStatus = ProfileRecord & {
-  /** running: answered with this install's token; foreign: another install's relay (it refused the token). */
-  relay: "running" | "stopped" | "foreign"
+  /**
+   * running: answered with this install's token; foreign: another install's relay (it refused the token); reserved:
+   * a port the token is never sent to (reservedPortProblem), so it wasn't asked.
+   */
+  relay: "running" | "stopped" | "foreign" | "reserved"
   connected: boolean
   /** Tabs the relay has attached (its root targets). */
   attachedTabs: number
@@ -163,6 +166,8 @@ export function portProblem(port: number, profiles: readonly ProfileRecord[]): s
   if (port >= reservedPortRange.first && port <= reservedPortRange.last)
     return `Port ${port} is in ${reservedPortRange.first}-${reservedPortRange.last}, browser-control's relays. Pick another.`
   if (port === defaultPort) return `Port ${port} is the default relay's, which the extension folder install set up dials. Pick another.`
+  const reserved = reservedPortProblem(port)
+  if (reserved) return `${reserved} Pick another.`
   const owner = profiles.find((profile) => profile.port === port)
   if (owner) return `Port ${port} is already profile "${owner.name}"'s.`
   return undefined
@@ -274,21 +279,41 @@ export function refreshProfileCopies(source: string, code: string, root = dataRo
   }
 }
 
-const relayRequest = (root: string, port: number, pathname: string, init: RequestInit = {}) =>
-  fetch(`http://127.0.0.1:${port}${pathname}`, {
+/**
+ * Why this install's relay token must never go to `port`, or undefined when it may: the default relay and
+ * browser-control's relays (19988-19995), and the same ports + 10000, where browse-remote reaches a Mac's relays. A
+ * profiles.json entry on one of them (it can be edited by hand) must not hand them the token.
+ */
+export function reservedPortProblem(port: number): string | undefined {
+  const mac = port >= defaultPort + 10_000 && port <= reservedPortRange.last + 10_000 ? port - 10_000 : port
+  if (mac < defaultPort || mac > reservedPortRange.last) return undefined
+  const owner = mac === defaultPort ? "the default relay's" : "browser-control's"
+  return `Port ${port} is ${mac === port ? owner : `Mac port ${mac} + 10000, ${owner}`}, and no profile may use it.`
+}
+
+/** A request to a profile's relay with this install's token; refused, before anything is sent, on a reserved port. */
+function relayRequest(root: string, port: number, pathname: string, init: RequestInit = {}): Promise<Response> {
+  const reserved = reservedPortProblem(port)
+  if (reserved) return Promise.reject(new ProfileError(reserved))
+  return fetch(`http://127.0.0.1:${port}${pathname}`, {
     ...init,
     headers: { authorization: relayAuthorization(root), ...init.headers },
     signal: AbortSignal.timeout(1_500),
   })
+}
 
-/** What a profile's relay answered at /extension/status: running (with the status body), stopped, or foreign. */
-export type RelayProbe = { relay: "running"; status: Record<string, unknown> } | { relay: "stopped" | "foreign" }
+/**
+ * What a profile's relay answered at /extension/status: running (with the status body), stopped, foreign, or reserved
+ * (a port reservedPortProblem refuses, so nothing was sent).
+ */
+export type RelayProbe = { relay: "running"; status: Record<string, unknown> } | { relay: "stopped" | "foreign" | "reserved" }
 
 /**
  * Asks a relay for /extension/status with this install's token, never starting one. A refused token (401) is another
  * install's relay; no answer, or any other failure (a tunnel proxy's 502 when the far relay is down), is stopped.
  */
 export async function probeRelay(port: number, root = dataRoot()): Promise<RelayProbe> {
+  if (reservedPortProblem(port)) return { relay: "reserved" }
   const response = await relayRequest(root, port, "/extension/status").catch(() => undefined)
   if (!response) return { relay: "stopped" }
   if (!response.ok) return { relay: response.status === 401 ? "foreign" : "stopped" }
@@ -354,6 +379,8 @@ export function selectProfile(args: readonly string[], env: Env, root = dataRoot
   const name = flag ?? env.OPENCODE_BROWSER_PROFILE
   if (!name) return { args: rest }
   const profile = resolveProfile(readProfiles(root), name)
+  const reserved = reservedPortProblem(profile.port)
+  if (reserved) throw new ProfileError(`Profile "${profile.name}": ${reserved} Fix its port in ${profilesFile(root)}.`)
   if (flag === undefined && env.OPENCODE_BROWSER_PORT && Number(env.OPENCODE_BROWSER_PORT) !== profile.port)
     throw new ProfileError(`OPENCODE_BROWSER_PROFILE=${name} is port ${profile.port}, but OPENCODE_BROWSER_PORT is ${env.OPENCODE_BROWSER_PORT}. Unset one.`)
   return { args: rest, profile }
@@ -401,6 +428,7 @@ const log = (line = "") => {
 function describeStatus(status: ProfileStatus) {
   if (status.relay === "stopped") return "relay stopped"
   if (status.relay === "foreign") return "port held by another relay (it refused this install's token)"
+  if (status.relay === "reserved") return `not asked: ${reservedPortProblem(status.port)} Fix its port in profiles.json`
   if (!status.connected) return "relay running, extension not connected"
   return `connected, ${status.attachedTabs} attached tab${status.attachedTabs === 1 ? "" : "s"}, ${status.sessions} session${status.sessions === 1 ? "" : "s"}`
 }

@@ -111,26 +111,41 @@ describe("findTabs", () => {
           : new Response("no", { status: 401 }),
     })
     const proxy = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("unreachable through tunnel", { status: 502 }) })
+    const realFetch = globalThis.fetch
+    const asked: string[] = []
+    globalThis.fetch = Object.assign((input: string | URL | Request, init?: RequestInit) => {
+      asked.push(String(input))
+      return realFetch(input, init)
+    }, realFetch)
     try {
       root = dataRoot([
         { name: "work", port: relay.port!, label: "Work (Profile 5)" },
         { name: "gone", port: stoppedPort },
         { name: "far", port: proxy.port! },
+        // Hand-edited onto browser-control's relay, and onto its browse-remote offset: never sent the token.
+        { name: "bc", port: 19990 },
+        { name: "bcremote", port: 29991 },
       ])
       const report = await findTabs("figma", root)
       expect(report.profiles.map(({ name, relay, connected, tabs, sessions }) => ({ name, relay, connected, tabs, sessions }))).toEqual([
         { name: "work", relay: "running", connected: true, tabs: [{ tabId: 12, url: "https://www.figma.com/file/abc", title: "Board", owner: "user", session: "figma" }], sessions: ["figma"] },
         { name: "gone", relay: "stopped", connected: false, tabs: [], sessions: [] },
         { name: "far", relay: "stopped", connected: false, tabs: [], sessions: [] },
+        { name: "bc", relay: "reserved", connected: false, tabs: [], sessions: [] },
+        { name: "bcremote", relay: "reserved", connected: false, tabs: [], sessions: [] },
       ])
+      expect(asked.some((url) => url.includes(`:${relay.port}/`))).toBe(true)
+      expect(asked.filter((url) => /:(19990|29991)\//.test(url))).toEqual([])
       expect(report.matches.map((match) => match.next)).toEqual([expect.stringContaining("--profile work execute --session figma")])
       const text = formatFindReport(report)
       expect(text).toContain("work  port")
       expect(text).toContain("extension connected, 1 attached tab  [Work (Profile 5)]")
       expect(text).toContain("gone  port")
       expect(text).toContain("relay not running")
+      expect(text).toContain("bcremote  port 29991  not asked: Port 29991 is Mac port 19991 + 10000, browser-control's")
       expect(text).toContain('"figma" is attached on work (tab 12)')
     } finally {
+      globalThis.fetch = realFetch
       relay.stop(true)
       proxy.stop(true)
     }

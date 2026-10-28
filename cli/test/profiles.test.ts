@@ -11,6 +11,7 @@ import {
   readProfiles,
   refreshProfileCopies,
   removeProfile,
+  reservedPortProblem,
   selectProfile,
   syncProfileCopies,
 } from "../src/profiles.ts"
@@ -78,6 +79,7 @@ describe("profiles add", () => {
     addProfile({ root, name: "work", source, code: CODE })
     for (const port of [19989, 19992, 19995]) expect(refusal(() => addProfile({ root, name: "x", port, source, code: CODE }))).toMatch(/browser-control/)
     expect(refusal(() => addProfile({ root, name: "x", port: 19988, source, code: CODE }))).toMatch(/default relay/)
+    for (const port of [29988, 29990, 29995]) expect(refusal(() => addProfile({ root, name: "x", port, source, code: CODE }))).toMatch(/\+ 10000/)
     expect(refusal(() => addProfile({ root, name: "x", port: 19960, source, code: CODE }))).toMatch(/profile "work"/)
     expect(refusal(() => addProfile({ root, name: "x", port: 80, source, code: CODE }))).toMatch(/valid port/)
     expect(refusal(() => addProfile({ root, name: "work", port: 19961, source, code: CODE }))).toMatch(/already exists/)
@@ -219,6 +221,29 @@ describe("profiles list", () => {
       ours.stop(true)
       foreign.stop(true)
     }
+  })
+
+  test("never sends the token to a reserved port written into profiles.json by hand", async () => {
+    const { root } = sandbox()
+    fs.mkdirSync(root, { recursive: true })
+    const ports = [19988, 19990, 19995, 29988, 29991, 29995]
+    fs.writeFileSync(profilesFile(root), JSON.stringify({ version: 1, profiles: ports.map((port) => ({ name: `p${port}`, port })) }))
+    const realFetch = globalThis.fetch
+    let calls = 0
+    globalThis.fetch = Object.assign((input: string | URL | Request, init?: RequestInit) => {
+      calls++
+      return realFetch(input, init)
+    }, realFetch)
+    try {
+      const statuses = await profileStatuses(readProfiles(root), root)
+      expect(statuses.map((status) => status.relay)).toEqual(ports.map(() => "reserved"))
+      expect(calls).toBe(0)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    for (const port of ports) expect(reservedPortProblem(port)).toBeString()
+    for (const port of [19960, 19966, 19987, 19996, 29960, 29987, 29996]) expect(reservedPortProblem(port)).toBeUndefined()
+    expect(refusal(() => selectProfile(["--profile", "p29991", "status"], {}, root))).toMatch(/Mac port 19991 \+ 10000, browser-control's/)
   })
 })
 
