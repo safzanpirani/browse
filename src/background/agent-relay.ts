@@ -40,6 +40,7 @@ import { DebuggerHub } from "./debugger-hub"
 import { HandoffNotice } from "./handoff-notice"
 import { normalizePairingCode, pairingProof, randomNonce, sameSecret } from "./pairing"
 import { PageScripts } from "./page-scripts"
+import { packagedRelayPort } from "./relay-port"
 import { TabCleanup } from "./tab-cleanup"
 import { UserSettings } from "./user-settings"
 
@@ -186,7 +187,7 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
     if (socket && socket.readyState <= WebSocket.OPEN) return
     clearTimeout(retry)
     retry = undefined
-    port = Number((await chrome.storage.local.get(PORT_KEY))[PORT_KEY]) || defaultRelayPort
+    port = Number((await chrome.storage.local.get(PORT_KEY))[PORT_KEY]) || (await packagedRelayPort()) || defaultRelayPort
     if (socket && socket.readyState <= WebSocket.OPEN) return
     // Without a pairing code there is no relay to trust; wait for one (install, or the status page).
     if ((await pairingCode()) === undefined) {

@@ -17,8 +17,9 @@ manifest.version = (await Bun.file(path.join(root, "cli", "package.json")).json(
 await Bun.write(path.join(staging, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n")
 const zip = path.join(root, "release", `opencode-browser-${manifest.version}.zip`)
 await rm(zip, { force: true })
-// install writes this checkout's pairing code into public/ (and so dist/); it is private to this machine.
-await rm(path.join(staging, "relay-pairing.json"), { force: true })
-await $`zip -qrX ${zip} . -x "*.map" -x ".DS_Store" -x "relay-pairing.json"`.cwd(staging)
+// install writes this checkout's pairing code into public/ (and so dist/); it is private to this machine, as is a
+// relay-port.json (profiles pin their port in their own copies, but one may have been dropped into public/ by hand).
+for (const file of ["relay-pairing.json", "relay-port.json"]) await rm(path.join(staging, file), { force: true })
+await $`zip -qrX ${zip} . -x "*.map" -x ".DS_Store" -x "relay-pairing.json" -x "relay-port.json"`.cwd(staging)
 await rm(staging, { recursive: true, force: true })
 console.log(zip)

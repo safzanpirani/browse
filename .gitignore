@@ -3,3 +3,5 @@ dist/
 release/
 # Per-install pairing code written by `install` (see cli/src/relay-secrets.ts)
 relay-pairing.json
+# Per-profile relay port written into profile copies by `profiles add` (see cli/src/profiles.ts)
+relay-port.json
