@@ -67,7 +67,7 @@ import { appendRelayLifecycleEvent, RelayLifecycleEvent } from "./relay-lifecycl
 import { RelayShutdown } from "./relay-shutdown.ts"
 import { ProtectedFrameTracker } from "./protected-frames.ts"
 import { RootTargetLifecycle } from "./root-target-lifecycle.ts"
-import { boundedToken, runtimeFailureKind, summarizeDiagnosticUrl, summarizeRuntimeEvaluate } from "./runtime-diagnostics.ts"
+import { boundedToken, isMissingChromeSessionError, runtimeFailureKind, summarizeDiagnosticUrl, summarizeRuntimeEvaluate } from "./runtime-diagnostics.ts"
 import { shouldExposeChildTarget, TargetRegistry, type RootTargetChange, type TargetOwnershipChange } from "./target-registry.ts"
 import { createUpdateWatcher } from "./update.ts"
 import { describeChanges, describeSettings, parseSettingChanges, settingsFromExtension, SettingsInputError, settingsToExtension, type SettingOverrides } from "./user-settings.ts"
@@ -1710,6 +1710,12 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         // is open in it; clients only see the rejection, so record it per tab.
         Effect.tapError((error) => Effect.sync(() => {
           if (runtimeFailureKind(error) === "cross-extension-page") setProtectedUi(tabId, true)
+          // Chrome dropped this child session (a frame or worker torn down by a
+          // navigation) without a detach event reaching the relay. Detach it
+          // before the error reply so clients dispose it: Playwright then treats
+          // the pending call as a closed child session instead of failing
+          // page-wide calls such as unroute's Network.setCacheDisabled.
+          if (route.chromeSessionId !== undefined && isMissingChromeSessionError(error)) detachChildTargetState(route.chromeSessionId)
         })),
         Effect.tap(() => Effect.sync(() => setProtectedUi(tabId, false))),
       )

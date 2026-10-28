@@ -593,3 +593,53 @@ describe("dataUrlDocument", () => {
     expect(await dataUrlDocument("data:application/pdf;base64,JVBERi0=")).toBeUndefined()
   })
 })
+
+type CdpMessage = { id?: number; method?: string; params?: Record<string, unknown>; sessionId?: string; error?: { message: string } }
+
+describe("child sessions", () => {
+  test("a command for a child session Chrome dropped detaches the child before the error reply", async () => {
+    const tabId = 81
+    const targetInfo = { targetId: "TARGET-81", type: "page", title: "Example", url: "https://example.com/", attached: true, browserContextId: "CTX" }
+    const extension = new FakeExtension(pairingCode(home))
+      .on("tabs.create", () => ({ tabId }))
+      .on("Target.getTargetInfo", () => ({ targetInfo }))
+      .on("Network.setCacheDisabled", (command) => {
+        if (command.params?.sessionId === "oopif-session") throw new Error("{\"code\":-32001,\"message\":\"Session with given id not found.\"}")
+        return {}
+      })
+    expect(await extension.pair()).toBe(true)
+    const socket = await connectCdp(`ws://127.0.0.1:${port}/devtools/browser/test?opencodeBrowserSessionId=stale-child`, { authorization: `Bearer ${token}` })
+    if (!(socket instanceof WebSocket)) throw new Error(`CDP connection refused: ${socket}`)
+    const messages = collect(socket) as CdpMessage[]
+    expect((await cdpCall(socket, 1, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true })).error).toBeUndefined()
+    expect((await cdpCall(socket, 2, "Target.createTarget", { url: "https://example.com/" })).result?.targetId).toBe("TARGET-81")
+
+    // A cross-origin frame whose detach never reached the relay, e.g. torn down by a failed reload while request
+    // interception was active.
+    extension.emit("debugger.event", {
+      tabId,
+      method: "Target.attachedToTarget",
+      params: { sessionId: "oopif-session", targetInfo: { targetId: "OOPIF-81", type: "iframe", title: "", url: "https://frame.example/", attached: true, browserContextId: "CTX" }, waitingForDebugger: false },
+    })
+    expect(await until(() => messages.some((message) => message.method === "Target.attachedToTarget" && message.params?.sessionId === "oopif-session"))).toBe(true)
+
+    socket.send(JSON.stringify({ id: 3, sessionId: "oopif-session", method: "Network.setCacheDisabled", params: { cacheDisabled: false } }))
+    expect(await until(() => messages.some((message) => message.id === 3))).toBe(true)
+    const detachIndex = messages.findIndex((message) => message.method === "Target.detachedFromTarget" && message.params?.sessionId === "oopif-session")
+    const replyIndex = messages.findIndex((message) => message.id === 3)
+    // Playwright disposes the session on the detach event, so the pending call fails as "closed" and page-wide calls
+    // such as unroute's Network.setCacheDisabled skip the dead child.
+    expect(detachIndex).toBeGreaterThanOrEqual(0)
+    expect(detachIndex).toBeLessThan(replyIndex)
+    expect(messages[replyIndex]?.error?.message).toContain("Session with given id not found")
+
+    // The relay no longer routes to the dead session, and the tab stays attached.
+    const sentBefore = extension.commands.length
+    const again = await cdpCall(socket, 4, "Network.setCacheDisabled", { cacheDisabled: false }, "oopif-session")
+    expect(again.error?.message).toBe("Unknown CDP session oopif-session for Network.setCacheDisabled")
+    expect(extension.commands.slice(sentBefore).some((command) => command.method === "debugger.sendCommand")).toBe(false)
+    expect(extension.commands.some((command) => command.method === "debugger.detach" && command.params?.tabId === tabId)).toBe(false)
+    socket.close()
+    extension.close()
+  }, 20_000)
+})

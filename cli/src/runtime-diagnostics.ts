@@ -30,6 +30,11 @@ export function runtimeFailureKind(cause: unknown): RuntimeFailureKind {
   return "other"
 }
 
+/** Chrome's reply to a command for a child session (frame or worker) it has already dropped. */
+export function isMissingChromeSessionError(cause: unknown): boolean {
+  return errorMessages(cause).some((message) => /session with given id not found/i.test(message))
+}
+
 export function executionContextFailureDiagnostic(cause: unknown, aftermath: ExecuteAftermath | undefined): string | undefined {
   const kind = runtimeFailureKind(cause)
   if (kind === "cross-extension-page") {
