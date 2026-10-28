@@ -21,7 +21,6 @@ mac="${BROWSE_MAC_HOST:-mac}"
 # Expanded by the Mac's shell.
 mac_launcher="${BROWSE_MAC_LAUNCHER:-\$HOME/.local/bin/browse}"
 mac_home="${BROWSE_MAC_HOME:-\$HOME/.local/share/opencode-browser}"
-mac_skill="${BROWSE_MAC_SKILL:-\$HOME/.agents/skills/browse}"
 # This host's OPENCODE_BROWSER_HOME: the Mac's token and profiles, never a local relay's.
 home="$HOME/.opencode-browser-mac"
 app="${BROWSE_APP:-$HOME/apps/browse}"
@@ -40,6 +39,10 @@ on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$mac" "$@"; }
 die() { echo "$*" >&2; exit 1; }
 # One shell word, for a command line the Mac's shell or this host's launcher parses.
 shq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
+# The Mac's browse skill folder as one word for the Mac's shell: an override is taken literally (quoted, so `$`,
+# backticks and `$(…)` in it are never run there); the default expands $HOME on the Mac.
+mac_skill_name="${BROWSE_MAC_SKILL:-~/.agents/skills/browse}"
+if [[ -n ${BROWSE_MAC_SKILL:-} ]]; then mac_skill="$(shq "$BROWSE_MAC_SKILL")"; else mac_skill='"$HOME/.agents/skills/browse"'; fi
 # Replaces folder <dest> with folder <new> by rename, so this running script and readers never see it half-written.
 swap_in() {
   rm -rf "$2.old"
@@ -211,9 +214,9 @@ EOF
       echo "! $browse_skill exists and isn't this script's; left it alone" >&2
     else
       rm -rf "$browse_skill.new" && mkdir -p "$browse_skill.new" || die "cannot create $browse_skill.new"
-      on_mac "COPYFILE_DISABLE=1 tar -C \"$mac_skill\" -czf - ." | tar --warning=no-unknown-keyword -xzf - -C "$browse_skill.new" \
+      on_mac "COPYFILE_DISABLE=1 tar -C $mac_skill -czf - ." | tar --warning=no-unknown-keyword -xzf - -C "$browse_skill.new" \
         && [[ -s $browse_skill.new/SKILL.md ]] \
-        || { rm -rf "$browse_skill.new"; die "cannot copy the browse skill from $mac:$mac_skill (\`browse install --client omp\` writes it there)"; }
+        || { rm -rf "$browse_skill.new"; die "cannot copy the browse skill from $mac:$mac_skill_name (\`browse install --client omp\` writes it there)"; }
       note="> **On $(hostname -s):** \`browse\` drives the Mac's profiles through \`~/.agents/skills/browse-remote/scripts/mac-relays.sh up\`, at Mac port + 10000; \`--profile <name>\` and \`browse find\` work unchanged, but journals and \`files.write()\` output stay on the Mac. Never run \`browse install\`, \`update\` or \`profiles add|remove|sync\` here (skill browse-remote)."
       awk -v marker="$skill_marker" -v note="$note" '
         /^<!-- Written by `opencode-browser install/ { next }
@@ -222,7 +225,7 @@ EOF
       ' "$browse_skill.new/SKILL.md" > "$browse_skill.new/SKILL.md.tmp" \
         && mv "$browse_skill.new/SKILL.md.tmp" "$browse_skill.new/SKILL.md" \
         && grep -qxF "$skill_marker" "$browse_skill.new/SKILL.md" \
-        || { rm -rf "$browse_skill.new"; die "the browse skill from $mac:$mac_skill has no frontmatter to mark"; }
+        || { rm -rf "$browse_skill.new"; die "the browse skill from $mac:$mac_skill_name has no frontmatter to mark"; }
       swap_in "$browse_skill.new" "$browse_skill"
       echo "✓ browse skill at $browse_skill"
     fi
