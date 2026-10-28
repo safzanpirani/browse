@@ -1,16 +1,22 @@
-// Host-rewriting loopback proxy for tunnelled Browser Control relays.
+// Host-rewriting loopback proxy for tunnelled browse (OpenCode Browser) relays.
 // A relay rejects any request whose Host header port differs from its own port
 // ("Invalid Host header port"), so an ssh -L on a different local port fails. For each
 // relay port P this listens on 127.0.0.1:(P+LISTEN_OFFSET), forwards to the ssh tunnel
 // on 127.0.0.1:(P+TUNNEL_OFFSET), and rewrites Host to 127.0.0.1:P (HTTP and WebSocket).
 //
-//   node relay-proxy.mjs 19989 19990 ...   [LISTEN_OFFSET=10000 TUNNEL_OFFSET=20000]
+//   node relay-proxy.mjs 19989 19990 ...   [LISTEN_OFFSET=10000 TUNNEL_OFFSET=20000 READY_FILE=<path>]
+//
+// Any port it cannot bind ends the whole proxy, so a caller never mistakes another program's listener for it. Once
+// every port listens it writes "<pid> <port>..." to READY_FILE; callers send the relay token only after that.
+import fs from "node:fs"
 import http from "node:http"
 import net from "node:net"
 
 const listenOffset = Number(process.env.LISTEN_OFFSET ?? 10000)
 const tunnelOffset = Number(process.env.TUNNEL_OFFSET ?? 20000)
 const ports = process.argv.slice(2).map(Number)
+const readyFile = process.env.READY_FILE
+let listening = 0
 if (ports.length === 0 || ports.some((p) => !Number.isInteger(p))) {
   console.error("usage: relay-proxy.mjs <relay-port>...")
   process.exit(2)
@@ -53,7 +59,9 @@ for (const relay of ports) {
 
   server.on("error", (err) => {
     console.error(`relay ${relay}: cannot listen on ${relay + listenOffset}: ${err.code ?? err.message}`)
-    process.exitCode = 1
+    process.exit(1)
   })
-  server.listen(relay + listenOffset, "127.0.0.1")
+  server.listen(relay + listenOffset, "127.0.0.1", () => {
+    if (++listening === ports.length && readyFile) fs.writeFileSync(readyFile, `${process.pid} ${ports.join(" ")}\n`)
+  })
 }

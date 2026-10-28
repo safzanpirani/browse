@@ -6,11 +6,12 @@
 #   mac-relays.sh up [port...]         # tunnel every profile in the Mac's profiles.json (or the given Mac ports)
 #   mac-relays.sh status               # tunnel and proxy processes, each relay's /extension/status (with the token)
 #   mac-relays.sh start-mac <port>...  # start (or restart) a relay on the Mac with the Mac's browse
-#   mac-relays.sh stop-mac <port>...   # stop a relay on the Mac
+#   mac-relays.sh stop-mac <port>...   # stop a relay the Mac's browse runs
 #   mac-relays.sh down
 #
 # Mac relay port P is reachable here on P+10000 (the proxy); the tunnel itself is P+20000. `up` writes the Mac's
-# profiles into this host's data root with those ports, so `browse --profile <name>` needs no port.
+# profiles into this host's data root with those ports, so `browse --profile <name>` needs no port. The relay token is
+# sent only to listeners this script started and confirmed (the proxy's ready marker, the tunnel's own sockets).
 # Overrides: BROWSE_MAC_HOST (mac), BROWSE_MAC_LAUNCHER (the Mac's ~/.local/bin/browse), BROWSE_MAC_HOME (the Mac's
 # data root, ~/.local/share/opencode-browser), BROWSE_APP (~/apps/browse here).
 set -uo pipefail
@@ -28,67 +29,128 @@ state="$home/mac-relays"
 here="$(cd "$(dirname "$0")" && pwd)"
 marker="# Written by browse-remote's mac-relays.sh sync, which rewrites it."
 
-mkdir -p "$state"
-chmod 700 "$home" "$state"
+mkdir -p "$state" && chmod 700 "$home" "$state" || { echo "cannot create $state" >&2; exit 1; }
 
 on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$mac" "$@"; }
-alive() { [[ -s $1 ]] && kill -0 "$(cat "$1")" 2>/dev/null; }
 die() { echo "$*" >&2; exit 1; }
+# One shell word, for a command line the Mac's shell or this host's launcher parses.
+shq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
 
-stop() {
-  for f in ssh proxy; do
-    alive "$state/$f.pid" && kill "$(cat "$state/$f.pid")"
-    rm -f "$state/$f.pid"
-  done
-}
-
-# browser-control's relays on the Mac; this script never starts or stops them.
+# A Mac relay port: plain decimal (no leading zero, which bash would read as octal), and never browser-control's.
 check_port() {
-  [[ $1 =~ ^[0-9]+$ ]] || die "not a port: $1"
+  [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )) || die "not a port: $1"
   (( $1 >= 19989 && $1 <= 19995 )) && die "port $1 is browser-control's; browse relays use 19960-19966 (or 19988)"
   return 0
 }
+
+# The CLI entry the Mac's launcher runs (its exec line, as omp's install writes it).
+mac_entry() {
+  local entry
+  entry="$(on_mac "cat \"$mac_launcher\"" | sed -n "s/^exec '[^']*' '\([^']*\)' .*/\1/p")"
+  [[ $entry == /*/dist/cli.mjs ]] || die "cannot read the CLI path from the Mac's launcher ($mac_launcher); is browse installed there?"
+  printf '%s' "$entry"
+}
+
+# A live process's start time (clock ticks after boot), which a reused pid does not share. Fails for a zombie.
+start_time() {
+  local stat fields
+  [[ $1 =~ ^[0-9]+$ && -r /proc/$1/stat ]] || return 1
+  stat="$(<"/proc/$1/stat")" || return 1
+  read -ra fields <<<"${stat##*) }"
+  [[ ${fields[0]} != Z ]] && printf '%s' "${fields[19]}"
+}
+# Records a process this script started as "<pid> <start time>" in $state/<name>.pid.
+record() {
+  local started
+  started="$(start_time "$2")" || return 1
+  printf '%s %s\n' "$2" "$started" > "$state/$1.pid"
+}
+# Prints the recorded pid while it is still that process; fails (and signals nothing) otherwise.
+owned() {
+  local pid started
+  read -r pid started < "$state/$1.pid" 2>/dev/null || return 1
+  [[ -n $started && $(start_time "$pid") == "$started" ]] && printf '%s' "$pid"
+}
+stop() {
+  local pid
+  for f in ssh proxy; do
+    pid="$(owned "$f")" && kill "$pid"
+    rm -f "$state/$f.pid"
+  done
+  rm -f "$state/ready"
+}
+
+# Whether <pid> holds the listening socket on 127.0.0.1:<port>.
+listens() { ss -Hltnp "sport = :$1" 2>/dev/null | grep -q "pid=$2,"; }
+# Sets ssh_pid and proxy_pid when both are this script's and the proxy confirmed every port in $state/ports.
+confirmed() {
+  local ports
+  ssh_pid="$(owned ssh)" && proxy_pid="$(owned proxy)" && [[ -s $state/ports && -s $state/ready ]] || return 1
+  mapfile -t ports < "$state/ports"
+  [[ $(<"$state/ready") == "$proxy_pid ${ports[*]}" ]]
+}
+# Whether Mac port <p>'s proxy and tunnel sockets belong to the confirmed proxy and ssh.
+port_ours() { listens "$(( $1 + 10000 ))" "$proxy_pid" && listens "$(( $1 + 20000 ))" "$ssh_pid"; }
 
 # curl with the relay token as a header read from stdin, so it never shows in argv.
 authed_curl() {
   printf 'header = "Authorization: Bearer %s"\n' "$(<"$home/relay-token")" | curl -s -K - "$@"
 }
 
+ssh_pid=""
+proxy_pid=""
 case "${1:-status}" in
   sync)
     command -v node >/dev/null || die "node is not on PATH"
     command -v bun >/dev/null || die "bun is not on PATH (it installs the CLI's dependencies)"
-    entry="$(on_mac "cat \"$mac_launcher\"" | sed -n "s/^exec '[^']*' '\([^']*\)' .*/\1/p")"
-    [[ $entry == */dist/cli.mjs ]] || die "cannot read the CLI path from the Mac's launcher ($mac_launcher); is browse installed there?"
+    entry="$(mac_entry)" || exit 1
     cli="${entry%/dist/cli.mjs}"
-    mkdir -p "$app/cli"
-    incoming="$(mktemp -d "$app/.sync.XXXXXX")"
-    trap 'rm -rf "$incoming"' EXIT
-    on_mac "COPYFILE_DISABLE=1 tar -C '$cli' -czf - dist package.json bun.lock skills/browse-remote" \
-      | tar --warning=no-unknown-keyword -xzf - -C "$incoming" \
+    live="$app/cli"
+    # The new CLI is assembled in its own release folder; $app/cli, a symlink, switches to it in one rename once it
+    # is complete, so an interrupted sync leaves the old CLI working and the next sync starts over.
+    mkdir -p "$app/releases" || die "cannot create $app/releases"
+    next="$app/releases/$(date +%Y%m%d-%H%M%S)-$$"
+    mkdir "$next" || die "cannot create $next"
+    trap 'rm -rf "$next"' EXIT
+    on_mac "COPYFILE_DISABLE=1 tar -C $(shq "$cli") -czf - dist package.json bun.lock skills/browse-remote" \
+      | tar --warning=no-unknown-keyword -xzf - -C "$next" \
       || die "cannot copy the built CLI from $mac:$cli"
-    [[ -s $incoming/dist/cli.mjs ]] || die "$mac:$cli has no built dist/cli.mjs"
-    deps=0
-    cmp -s "$incoming/package.json" "$app/cli/package.json" && cmp -s "$incoming/bun.lock" "$app/cli/bun.lock" \
-      && [[ -d $app/cli/node_modules ]] || deps=1
-    rm -rf "$app/cli/dist" "$app/cli/skills"
-    mv "$incoming/dist" "$incoming/skills" "$incoming/package.json" "$incoming/bun.lock" "$app/cli/"
-    if (( deps )); then
-      (cd "$app/cli" && bun install --production --frozen-lockfile --ignore-scripts) || die "bun install failed in $app/cli"
+    [[ -s $next/dist/cli.mjs ]] || die "$mac:$cli has no built dist/cli.mjs"
+    deps="$(cat "$next/package.json" "$next/bun.lock" | sha256sum | cut -d' ' -f1)"
+    # .deps names the manifests a release's node_modules was installed from; it is written only after that worked.
+    if [[ -d $live/node_modules && -s $live/.deps && $(<"$live/.deps") == "$deps" ]]; then
+      cp -al "$live/node_modules" "$next/node_modules" || die "cannot link node_modules into $next"
+    else
+      (cd "$next" && bun install --production --frozen-lockfile --ignore-scripts) || die "bun install failed in $next"
     fi
-    echo "✓ CLI from $mac:$cli at $app/cli ($(md5sum < "$app/cli/dist/cli.mjs" | cut -c1-12))"
+    printf '%s\n' "$deps" > "$next/.deps" || die "cannot write $next/.deps"
+    node "$next/dist/cli.mjs" --version >/dev/null || die "the new CLI in $next does not run"
+    legacy=""
+    if [[ -d $live && ! -L $live ]]; then
+      # An install from before releases: a plain folder. Moved aside once, put back if the switch fails.
+      legacy="$app/releases/00000000-legacy-$$"
+      mv "$live" "$legacy" || die "cannot move $live aside"
+    fi
+    if ! { ln -sfn "releases/${next##*/}" "$app/cli.tmp" && mv -T "$app/cli.tmp" "$live"; }; then
+      [[ -n $legacy ]] && mv "$legacy" "$live"
+      die "cannot switch $live to $next"
+    fi
+    trap - EXIT
+    # The previous release stays, for a command still running from it.
+    ls -1d "$app/releases"/* | sort | head -n -2 | while read -r old; do rm -rf "$old"; done
+    echo "✓ CLI from $mac:$cli at $live → releases/${next##*/} ($(md5sum < "$live/dist/cli.mjs" | cut -c1-12))"
 
     # The token goes through ssh stdout into a 0600 file; it is never printed or passed as an argument.
     (umask 077 && on_mac "cat \"$mac_home/relay-token\"" > "$home/relay-token.tmp") && [[ -s $home/relay-token.tmp ]] \
       || { rm -f "$home/relay-token.tmp"; die "cannot read the Mac's relay token at $mac_home/relay-token"; }
-    mv "$home/relay-token.tmp" "$home/relay-token"
+    mv "$home/relay-token.tmp" "$home/relay-token" || die "cannot write $home/relay-token"
     echo "✓ relay token at $home/relay-token"
 
     if [[ -e $launcher ]] && ! grep -qxF "$marker" "$launcher"; then
       echo "! $launcher exists and isn't this script's; left it alone" >&2
     else
-      mkdir -p "$(dirname "$launcher")"
-      cat > "$launcher.tmp" <<EOF
+      mkdir -p "$(dirname "$launcher")" || die "cannot create $(dirname "$launcher")"
+      cat > "$launcher.tmp" <<EOF || die "cannot write $launcher.tmp"
 #!/bin/sh
 # browse: drives the Mac's browser through the tunnels \`mac-relays.sh up\` opens (skill browse-remote).
 $marker
@@ -97,18 +159,22 @@ export OPENCODE_BROWSER_AUTOSTART=false
 export OPENCODE_BROWSER_HOME="\$HOME/.opencode-browser-mac"
 # Updates come from \`mac-relays.sh sync\`, not this copy.
 export OPENCODE_BROWSER_UPDATE_CHECK=0
-exec '$(command -v node)' '$app/cli/dist/cli.mjs' "\$@"
+exec $(shq "$(command -v node)") $(shq "$live/dist/cli.mjs") "\$@"
 EOF
-      chmod 755 "$launcher.tmp" && mv "$launcher.tmp" "$launcher"
+      chmod 755 "$launcher.tmp" && mv "$launcher.tmp" "$launcher" || die "cannot install $launcher"
       echo "✓ launcher at $launcher"
     fi
 
     # Swapped in by rename, so this running script keeps reading its old copy.
-    mkdir -p "$(dirname "$skill")"
+    mkdir -p "$(dirname "$skill")" || die "cannot create $(dirname "$skill")"
     rm -rf "$skill.new" "$skill.old"
-    cp -R "$app/cli/skills/browse-remote" "$skill.new" || die "cannot copy the skill to $skill.new"
-    [[ -d $skill ]] && mv "$skill" "$skill.old"
-    mv "$skill.new" "$skill" && rm -rf "$skill.old"
+    cp -R "$live/skills/browse-remote" "$skill.new" || die "cannot copy the skill to $skill.new"
+    if [[ -d $skill ]]; then mv "$skill" "$skill.old" || die "cannot move $skill aside"; fi
+    if ! mv "$skill.new" "$skill"; then
+      [[ -d $skill.old ]] && mv "$skill.old" "$skill"
+      die "cannot install $skill"
+    fi
+    rm -rf "$skill.old"
     echo "✓ skill at $skill"
     ;;
   up)
@@ -131,7 +197,10 @@ EOF
     ports=("$@")
     (( ${#ports[@]} )) || ports=("${profile_ports[@]}")
     (( ${#ports[@]} )) || die "no browse profiles on the Mac (\`browse profiles add <name>\` there), and no ports given"
-    for p in "${ports[@]}"; do check_port "$p"; done
+    for p in "${ports[@]}"; do
+      check_port "$p"
+      (( p + 20000 <= 65535 )) || die "port $p has no room for its tunnel port $((p + 20000))"
+    done
     printf '%s\n' "${ports[@]}" > "$state/ports"
     forwards=()
     for p in "${ports[@]}"; do forwards+=(-L "127.0.0.1:$((p + 20000)):127.0.0.1:$p"); done
@@ -140,12 +209,22 @@ EOF
     # close them.
     nohup ssh -N -o ControlPath=none -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
       "${forwards[@]}" "$mac" >"$state/ssh.log" 2>&1 &
-    echo $! > "$state/ssh.pid"
-    nohup node "$here/relay-proxy.mjs" "${ports[@]}" >"$state/proxy.log" 2>&1 &
-    echo $! > "$state/proxy.pid"
-    sleep 1.5
-    alive "$state/ssh.pid" || { echo "ssh tunnel failed:" >&2; cat "$state/ssh.log" >&2; stop; exit 1; }
-    alive "$state/proxy.pid" || { echo "proxy failed:" >&2; cat "$state/proxy.log" >&2; stop; exit 1; }
+    record ssh $!
+    READY_FILE="$state/ready" nohup node "$here/relay-proxy.mjs" "${ports[@]}" >"$state/proxy.log" 2>&1 &
+    record proxy $!
+    # Up means confirmed: the proxy wrote its ready marker after binding every port, and each tunnel port is the ssh
+    # client's own socket. Anything else (a port another program holds, a dead process) stops both.
+    for (( tries = 0; tries < 100; tries++ )); do
+      if confirmed; then
+        all=1
+        for p in "${ports[@]}"; do port_ours "$p" || { all=0; break; }; done
+        (( all )) && break
+      fi
+      owned ssh >/dev/null || { echo "ssh tunnel failed:" >&2; cat "$state/ssh.log" >&2; stop; exit 1; }
+      owned proxy >/dev/null || { echo "proxy failed:" >&2; cat "$state/proxy.log" >&2; stop; exit 1; }
+      sleep 0.1
+    done
+    (( tries < 100 )) || { echo "tunnel and proxy not confirmed within 10 s:" >&2; cat "$state/ssh.log" "$state/proxy.log" >&2; stop; exit 1; }
     "$0" status
     ;;
   down)
@@ -153,12 +232,16 @@ EOF
     echo "mac relay tunnels closed"
     ;;
   status)
-    alive "$state/ssh.pid" && echo "ssh tunnel: pid $(cat "$state/ssh.pid")" || echo "ssh tunnel: not running"
-    alive "$state/proxy.pid" && echo "proxy:      pid $(cat "$state/proxy.pid")" || echo "proxy:      not running"
-    alive "$state/proxy.pid" || exit 0
+    ssh_pid="$(owned ssh)" && echo "ssh tunnel: pid $ssh_pid" || echo "ssh tunnel: not running"
+    proxy_pid="$(owned proxy)" && echo "proxy:      pid $proxy_pid" || echo "proxy:      not running"
+    [[ -n $ssh_pid && -n $proxy_pid ]] || exit 0
     [[ -s $home/relay-token ]] || die "no relay token at $home/relay-token; run \`$0 sync\`"
-    [[ -s $state/ports ]] || die "no ports recorded; run \`$0 up\`"
+    confirmed || die "the proxy never confirmed its ports; run \`$0 up\` (no token sent)"
     while read -r p; do
+      if ! port_ours "$p"; then
+        echo "$((p + 10000)) (mac relay $p): not this proxy and tunnel's sockets; skipped, no token sent"
+        continue
+      fi
       out="$(authed_curl -m 4 -w '\n%{http_code}' "http://127.0.0.1:$((p + 10000))/extension/status")"
       body="${out%$'\n'*}"
       printf '%s (mac relay %s): HTTP %s %s\n' "$((p + 10000))" "$p" "${out##*$'\n'}" "${body:0:120}"
@@ -169,23 +252,37 @@ EOF
     # profile stays down until then, and that profile's extension cannot attach.
     shift
     (( $# )) || die "usage: mac-relays.sh start-mac <port>..."
+    for p in "$@"; do check_port "$p"; done
     for p in "$@"; do
-      check_port "$p"
       on_mac "OPENCODE_BROWSER_PORT=$p \"$mac_launcher\" relay restart" 2>&1
     done
     ;;
   stop-mac)
-    # Stops the relay process listening on a Mac port, and only one this CLI runs (`cli.mjs serve`).
+    # Stops the process listening on a Mac port only when it is exactly `<node> <the launcher's CLI entry> serve`,
+    # the relay that CLI runs.
     shift
     (( $# )) || die "usage: mac-relays.sh stop-mac <port>..."
+    for p in "$@"; do check_port "$p"; done
+    entry="$(mac_entry)" || exit 1
     for p in "$@"; do
-      check_port "$p"
-      on_mac "pid=\$(lsof -nP -t -iTCP:$p -sTCP:LISTEN | head -n 1)
-        [ -n \"\$pid\" ] || { echo 'no relay on $p'; exit 0; }
-        case \"\$(ps -o command= -p \$pid)\" in
-          *cli.mjs*serve*) kill \$pid && echo \"stopped relay $p (pid \$pid)\" ;;
-          *) echo \"port $p is held by something else (pid \$pid); left it alone\" >&2; exit 1 ;;
-        esac"
+      on_mac "sh -s -- $p $(shq "$entry")" <<'EOF'
+p=$1 entry=$2
+pid=$(lsof -nP -t -iTCP:"$p" -sTCP:LISTEN | head -n 1)
+[ -n "$pid" ] || { echo "no relay on $p"; exit 0; }
+cmd=$(ps -ww -o command= -p "$pid")
+node=${cmd%" $entry serve"}
+case "$node" in
+  "$cmd" | "" | *" "*) ours=no ;;
+  node | */node) ours=yes ;;
+  *) ours=no ;;
+esac
+if [ "$ours" = yes ]; then
+  kill "$pid" && echo "stopped relay $p (pid $pid)"
+else
+  echo "port $p is held by something other than $entry serve (pid $pid: $cmd); left it alone" >&2
+  exit 1
+fi
+EOF
     done
     ;;
   *) echo "usage: mac-relays.sh sync | up [port...] | down | status | start-mac <port>... | stop-mac <port>..." >&2; exit 2 ;;
