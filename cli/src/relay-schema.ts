@@ -77,6 +77,8 @@ export const ExecuteRequest = Schema.Struct({
   code: Schema.String,
   createIfMissing: Schema.Boolean,
   targetSelection: Schema.optionalKey(TargetSelection),
+  /** Wall-clock budget for the call; the script is stopped at the deadline (diagnostic `execute-timeout`). */
+  timeoutMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
 })
 
 export interface ExecuteRequest extends Schema.Schema.Type<typeof ExecuteRequest> {}

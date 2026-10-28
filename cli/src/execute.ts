@@ -473,6 +473,9 @@ export type ExecuteResult = {
   readonly setupFailed?: true
 }
 
+/** What a running script has produced so far: its logs and aftermath, redacted like a finished result's. */
+export type ExecuteProgress = Pick<ExecuteResult, "logs" | "logSummary"> & { readonly aftermath: ExecuteAftermath }
+
 class ExecuteCodeError extends Error {
   constructor(
     readonly originalError: Error,
@@ -518,6 +521,8 @@ export class ExecuteSandbox {
     readonly close: () => void
     readonly navigate: (frame: Frame) => void
   } | undefined
+  /** Reads the running script's logs and aftermath so far; set only while user code runs. */
+  private readRunningProgress: (() => ExecuteProgress) | undefined
 
   constructor(readonly options: ExecuteSandboxOptions) {}
 
@@ -530,7 +535,17 @@ export class ExecuteSandbox {
           this.pendingWarnings.push("The previous execute realm stopped; JavaScript state and pending callbacks were reset.")
         }
         const globals = await this.getGlobals(options)
-        const { result, logs, logSummary, aftermath } = await runUserCode({ code, globals, ...(this.realm ? { realm: this.realm } : {}) })
+        let ownReader: (() => ExecuteProgress) | undefined
+        const { result, logs, logSummary, aftermath } = await runUserCode({
+          code,
+          globals,
+          ...(this.realm ? { realm: this.realm } : {}),
+          onProgressReader: (read) => {
+            // A stopped script that ends late must not clear the reader of the execute that replaced it.
+            if (read) this.readRunningProgress = ownReader = read
+            else if (this.readRunningProgress === ownReader) this.readRunningProgress = undefined
+          },
+        })
         await this.networkCapture.settleForOutput()
         const extracted = extractExecuteMedia(result)
         const redactedValue = this.networkCapture.redactValue(extracted.value)
@@ -686,6 +701,21 @@ export class ExecuteSandbox {
       startUrl: aftermath.startUrl ? this.networkCapture.redactUrl(aftermath.startUrl) : aftermath.startUrl,
       endUrl: aftermath.endUrl ? this.networkCapture.redactUrl(aftermath.endUrl) : aftermath.endUrl,
       navigations: aftermath.navigations.map((url) => this.networkCapture.redactUrl(url)),
+    }
+  }
+
+  /**
+   * The running script's logs and aftermath so far, redacted with the session's active network capture. Undefined
+   * while no user code runs (still connecting, or between executes). Read it before abortExecution, which cancels the
+   * capture whose secrets the redaction needs.
+   */
+  executeProgress(): ExecuteProgress | undefined {
+    const progress = this.readRunningProgress?.()
+    if (!progress) return undefined
+    return {
+      logs: this.redactCaptureLogs(progress.logs),
+      logSummary: progress.logSummary,
+      aftermath: this.redactCaptureAftermath(progress.aftermath),
     }
   }
 
@@ -1805,7 +1835,13 @@ function formatLocatorFailurePageWarning(
   return "Locator failed on page about:blank. Navigate with page.goto(...) or adopt an attached tab before querying controls."
 }
 
-export async function runUserCode({ code, globals, realm }: { readonly code: string; readonly globals: SandboxGlobals; readonly realm?: ExecuteRealm }): Promise<{
+export async function runUserCode({ code, globals, realm, onProgressReader }: {
+  readonly code: string
+  readonly globals: SandboxGlobals
+  readonly realm?: ExecuteRealm
+  /** Receives a reader for the logs and aftermath so far when user code starts, and undefined once it ends. */
+  readonly onProgressReader?: (read: (() => ExecuteProgress) | undefined) => void
+}): Promise<{
   readonly result: unknown
   readonly logs: readonly ExecuteLogEntry[]
   readonly logSummary: ExecuteLogSummary
@@ -1855,6 +1891,7 @@ export async function runUserCode({ code, globals, realm }: { readonly code: str
       },
     } satisfies { readonly logs: readonly ExecuteLogEntry[]; readonly logSummary: ExecuteLogSummary; readonly aftermath: ExecuteAftermath }
   }
+  onProgressReader?.(buildResultMetadata)
   try {
     const values = [sandboxConsole, ...sandboxGlobalKeys.map((key) => globals[key])]
     if (realm) {
@@ -1876,6 +1913,7 @@ export async function runUserCode({ code, globals, realm }: { readonly code: str
     const metadata = buildResultMetadata()
     throw new ExecuteCodeError(error, metadata.logs, metadata.logSummary, metadata.aftermath)
   } finally {
+    onProgressReader?.(undefined)
     globals.page.off("console", onConsole)
     globals.page.off("pageerror", onPageError)
     globals.page.off("framenavigated", onFrameNavigated)

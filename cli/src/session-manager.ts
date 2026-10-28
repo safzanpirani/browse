@@ -1,5 +1,5 @@
 import { Deferred, Effect, Exit, Fiber, Latch, Option, Result, Schema, Semaphore } from "effect"
-import { defaultPageClosedWarning, ExecuteSandbox, hasExplicitTargetSelection, type ExecuteResult, type ExecuteTargetSelection } from "./execute.ts"
+import { defaultPageClosedWarning, ExecuteSandbox, hasExplicitTargetSelection, type ExecuteProgress, type ExecuteResult, type ExecuteTargetSelection } from "./execute.ts"
 import type { NetworkCaptureOptions, NetworkCaptureResult, NetworkCaptureStatus, NetworkCaptureStopOptions } from "./network-capture.ts"
 import { cliCommand } from "./paths.ts"
 import { generateSessionId } from "./relay-helpers.ts"
@@ -63,8 +63,15 @@ export type SessionStopReport = {
   readonly forced: boolean
 }
 
+/** Why a running execute was stopped; a timeout also carries what the script produced before the deadline. */
+type ExecutionStop = {
+  readonly message: string
+  readonly diagnostic: string
+  readonly progress?: ExecuteProgress
+}
+
 type RunningExecution = {
-  readonly stop: (message: string, diagnostic: string) => void
+  readonly stop: (stop: ExecutionStop) => void
   /** Settles once the execute lock is released, with whether the script had to be abandoned. */
   readonly released: Deferred.Deferred<{ readonly forced: boolean }>
 }
@@ -273,7 +280,7 @@ export class OpenCodeBrowserSessions {
   stopExecution(id: string, message: string, diagnostic = "user-stopped"): boolean {
     const running = this.runningExecutions.get(id)
     if (!running) return false
-    running.stop(message, diagnostic)
+    running.stop({ message, diagnostic })
     return true
   }
 
@@ -288,7 +295,7 @@ export class OpenCodeBrowserSessions {
       const handoff = manager.cancelSessionHandoff(id)
       const running = manager.runningExecutions.get(id)
       if (!running) return handoff ? { execute: false, handoff, forced: false } : undefined
-      running.stop(message, `session-${operation}`)
+      running.stop({ message, diagnostic: `session-${operation}` })
       const released = yield* Deferred.await(running.released).pipe(
         Effect.timeoutOption(manager.stopGraceMs() + 2_000),
       )
@@ -487,14 +494,21 @@ export class OpenCodeBrowserSessions {
     readonly code: string
     readonly createIfMissing: boolean
     readonly targetSelection?: ExecuteTargetSelection
+    /**
+     * Wall-clock budget for the whole call, from admission: time queued behind an earlier execute in the session
+     * counts. A script still running at the deadline is stopped like a toolbar stop, keeping its logs so far.
+     */
+    readonly timeoutMs?: number
   }): Effect.Effect<ExecutionResponse, Error> {
     const manager = this
     return this.withAdmission(options.sessionId, Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+      const admittedAt = Date.now()
       const resolved = yield* manager.resolveWorkSession(options.sessionId, options.createIfMissing)
       const session = resolved.session
       const response = yield* Deferred.make<ExecutionResponse, Error>()
       let started = false
       let cancelled = false
+      let running: RunningExecution | undefined
       const operation = Effect.gen(function* () {
           if (cancelled) {
             return yield* sessionError("inactive", `Session execute was cancelled before starting: ${session.id}`, session.id)
@@ -505,19 +519,20 @@ export class OpenCodeBrowserSessions {
           started = true
           session.updatedAt = new Date().toISOString()
           manager.setExecuting(session.id, true)
-          const stopSignal = Deferred.makeUnsafe<{ readonly message: string; readonly diagnostic: string }>()
+          const stopSignal = Deferred.makeUnsafe<ExecutionStop>()
           const released = Deferred.makeUnsafe<{ readonly forced: boolean }>()
-          const running: RunningExecution = {
+          running = {
             released,
-            stop: (message, diagnostic) => {
-              Effect.runSync(Deferred.succeed(stopSignal, { message, diagnostic }))
+            stop: (stop) => {
+              Effect.runSync(Deferred.succeed(stopSignal, stop))
               Effect.runSync(Deferred.succeed(response, {
-                result: stoppedExecuteResult(message, diagnostic),
+                result: stoppedExecuteResult(stop),
                 session: manager.createdSummary(session, resolved.created),
               }))
             },
           }
-          manager.runningExecutions.set(session.id, running)
+          const current = running
+          manager.runningExecutions.set(session.id, current)
           let forced = false
           const startedAt = Date.now()
           // The script runs in its own fiber so a stop can release the execute lock without waiting for it: a stopped
@@ -540,9 +555,9 @@ export class OpenCodeBrowserSessions {
               yield* manager.endStoppedScript(session)
               manager.replaceSandbox(session)
             }
-            return stoppedExecuteResult(first.stop.message, first.stop.diagnostic)
+            return stoppedExecuteResult(first.stop)
           }).pipe(Effect.ensuring(Effect.sync(() => {
-            if (manager.runningExecutions.get(session.id) === running) manager.runningExecutions.delete(session.id)
+            if (manager.runningExecutions.get(session.id) === current) manager.runningExecutions.delete(session.id)
             manager.setExecuting(session.id, false)
             Effect.runSync(Deferred.succeed(released, { forced }))
           })))
@@ -575,7 +590,28 @@ export class OpenCodeBrowserSessions {
         onSuccess: (value) => Deferred.succeed(response, value),
       })))
       const workerFiber = yield* manager.forkTracked(worker, session.id)
+      const timeoutMs = options.timeoutMs
+      const deadline = timeoutMs === undefined ? undefined : yield* Effect.sleep(Math.max(0, admittedAt + timeoutMs - Date.now())).pipe(
+        Effect.andThen(Effect.sync(() => {
+          if (!started) {
+            // Still queued behind an earlier execute: this script never runs.
+            cancelled = true
+            Effect.runSync(Deferred.fail(response, sessionError(
+              "timeout",
+              `Execute timed out after ${timeoutMs}ms while waiting for an earlier execute in session ${session.id} to finish; this script did not run.`,
+              session.id,
+            )))
+            return
+          }
+          if (!running || manager.runningExecutions.get(session.id) !== running) return
+          // Read before the stop aborts the script, which cancels the network capture its redaction needs.
+          const progress = session.sandbox.executeProgress()
+          running.stop({ message: executeTimeoutMessage(timeoutMs), diagnostic: "execute-timeout", ...(progress ? { progress } : {}) })
+        })),
+        Effect.forkDetach({ startImmediately: true }),
+      )
       return yield* restore(Deferred.await(response)).pipe(
+        Effect.ensuring(deadline ? Fiber.interrupt(deadline) : Effect.void),
         Effect.onInterrupt(() => Effect.suspend(() => {
           if (started) return Effect.void
           cancelled = true
@@ -1108,15 +1144,22 @@ export class OpenCodeBrowserSessions {
   }
 }
 
-function stoppedExecuteResult(message: string, diagnostic: string): ExecuteResult {
+function stoppedExecuteResult(stop: ExecutionStop): ExecuteResult {
   return {
-    text: message,
+    text: stop.message,
     isError: true,
-    logs: [],
-    logSummary: { totalCount: 0, returnedCount: 0, repeatedCount: 0, omittedCount: 0 },
+    logs: stop.progress?.logs ?? [],
+    logSummary: stop.progress?.logSummary ?? { totalCount: 0, returnedCount: 0, repeatedCount: 0, omittedCount: 0 },
     warnings: [],
-    diagnostic,
+    diagnostic: stop.diagnostic,
+    ...(stop.progress ? { aftermath: stop.progress.aftermath } : {}),
   }
+}
+
+function executeTimeoutMessage(timeoutMs: number): string {
+  return `Execute timed out after ${timeoutMs}ms and was stopped: its Playwright connection was closed so it cannot touch the page again, ` +
+    "and the session's `state` was reset. The page stays as the script left it; the logs and aftermath cover the work done before the deadline. " +
+    "Check the page with a short follow-up execute on the same session."
 }
 
 function targetUrlHintSelector(rawUrl: string): string {

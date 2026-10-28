@@ -449,6 +449,16 @@ when another command needs to branch on `ok`, `value`, `error`, `warnings`, or
 opencode-browser execute --json --session github '({ url: page.url() })' | jq .value.url
 ```
 
+Bound a call that might stall with `--timeout-ms` (MCP: `timeoutMs`). At the
+deadline the script is stopped like a toolbar stop: the result is an error with
+diagnostic `execute-timeout`, carrying the logs and aftermath written before it,
+and the session stays usable on the same tab with its `state` reset. Time spent
+waiting for an earlier execute in the same session counts against the budget.
+
+```bash
+opencode-browser execute --session github --timeout-ms 30000 --file ./slow-flow.js
+```
+
 Playwright downloads are unavailable through extension-backed tabs because
 Chromium blocks download artifact control through `chrome.debugger`. If the
 page exposes the payload through fetch or an API response, read the bytes in the

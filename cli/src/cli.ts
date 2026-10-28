@@ -281,8 +281,9 @@ const execute = Command.make(
     targetUrl: Flag.String("target-url").pipe(Flag.optional, Flag.withDescription("Use the attached page whose URL contains this text")),
     targetIndex: Flag.Int("target-index").pipe(Flag.optional, Flag.withDescription("Use the attached page at this zero-based index")),
     json: Flag.Boolean("json").pipe(Flag.withDefault(false), Flag.withDescription("Print a machine-readable result envelope: { ok, isError, text, value, valueUnavailable, error?, logs, warnings, diagnostic?, aftermath, session }")),
+    timeoutMs: Flag.Int("timeout-ms").pipe(Flag.optional, Flag.withDescription("Stop the script after this many milliseconds (counting time queued behind an earlier execute); the result keeps its logs so far and the session stays usable")),
   },
-  Effect.fn("Cli.execute")(function* ({ code, file, session, targetUrl, targetIndex, json }) {
+  Effect.fn("Cli.execute")(function* ({ code, file, session, targetUrl, targetIndex, json, timeoutMs }) {
     const run = Effect.gen(function* () {
       const relay = yield* RelayClient.Service
       const filePath = Option.getOrUndefined(file)
@@ -303,6 +304,10 @@ const execute = Command.make(
       if (targetUrlValue && targetIndexValue !== undefined) {
         return yield* Effect.fail(new Error("Use only one target selector: --target-url/OPENCODE_BROWSER_TARGET_URL or --target-index/OPENCODE_BROWSER_TARGET_INDEX"))
       }
+      const timeoutMsValue = Option.getOrUndefined(timeoutMs)
+      if (timeoutMsValue !== undefined && timeoutMsValue <= 0) {
+        return yield* Effect.fail(new Error("--timeout-ms must be a positive integer"))
+      }
       const result = yield* relay.execute({
         ...(explicitSessionId ? { sessionId: explicitSessionId } : {}),
         code: executeCode,
@@ -315,6 +320,7 @@ const execute = Command.make(
             },
           }
           : {}),
+        ...(timeoutMsValue === undefined ? {} : { timeoutMs: timeoutMsValue }),
       })
       if (!explicitSessionId) {
         yield* Console.error(formatSessionContinuation(result.session.id))

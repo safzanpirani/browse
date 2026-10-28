@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import type { ExecuteResult } from "../src/execute.ts"
+import type { ExecuteProgress, ExecuteResult } from "../src/execute.ts"
 import { ExecuteRealm } from "../src/execute-realm.ts"
 import { HandoffRegistry } from "../src/handoff.ts"
 import type { ExecuteSandboxLike } from "../src/relay-types.ts"
@@ -37,6 +37,13 @@ class FakeSandbox implements ExecuteSandboxLike {
     return Effect.void
   }
   disconnectSettled() { return Effect.void }
+  progress: ExecuteProgress | undefined
+  /** `aborted` at each executeProgress() read. */
+  readonly progressReadsAt: number[] = []
+  executeProgress() {
+    this.progressReadsAt.push(this.aborted)
+    return this.progress
+  }
   closeSettled() { return Effect.void }
   authenticatedJson(): never { throw new Error("unused") }
   adoptPage() { return Effect.void }
@@ -185,6 +192,57 @@ describe("delete and reset while busy", () => {
     const { sessions } = manager(async () => ok("x"))
     await run(sessions.execute({ sessionId: "idle", code: "...", createIfMissing: true }))
     expect(await run(sessions.delete("idle"))).toEqual({ deleted: true })
+  })
+})
+
+describe("execute with timeoutMs", () => {
+  test("stops the script at the deadline, keeps its logs so far and leaves the session usable", async () => {
+    const progress: ExecuteProgress = {
+      logs: [{ source: "script", type: "log", text: "step 1 done" }],
+      logSummary: { totalCount: 1, returnedCount: 1, repeatedCount: 0, omittedCount: 0 },
+      aftermath: { startUrl: "https://example.com/", endUrl: "https://example.com/step-1", navigations: ["https://example.com/step-1"], consoleErrorCount: 0, pageErrorCount: 0, handoffs: 0 },
+    }
+    const { sessions, sandboxes } = manager(async (sandbox) => {
+      if (sandbox.executions === 1) {
+        sandbox.progress = progress
+        // Stalls on the page until the sandbox is aborted.
+        await sandbox.playwrightCall()
+      }
+      return ok("second")
+    })
+    const started = Date.now()
+    const timedOut = await run(sessions.execute({ sessionId: "t1", code: "...", createIfMissing: true, timeoutMs: 100 }))
+    expect(Date.now() - started).toBeLessThan(2_000)
+    expect(timedOut.result).toMatchObject({ isError: true, diagnostic: "execute-timeout", logs: progress.logs, logSummary: progress.logSummary, aftermath: progress.aftermath })
+    expect(timedOut.result.text).toContain("timed out after 100ms")
+    // The logs were read (and redacted) before the stop aborted the script and cancelled its network capture.
+    expect(sandboxes[0]?.progressReadsAt).toEqual([0])
+    expect(sandboxes[0]?.aborted).toBe(1)
+    const second = await run(sessions.execute({ sessionId: "t1", code: "...", createIfMissing: false }))
+    expect(second.result.text).toBe("second")
+    expect(sandboxes.length).toBe(1)
+  })
+
+  test("a script that finishes in time is not stopped", async () => {
+    const { sessions, sandboxes } = manager(async () => ok("done"))
+    const result = await run(sessions.execute({ sessionId: "t2", code: "...", createIfMissing: true, timeoutMs: 1_000 }))
+    expect(result.result).toMatchObject({ isError: false, text: "done" })
+    expect(sandboxes[0]?.aborted).toBe(0)
+  })
+
+  test("a call still queued behind another execute at the deadline never runs", async () => {
+    const { promise: gate, resolve: release } = Promise.withResolvers<void>()
+    const { sessions, sandboxes } = manager(async (sandbox) => {
+      if (sandbox.executions === 1) await gate
+      return ok(`run ${sandbox.executions}`)
+    })
+    const { response: first } = await startExecute(sessions, "q1")
+    await expect(run(sessions.execute({ sessionId: "q1", code: "...", createIfMissing: false, timeoutMs: 100 })))
+      .rejects.toThrow("waiting for an earlier execute")
+    expect(sandboxes[0]?.executions).toBe(1)
+    release()
+    expect((await first).result.text).toBe("run 1")
+    expect((await run(sessions.execute({ sessionId: "q1", code: "...", createIfMissing: false }))).result.text).toBe("run 2")
   })
 })
 

@@ -541,6 +541,7 @@ function handleCliRequest(options: {
         code: request.code,
         createIfMissing: request.createIfMissing,
         ...(request.targetSelection ? { targetSelection: request.targetSelection } : {}),
+        ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
       })
       const { setupFailed: _setupFailed, ...wireResult } = result
       sendJson(options.response, { ...wireResult, session })

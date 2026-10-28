@@ -646,3 +646,17 @@ describe("child sessions", () => {
     extension.close()
   }, 20_000)
 })
+
+describe("execute timeoutMs", () => {
+  test("the relay refuses a timeout that isn't a positive integer before running anything", async () => {
+    for (const timeoutMs of [0, -5, 1.5, "100"]) {
+      const response = await fetch(`${base}/cli/execute`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ code: "1", createIfMissing: true, timeoutMs }),
+      })
+      expect(response.status).toBe(400)
+      expect(String((await response.json() as { error?: string }).error)).toContain("Invalid execute request")
+    }
+  })
+})

@@ -30,6 +30,7 @@ type ExecuteArguments = {
   readonly code: string
   readonly session?: string | undefined
   readonly targetSelection?: TargetSelection
+  readonly timeoutMs?: number
 }
 
 type AdoptArguments = {
@@ -62,6 +63,7 @@ function makeToolSpecs(relay: RelayClient.Interface, currentSession: CurrentSess
         session: { type: "string", description: "Optional existing OpenCode Browser session id. Explicit ids must already exist; omit this field to use the MCP server's current session, which is created when needed." },
         targetUrl: { type: "string", description: "Optional URL substring selecting an existing attached page. This does not navigate or open a URL; use page.goto() for that." },
         targetIndex: { type: "integer", minimum: 0, description: "Optional zero-based attached page index selector." },
+        timeoutMs: { type: "integer", minimum: 1, description: "Optional wall-clock budget in milliseconds, counting time queued behind an earlier execute in the session. At the deadline the script is stopped (diagnostic execute-timeout); the result keeps its logs so far and the session stays usable with its state reset." },
       }, ["code"]),
       readOnly: false,
       destructive: true,
@@ -75,6 +77,7 @@ function makeToolSpecs(relay: RelayClient.Interface, currentSession: CurrentSess
           code: args.code,
           createIfMissing: !args.session,
           ...(args.targetSelection ? { targetSelection: args.targetSelection } : {}),
+          ...(args.timeoutMs === undefined ? {} : { timeoutMs: args.timeoutMs }),
         })
         const recreated = !args.session && currentSession.established && result.session.created === true
         establishCurrentSession(sessionId)
@@ -640,10 +643,12 @@ function parseExecuteArguments(input: unknown): ExecuteArguments {
   const code = requiredStringField(object, "code")
   const session = optionalStringField(object, "session")
   const targetSelection = parseMcpTargetSelection(object)
+  const timeoutMs = optionalPositiveIntegerField(object, "timeoutMs")
   return {
     code,
     ...(session ? { session } : {}),
     ...(targetSelection ? { targetSelection } : {}),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
   }
 }
 
