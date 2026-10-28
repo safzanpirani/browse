@@ -75,6 +75,21 @@ server in `~/.omp/agent/mcp.json`; the rest of that file is left as it is. `--bi
 overwrites a file it didn't write, later installs and `update` rewrite the same files, `status` reports them, and
 `uninstall` removes them (`uninstall --client omp` removes only those).
 
+### Several browser profiles
+
+A relay drives one browser profile, so each profile gets its own relay and its own copy of the unpacked extension:
+
+```sh
+node cli/dist/cli.mjs profiles add work --label "Chrome: Work"   # copies the extension, pinned to port 19960
+node cli/dist/cli.mjs profiles list                              # ports, folders, relay and extension status
+node cli/dist/cli.mjs --profile work status                      # any command; or OPENCODE_BROWSER_PROFILE=work
+```
+
+Load each profile's folder (`<data dir>/profiles/<name>/extension`) unpacked in that browser profile, in place of the
+usual folder: every copy has the same extension ID. `add` picks the next free port in 19960-19966 unless you pass
+`--port`. Install refreshes the copies' pairing code; after a rebuild, `profiles sync` re-copies the build and
+reloads the connected copies. Without `--profile`, commands use `OPENCODE_BROWSER_PORT` or 19988 as before.
+
 ## Using it
 
 - **Agents open their own tabs** in the background of the window you last used, grouped at the start of your tab strip

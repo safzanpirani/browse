@@ -155,7 +155,9 @@ export function launcherTarget(file: string): string | undefined {
 const OMP_NOTE = `> **In omp:** run browse as shell commands through bash: \`${NAME} <command>\` is the OpenCode Browser CLI on
 > PATH, and \`${NAME} --help\` / \`${NAME} <command> --help\` list every command and flag. Where this skill names an
 > MCP tool (\`session_new\`, \`tabs_cleanup\`, \`settings { … }\`, \`network_*\`), run the matching \`${NAME}\` command
-> instead; the \`${NAME}\` MCP server is optional. Pass \`--json\` when you need structured output.`
+> instead; the \`${NAME}\` MCP server is optional. Pass \`--json\` when you need structured output.
+> With several browser profiles, each has its own relay: \`${NAME} profiles list\` shows them, and
+> \`${NAME} --profile <name> <command>\` (or \`OPENCODE_BROWSER_PROFILE=<name>\`) drives that profile's browser.`
 
 /**
  * The browse skill for omp: the upstream skill with `opencode-browser` commands renamed to the `browse` launcher, a
