@@ -15,6 +15,8 @@ export type FoundTab = {
   owner?: "relay" | "user"
   /** The session that has adopted or opened it. */
   session?: string
+  /** It is that session's default page (the relay's recorded default target), the one `--session` alone drives. */
+  sessionDefault?: boolean
   crashed?: boolean
   protectedUi?: boolean
 }
@@ -129,20 +131,21 @@ export function sessionNameFor(query: string, taken: ReadonlySet<string>): strin
 
 /**
  * The tab's next command: continue its session, else adopt it into a new session (a user tab), else select it for one
- * execute. A session with several pages drives its default page unless told which, so a tab in one gets
- * `--target-url` with its URL when no other tab of the profile contains that URL, and a note when one does.
+ * execute. `--session` alone drives the session's default page, or opens a new one when that closed, so a tab in a
+ * session gets `--target-url` with its URL unless the relay reports it as the default; when another attached tab
+ * contains that URL too, nothing names it exactly and a note says so.
  */
 function nextStep(profile: FoundProfile, tab: FoundTab, query: string, taken: Set<string>): Pick<FindMatch, "next" | "note"> {
   const prefix = `--profile ${profile.name}`
   const unique = profile.tabs.filter((other) => other.url.includes(tab.url)).length === 1
   const tabName = tab.tabId === undefined ? "this tab" : `tab ${tab.tabId}`
   if (tab.session) {
-    const shared = profile.tabs.filter((other) => other.session === tab.session).length > 1
-    if (!shared) return { next: cliCommand(`${prefix} execute --session ${quoted(tab.session)} 'return page.url()'`) }
-    if (unique) return { next: cliCommand(`${prefix} execute --session ${quoted(tab.session)} --target-url ${quoted(tab.url)} 'return page.url()'`) }
+    const session = `--session ${quoted(tab.session)}`
+    if (tab.sessionDefault) return { next: cliCommand(`${prefix} execute ${session} 'return page.url()'`) }
+    if (unique) return { next: cliCommand(`${prefix} execute ${session} --target-url ${quoted(tab.url)} 'return page.url()'`) }
     return {
-      next: cliCommand(`${prefix} execute --session ${quoted(tab.session)} 'return context.pages().map((p) => p.url())'`),
-      note: `Session ${tab.session} has several pages and another tab shares this URL, so --session alone drives its default page, which may not be ${tabName}; pick the page from context.pages().`,
+      next: cliCommand(`${prefix} execute ${session} 'return context.pages().map((p) => p.url())'`),
+      note: `${tabName} isn't session ${tab.session}'s default page, and another attached tab contains its URL, so no selector names it alone: --session drives the default page (or opens one). Pick it from context.pages().`,
     }
   }
   if (tab.owner === "user" && tab.tabId !== undefined) {
@@ -195,25 +198,32 @@ export async function findTabs(query: string | undefined, root = dataRoot()): Pr
     }
     if (probe.relay !== "running") return { ...base, connected: false, tabs: [], sessions: [] }
     const { status } = probe
+    const sessionList: unknown[] = Array.isArray(status.sessions) ? status.sessions : []
+    const sessions: string[] = []
+    // Each session's default page, by target id: a tab is the default only when the relay says so.
+    const defaults = new Map<string, string>()
+    for (const session of sessionList) {
+      if (typeof session !== "object" || session === null || !("id" in session) || typeof session.id !== "string") continue
+      sessions.push(session.id)
+      if ("targetId" in session && typeof session.targetId === "string") defaults.set(session.id, session.targetId)
+    }
     const targets: unknown[] = Array.isArray(status.targets) ? status.targets : []
     const tabs = targets.flatMap((target): FoundTab[] => {
       if (typeof target !== "object" || target === null) return []
       const t: Record<string, unknown> = Object.fromEntries(Object.entries(target))
       if (t.type !== "page") return []
+      const session = typeof t.opencodeBrowserSessionId === "string" ? t.opencodeBrowserSessionId : undefined
       return [{
         ...(typeof t.tabId === "number" ? { tabId: t.tabId } : {}),
         url: typeof t.url === "string" ? t.url : "",
         title: typeof t.title === "string" ? t.title : "",
         ...(t.owner === "user" || t.owner === "relay" ? { owner: t.owner } : {}),
-        ...(typeof t.opencodeBrowserSessionId === "string" ? { session: t.opencodeBrowserSessionId } : {}),
+        ...(session ? { session } : {}),
+        ...(session && typeof t.id === "string" && defaults.get(session) === t.id ? { sessionDefault: true } : {}),
         ...(t.crashed === true ? { crashed: true } : {}),
         ...(t.protectedUi === true ? { protectedUi: true } : {}),
       }]
     })
-    const sessionList: unknown[] = Array.isArray(status.sessions) ? status.sessions : []
-    const sessions = sessionList.flatMap((session) =>
-      typeof session === "object" && session !== null && "id" in session && typeof session.id === "string" ? [session.id] : [],
-    )
     return { ...base, connected: status.connected === true, tabs, sessions }
   }))
   if (!query) return { profiles, matches: [], visitedBy: [] }

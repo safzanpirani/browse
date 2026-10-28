@@ -291,3 +291,15 @@ describe("realm timers", () => {
     expect(fired).toEqual([])
   })
 })
+
+describe("session summary", () => {
+  test("names the default page's target id, which find compares with each tab", () => {
+    const { sessions } = manager(() => Promise.resolve(ok("")))
+    sessions.restore([
+      { id: "app", createdAt: "", updatedAt: "", readOnly: false, target: { id: "t1", owner: "relay" } },
+      { id: "bare", createdAt: "", updatedAt: "", readOnly: false },
+    ])
+    expect(sessions.summary("app")?.targetId).toBe("t1")
+    expect(sessions.summary("bare")).not.toHaveProperty("targetId")
+  })
+})

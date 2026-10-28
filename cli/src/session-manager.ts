@@ -903,6 +903,7 @@ export class OpenCodeBrowserSessions {
       pageUrl: status.pageUrl,
       stateKeys: status.stateKeys,
       ...(session.readOnly ? { readOnly: true } : {}),
+      ...(session.target ? { targetId: session.target.id } : {}),
     }
   }
 

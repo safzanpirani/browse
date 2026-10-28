@@ -17,6 +17,8 @@ export const SessionSummary = Schema.Struct({
   pageUrl: Schema.NullOr(Schema.String),
   stateKeys: Schema.Array(Schema.String),
   readOnly: Schema.optionalKey(Schema.Boolean),
+  /** The target id of the session's default page (the one `--session` alone drives), while it has one. */
+  targetId: Schema.optionalKey(Schema.String),
 })
 
 export interface SessionSummary extends Schema.Schema.Type<typeof SessionSummary> {}

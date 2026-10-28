@@ -58,7 +58,7 @@ describe("sessionHistory", () => {
 describe("matchQuery", () => {
   const profiles = [
     profile("work", { visited: ["myaccount.google.com"], tabs: [{ tabId: 7, url: "https://www.figma.com/file/abc", title: "Board", owner: "user" }] }),
-    profile("patty", { port: 19963, tabs: [{ tabId: 9, url: "https://github.com/", title: "Figma plugin issue", owner: "user", session: "gh" }] }),
+    profile("patty", { port: 19963, tabs: [{ tabId: 9, url: "https://github.com/", title: "Figma plugin issue", owner: "user", session: "gh", sessionDefault: true }] }),
     profile("ananya", { port: 19964, connected: false, visited: ["figma.com"] }),
   ]
 
@@ -85,25 +85,22 @@ describe("matchQuery", () => {
     ])
   })
 
-  test("names the exact tab when its session has several pages, or says it can't", () => {
-    const popup = profile("work", {
-      tabs: [
-        { tabId: 1, url: "https://app.example/home", title: "", owner: "relay", session: "app" },
-        { tabId: 2, url: "https://app.example/login", title: "Sign in", owner: "relay", session: "app" },
-      ],
-    })
-    const [match] = matchQuery([popup], "Sign in", new Set()).matches
-    expect(match?.next).toEndWith("--profile work execute --session app --target-url https://app.example/login 'return page.url()'")
-    expect(match?.note).toBeUndefined()
-    const twins = profile("work", {
-      tabs: [
-        { tabId: 1, url: "https://app.example/", title: "", owner: "relay", session: "app" },
-        { tabId: 2, url: "https://app.example/", title: "Sign in", owner: "relay", session: "app" },
-      ],
-    })
-    const [twin] = matchQuery([twins], "Sign in", new Set()).matches
+  test("names the exact tab unless the relay reports it as the session's default page", () => {
+    const app = (tabs: FoundProfile["tabs"]) => matchQuery([profile("work", { tabs })], "Sign in", new Set()).matches[0]
+    const home = { tabId: 1, url: "https://app.example/home", title: "", owner: "relay" as const, session: "app" }
+    const login = { tabId: 2, url: "https://app.example/login", title: "Sign in", owner: "relay" as const, session: "app" }
+    // The default page: --session alone drives it.
+    expect(app([{ ...login, sessionDefault: true }])?.next).toEndWith("--profile work execute --session app 'return page.url()'")
+    // A popup beside the default page.
+    expect(app([{ ...home, sessionDefault: true }, login])?.next).toEndWith("--profile work execute --session app --target-url https://app.example/login 'return page.url()'")
+    // Only the popup is left and the default closed: --session alone would open a new page, so it still gets a selector.
+    const orphan = app([login])
+    expect(orphan?.next).toEndWith("--profile work execute --session app --target-url https://app.example/login 'return page.url()'")
+    expect(orphan?.note).toBeUndefined()
+    // Not the default, and another tab contains its URL: nothing names it alone, so the note says so.
+    const twin = app([{ ...home, url: "https://app.example/login?next=1" }, login])
     expect(twin?.next).toEndWith("--profile work execute --session app 'return context.pages().map((p) => p.url())'")
-    expect(twin?.note).toContain("drives its default page, which may not be tab 2")
+    expect(twin?.note).toContain("tab 2 isn't session app's default page")
   })
 
   test("without a matching tab, names the profiles whose sessions visited the host", () => {
@@ -137,11 +134,12 @@ describe("findTabs", () => {
         request.headers.get("authorization") === `Bearer ${relayToken(root)}` && new URL(request.url).pathname === "/extension/status"
           ? Response.json({
               connected: true,
-              activeTargets: 1,
-              sessions: [{ id: "figma" }],
+              activeTargets: 2,
+              sessions: [{ id: "figma", targetId: "t1" }],
               targets: [
                 { id: "t1", type: "page", title: "Board", url: "https://www.figma.com/file/abc", tabId: 12, owner: "user", opencodeBrowserSessionId: "figma" },
                 { id: "t2", type: "iframe", title: "", url: "https://figma.com/embed" },
+                { id: "t3", type: "page", title: "Figma login", url: "https://www.figma.com/login", tabId: 13, owner: "relay", opencodeBrowserSessionId: "figma" },
               ],
             })
           : new Response("no", { status: 401 }),
@@ -164,7 +162,16 @@ describe("findTabs", () => {
       ])
       const report = await findTabs("figma", root)
       expect(report.profiles.map(({ name, relay, connected, tabs, sessions }) => ({ name, relay, connected, tabs, sessions }))).toEqual([
-        { name: "work", relay: "running", connected: true, tabs: [{ tabId: 12, url: "https://www.figma.com/file/abc", title: "Board", owner: "user", session: "figma" }], sessions: ["figma"] },
+        {
+          name: "work",
+          relay: "running",
+          connected: true,
+          tabs: [
+            { tabId: 12, url: "https://www.figma.com/file/abc", title: "Board", owner: "user", session: "figma", sessionDefault: true },
+            { tabId: 13, url: "https://www.figma.com/login", title: "Figma login", owner: "relay", session: "figma" },
+          ],
+          sessions: ["figma"],
+        },
         { name: "gone", relay: "stopped", connected: false, tabs: [], sessions: [] },
         { name: "far", relay: "stopped", connected: false, tabs: [], sessions: [] },
         { name: "bc", relay: "reserved", connected: false, tabs: [], sessions: [] },
@@ -172,10 +179,13 @@ describe("findTabs", () => {
       ])
       expect(asked.some((url) => url.includes(`:${relay.port}/`))).toBe(true)
       expect(asked.filter((url) => /:(19990|29991)\//.test(url))).toEqual([])
-      expect(report.matches.map((match) => match.next)).toEqual([expect.stringContaining("--profile work execute --session figma")])
+      expect(report.matches.map((match) => match.next.replace(/^.*? --profile/, "--profile"))).toEqual([
+        "--profile work execute --session figma 'return page.url()'",
+        "--profile work execute --session figma --target-url https://www.figma.com/login 'return page.url()'",
+      ])
       const text = formatFindReport(report)
       expect(text).toContain("work  port")
-      expect(text).toContain("extension connected, 1 attached tab  [Work (Profile 5)]")
+      expect(text).toContain("extension connected, 2 attached tabs  [Work (Profile 5)]")
       expect(text).toContain("gone  port")
       expect(text).toContain("relay not running")
       expect(text).toContain("bcremote  port 29991  not asked: Port 29991 is Mac port 19991 + 10000, browser-control's")
