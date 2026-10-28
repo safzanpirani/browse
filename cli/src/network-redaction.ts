@@ -24,6 +24,16 @@ const secretHeaders = new Set([
   "x-xsrf-token",
 ])
 
+// Standard headers whose names match secretNamePattern but whose values are not credentials: the host,
+// and CORS metadata that lists header names (`authorization`) or says `true`.
+const nonSecretHeaders = new Set([
+  ":authority",
+  "access-control-allow-credentials",
+  "access-control-allow-headers",
+  "access-control-expose-headers",
+  "access-control-request-headers",
+])
+
 export class SecretCollector {
   private readonly slotsByRef = new Map<string, MutableCredentialSlot>()
   private readonly refsByValue = new Map<string, string>()
@@ -206,10 +216,7 @@ export class SecretCollector {
       const match = /^(\S+)\s+(.+)$/.exec(value)
       if (match) return `${match[1]} ${this.reference(match[2] ?? "", source)}`
     }
-    // Pseudo-headers (`:authority` is the host) and CORS headers (they list header names such as
-    // `authorization`, or say `true`) only match secretNamePattern by their names.
-    if (lower.startsWith(":") || lower.startsWith("access-control-")) return value
-    if (secretHeaders.has(lower) || secretNamePattern.test(lower)) {
+    if (!nonSecretHeaders.has(lower) && (secretHeaders.has(lower) || secretNamePattern.test(lower))) {
       return this.reference(value, source)
     }
     return value

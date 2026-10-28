@@ -34,6 +34,12 @@ describe("SecretCollector", () => {
     expect(cookie?.value).toBe("sid=${BC_SECRET_1}; Path=/; HttpOnly")
   })
 
+  test("still redacts a custom credential header that shares the CORS prefix", () => {
+    const collector = new SecretCollector()
+    const [header] = collector.protectHeaders([{ name: "Access-Control-Token", value: "tok_live_ABCDEF1234567890" }], "request")
+    expect(header?.value).toBe("${BC_SECRET_1}")
+  })
+
   test("stores no slot for the host, CORS headers or cookie priority", () => {
     const collector = new SecretCollector()
     const headers = collector.protectHeaders(

@@ -963,9 +963,12 @@ const secretsStatus = Command.make(
   },
   Effect.fn("Cli.secretsStatus")(function* ({ name, json }) {
     const relay = yield* RelayClient.Service
-    // Observational: ask a relay that is already up (on ampere the profile files live on the Mac behind it),
+    // Observational: ask a relay that is already up (its data root may be on another host),
     // otherwise read this host's profile file. Never start a relay just to read metadata.
-    const relayUp = yield* relay.version.pipe(Effect.as(true), Effect.orElseSucceed(() => false))
+    const relayUp = yield* relay.version.pipe(
+      Effect.as(true),
+      Effect.catch((error) => error instanceof RelayClient.RelayUnreachable ? Effect.succeed(false) : Effect.fail(error)),
+    )
     const result = relayUp ? yield* relay.authStatus({ name }) : yield* AuthProfile.status(name)
     if (json) {
       yield* Console.log(JSON.stringify(result, null, 2))
