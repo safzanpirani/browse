@@ -14,7 +14,7 @@ import {
 } from "./cdp-shims.ts"
 import { CdpClientPool } from "./cdp-client-pool.ts"
 import { beforeInput, forgetTab, humanInputEnabled, humanInputOverride, setHumanInput } from "./human-input.ts"
-import { CdpRouter } from "./cdp-router.ts"
+import { CdpRouter, tabScopedCookieCommand } from "./cdp-router.ts"
 import { CdpRuntime } from "./cdp-runtime.ts"
 import { ExtensionRpc } from "./extension-rpc.ts"
 import { createHttpRequestHandler, hasRelayToken } from "./http-api.ts"
@@ -1686,10 +1686,11 @@ const makeRelay = Effect.fnUntraced(function* (options: {
       const dataNavigation = yield* navigateTopFrameToDataUrl(tabId, message.params)
       if (dataNavigation) return dataNavigation
     }
+    const { method, params } = tabScopedCookieCommand(route, normalizedMessage.method, normalizedMessage.params ?? {})
     const command = {
       tabId,
-      method: normalizedMessage.method,
-      params: normalizedMessage.params ?? {},
+      method,
+      params,
       ...(route.chromeSessionId === undefined ? {} : { sessionId: route.chromeSessionId }),
     }
     const sessionId = message.sessionId
@@ -1719,7 +1720,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         })),
         Effect.tap(() => Effect.sync(() => setProtectedUi(tabId, false))),
       )
-    return scopeCdpResult({ method: message.method, result, pageUrls: () => cdpRouter.visibleRoots(socket).map((target) => target.targetInfo.url) })
+    return scopeCdpResult({ method: command.method, result, pageUrls: () => cdpRouter.visibleRoots(socket).map((target) => target.targetInfo.url) })
   })
 
   /**

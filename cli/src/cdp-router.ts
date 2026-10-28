@@ -1,6 +1,6 @@
 import { ClientCdpSessionAlias, type CdpClientPool } from "./cdp-client-pool.ts"
 import { canClientSeeTarget } from "./cdp-visibility.ts"
-import type { CdpRequest, TargetInfo } from "./protocol.ts"
+import type { CdpRequest, JsonObject, TargetInfo } from "./protocol.ts"
 import { getString, isRestrictedTarget } from "./relay-helpers.ts"
 import type { ChildTarget, ConnectedTarget } from "./relay-types.ts"
 import { shouldExposeChildTarget, type TargetRegistry } from "./target-registry.ts"
@@ -17,10 +17,32 @@ export function isRootRoutableBrowserContextMethod(method: string): boolean {
   return rootRoutableBrowserContextMethods.has(method)
 }
 
+// Chrome resolves the Storage cookie commands through the browser's default context, which is the last-focused
+// profile, even when they're sent to a tab; it rejects browserContextId there. The Network equivalents use the
+// tab's own profile.
+const tabScopedCookieMethods = new Map([
+  ["Storage.getCookies", "Network.getAllCookies"],
+  ["Storage.setCookies", "Network.setCookies"],
+])
+
+/**
+ * Rewrite a cookie command so it reads or writes the routed tab's profile, not the last-focused one. A root route
+ * already matched any requested browser context; an explicit context on a plain tab session is left for Chrome to
+ * reject. The cookie guardrails cover both spellings (cdp-guardrails.ts).
+ */
+export function tabScopedCookieCommand(route: CdpRoutedSession, method: string, params: JsonObject): { readonly method: string; readonly params: JsonObject } {
+  const tabMethod = tabScopedCookieMethods.get(method)
+  if (!tabMethod || (!route.rootRouted && params.browserContextId !== undefined)) return { method, params }
+  const { browserContextId: _browserContextId, ...tabParams } = params
+  return { method: tabMethod, params: tabParams }
+}
+
 export type CdpRoutedSession = {
   readonly tabId: number
   readonly rootSessionId: string
   readonly chromeSessionId?: string
+  /** Routed to a session-owned root tab for a browser-context command sent without a tab session. */
+  readonly rootRouted?: true
 }
 
 export class CdpRouter<Client extends object> {
@@ -135,7 +157,7 @@ export class CdpRouter<Client extends object> {
     const requestedBrowserContextId = getString(message.params, "browserContextId")
     const preferredRoot = rootRoutable ? this.preferredRoot(client, requestedBrowserContextId) : undefined
     const route = rootRoutable && preferredRoot
-      ? { tabId: preferredRoot.tabId, rootSessionId: preferredRoot.sessionId }
+      ? { tabId: preferredRoot.tabId, rootSessionId: preferredRoot.sessionId, rootRouted: true as const }
       : message.sessionId
       ? this.session(client, message.sessionId)
       : undefined

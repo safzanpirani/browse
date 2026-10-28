@@ -660,3 +660,38 @@ describe("execute timeoutMs", () => {
     }
   })
 })
+
+describe("cookie commands", () => {
+  test("browser-level Storage cookie commands reach the routed tab's profile as Network commands, still host-scoped", async () => {
+    const tabId = 91
+    const targetInfo = { targetId: "TARGET-91", type: "page", title: "Example", url: "https://example.com/", attached: true, browserContextId: "CTX" }
+    const extension = new FakeExtension(pairingCode(home))
+      .on("tabs.create", () => ({ tabId }))
+      .on("Target.getTargetInfo", () => ({ targetInfo }))
+      .on("Network.getAllCookies", () => ({ cookies: [{ name: "own", domain: ".example.com" }, { name: "other", domain: "bank.test" }] }))
+      .on("Network.setCookies", () => ({}))
+    expect(await extension.pair()).toBe(true)
+    const socket = await connectCdp(`ws://127.0.0.1:${port}/devtools/browser/test?opencodeBrowserSessionId=cookie-scope`, { authorization: `Bearer ${token}` })
+    if (!(socket instanceof WebSocket)) throw new Error(`CDP connection refused: ${socket}`)
+    expect((await cdpCall(socket, 1, "Target.createTarget", { url: "https://example.com/" })).result?.targetId).toBe("TARGET-91")
+    // Playwright's context.cookies(): Chrome would answer from the last-focused profile, not this tab's.
+    const read = await cdpCall(socket, 2, "Storage.getCookies", { browserContextId: "CTX" })
+    expect(read.error).toBeUndefined()
+    expect(read.result).toEqual({ cookies: [{ name: "own", domain: ".example.com" }] })
+
+    const write = await cdpCall(socket, 3, "Storage.setCookies", { browserContextId: "CTX", cookies: [{ name: "own", value: "1", domain: "example.com" }] })
+    expect(write.error).toBeUndefined()
+    const foreign = await cdpCall(socket, 4, "Storage.setCookies", { browserContextId: "CTX", cookies: [{ name: "x", value: "1", domain: "bank.test" }] })
+    expect(foreign.error?.message).toContain("blocked Storage.setCookies")
+
+    const cookieCommands = extension.commands
+      .filter((command) => command.method === "debugger.sendCommand" && command.params?.tabId === tabId && String(command.params?.method).includes("Cookies"))
+      .map((command) => ({ method: command.params?.method, params: command.params?.params }))
+    expect(cookieCommands).toEqual([
+      { method: "Network.getAllCookies", params: {} },
+      { method: "Network.setCookies", params: { cookies: [{ name: "own", value: "1", domain: "example.com" }] } },
+    ])
+    socket.close()
+    extension.close()
+  }, 20_000)
+})
