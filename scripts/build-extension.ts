@@ -3,52 +3,64 @@
 // worker disappears, so dist/ is never emptied: a failed build leaves the previous output untouched, and a
 // successful one writes every new file before it removes the stale ones (old content-hashed assets).
 // Concurrent builds each run vite on their own, then publish one at a time under a lock beside dist/, so one build's
-// prune never deletes the assets another build's background.js has just started loading.
+// prune never deletes the assets another build's background.js has just started loading. A lock is never taken over:
+// a build waits while the lock's owner runs, and refuses (leaving dist/ alone) when the owner is gone.
 import { $ } from "bun"
-import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, utimes, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+
+/** The publish lock is left by a build that is no longer running; only the user may clear it. */
+export class StaleLockError extends Error {}
 
 /** Replaces `destination`'s contents with `source`'s while holding the publish lock beside it. */
 export async function publish(source: string, destination: string): Promise<void> {
   const lock = `${destination}.lock`
-  await acquire(lock)
+  const owner = `${process.pid} ${randomUUID()}`
+  await acquire(lock, owner)
   try {
     await mkdir(destination, { recursive: true })
     await copyInto(source, destination)
     await prune(source, destination)
   } finally {
-    await release(lock)
+    await release(lock, owner)
   }
 }
 
 /**
- * Takes the lock: a directory holding the owner's pid, created complete under a private name and renamed into place
- * (a rename onto an existing, non-empty directory fails). A lock whose owner is gone is cleared and retaken.
+ * Takes the lock: a directory holding the owner's pid and a nonce, created complete under a private name and renamed
+ * into place. The rename fails onto a non-empty directory; an empty one is never a lock (every lock is created with
+ * its owner file and moved aside before it is deleted), so the rename replaces it. Waits while the holder runs;
+ * throws StaleLockError when the holder is gone, since only the user can tell that no build is still using it.
  */
-async function acquire(lock: string): Promise<void> {
+async function acquire(lock: string, owner: string): Promise<void> {
   const candidate = `${lock}.${process.pid}`
   await rm(candidate, { recursive: true, force: true })
   await mkdir(candidate)
-  await writeFile(path.join(candidate, "pid"), `${process.pid}\n`)
+  await writeFile(path.join(candidate, "owner"), `${owner}\n`)
   try {
     for (let misses = 0; ; await Bun.sleep(50)) {
-      // The lock's age tells a held lock from one whose dead owner's pid now names an unrelated process, so it starts
-      // fresh however long this build waited.
-      const now = new Date()
-      await utimes(candidate, now, now)
       try {
         await rename(candidate, lock)
         return
       } catch (error) {
         // Windows reports a rename onto an existing directory as EPERM.
         if (!["EEXIST", "ENOTEMPTY", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
-        const owner = await lockOwner(lock)
-        // No lock there, yet the rename keeps failing: the error is not about the lock.
-        if (owner === undefined && ++misses > 100) throw error
-        // Stale: its owner is gone, or its pid was reused (by this process, or anyone once it is too old to be held).
-        if (owner !== undefined && (owner === process.pid || !alive(owner) || (await lockAge(lock)) > staleAfterMs))
-          await clearStale(lock, owner)
+        const holder = await lockOwner(lock)
+        if (holder === undefined) {
+          // No lock there, yet the rename keeps failing: the error is not about the lock.
+          if (++misses > 100) throw error
+          continue
+        }
+        // The holder's pid naming this process means it was reused after the holder died.
+        const pid = Number.parseInt(holder, 10)
+        if (pid !== process.pid && alive(pid)) continue
+        const why = Number.isInteger(pid) ? `its owner (pid ${pid}) is not running` : "it names no owner"
+        throw new StaleLockError(
+          `${lock} is held by no running build: ${why}, so a build likely died while publishing into dist/. ` +
+            `Check that no extension build is running, delete ${lock}, then build again.`,
+        )
       }
     }
   } finally {
@@ -56,48 +68,24 @@ async function acquire(lock: string): Promise<void> {
   }
 }
 
-/** Moves the lock aside before deleting it, so the path never holds a half-removed (empty) lock directory. */
-async function release(lock: string): Promise<void> {
+/**
+ * Removes the lock only while it is still this publish's own. It is moved aside before it is deleted, so a waiter
+ * never reads a half-removed lock as one with no owner.
+ */
+async function release(lock: string, owner: string): Promise<void> {
+  if ((await lockOwner(lock)) !== owner) return
   const trash = `${lock}.${process.pid}.released`
-  try {
-    await rename(lock, trash)
-  } catch (error) {
-    // Already cleared as stale by another build.
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
-    throw error
-  }
+  await rename(lock, trash)
   await rm(trash, { recursive: true, force: true })
 }
 
-/** Publishing takes well under a second; a lock held this long belongs to no running build. */
-const staleAfterMs = 60_000
-
-async function lockAge(lock: string): Promise<number> {
-  const stats = await lstat(lock).catch(() => undefined)
-  return stats ? Date.now() - stats.mtimeMs : 0
-}
-
-/** Clears a dead owner's lock; puts it back if, in between, someone live had taken it. */
-async function clearStale(lock: string, owner: number): Promise<void> {
-  const trash = `${lock}.${process.pid}.stale`
+/** The lock's owner line; undefined when there is no lock, and "" when the lock has no readable owner. */
+async function lockOwner(lock: string): Promise<string | undefined> {
   try {
-    await rename(lock, trash)
-  } catch {
-    return
-  }
-  const moved = await lockOwner(trash)
-  if (moved !== owner && moved !== undefined && alive(moved) && (await lockAge(trash)) <= staleAfterMs)
-    await rename(trash, lock).catch(() => undefined)
-  await rm(trash, { recursive: true, force: true })
-}
-
-/** The lock's owner pid; undefined when the lock is gone, and NaN (never alive) when it has no readable pid. */
-async function lockOwner(lock: string): Promise<number | undefined> {
-  try {
-    return Number.parseInt(await readFile(path.join(lock, "pid"), "utf8"), 10)
+    return (await readFile(path.join(lock, "owner"), "utf8")).trim()
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    return (await lstat(lock).catch(() => undefined)) ? Number.NaN : undefined
+    return (await lstat(lock).catch(() => undefined)) ? "" : undefined
   }
 }
 
@@ -162,7 +150,13 @@ if (import.meta.main) {
       status = (await $`vite build ${config} --outDir ${staging}`.cwd(root).nothrow()).exitCode
       if (status !== 0) break
     }
-    if (status === 0) await publish(staging, dist)
+    if (status === 0) {
+      await publish(staging, dist).catch((error: unknown) => {
+        if (!(error instanceof StaleLockError)) throw error
+        console.error(error.message)
+        status = 1
+      })
+    }
   } finally {
     await rm(staging, { recursive: true, force: true })
   }
