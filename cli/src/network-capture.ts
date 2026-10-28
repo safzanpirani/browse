@@ -135,6 +135,9 @@ const maxAllowedEntries = 10_000
 const maxAllowedResourceTypes = 50
 const maxFinalizeWorkers = 4
 
+/** What output a capture can't yet redact safely is replaced with. */
+export const finalizationPendingRedaction = "[REDACTED: network capture finalization pending]"
+
 export class Recorder {
   private active: ActiveCapture | undefined
   private page: Page | undefined
@@ -315,22 +318,31 @@ export class Recorder {
     active.outputUnsafe = !await settleFinalizers(active, this.recorderOptions.outputSettleTimeoutMs ?? 5_000)
   }
 
+  /**
+   * False while a capture is still finalizing requests, or gave up waiting for them: its redaction may not know their
+   * secrets yet. settleForOutput waits for this; output read without waiting must be withheld instead.
+   */
+  outputSettled(): boolean {
+    const active = this.active
+    return !active || (!active.outputUnsafe && active.pending.size === 0 && active.finalizeQueue.length === 0 && active.finalizeWorkers === 0)
+  }
+
   redactText(text: string): string {
     const active = this.active
     if (!active) return text
-    return active.outputUnsafe ? "[REDACTED: network capture finalization pending]" : active.liveCollector.redactText(text)
+    return active.outputUnsafe ? finalizationPendingRedaction : active.liveCollector.redactText(text)
   }
 
   redactValue(value: unknown): unknown {
     const active = this.active
     if (!active) return value
-    return active.outputUnsafe ? "[REDACTED: network capture finalization pending]" : active.liveCollector.redactValue(value)
+    return active.outputUnsafe ? finalizationPendingRedaction : active.liveCollector.redactValue(value)
   }
 
   redactUrl(url: string): string {
     const active = this.active
     if (!active) return url
-    if (active.outputUnsafe) return "[REDACTED: network capture finalization pending]"
+    if (active.outputUnsafe) return finalizationPendingRedaction
     return active.liveCollector.redactText(active.liveCollector.protectUrl(url, "execute"))
   }
 

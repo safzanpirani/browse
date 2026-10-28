@@ -509,6 +509,8 @@ export class OpenCodeBrowserSessions {
       let started = false
       let cancelled = false
       let running: RunningExecution | undefined
+      /** The finished script's response while the session journals and persists it. */
+      let finished: ExecutionResponse | undefined
       const operation = Effect.gen(function* () {
           if (cancelled) {
             return yield* sessionError("inactive", `Session execute was cancelled before starting: ${session.id}`, session.id)
@@ -574,6 +576,7 @@ export class OpenCodeBrowserSessions {
             ? { ...result, warnings: [...result.warnings, adoptionTipForUrl(userAttachedPageUrls[0] ?? "about:blank")] }
             : result
           session.updatedAt = new Date().toISOString()
+          finished = { result: resultWithHint, session: manager.createdSummary(session, resolved.created) }
           yield* manager.recordExecute({
             sessionId: session.id,
             code: session.sandbox.redactNetworkCaptureText(options.code),
@@ -581,7 +584,7 @@ export class OpenCodeBrowserSessions {
             result: resultWithHint,
           })
           yield* manager.commitPersistence()
-          return { result: resultWithHint, session: manager.createdSummary(session, resolved.created) }
+          return finished
         })
       const worker = session.executeSemaphore.withPermit(operation.pipe(Effect.matchEffect({
         onFailure: (error) => (resolved.created
@@ -601,6 +604,11 @@ export class OpenCodeBrowserSessions {
               `Execute timed out after ${timeoutMs}ms while waiting for an earlier execute in session ${session.id} to finish; this script did not run.`,
               session.id,
             )))
+            return
+          }
+          // The script finished in time; journaling and persistence go on after the caller has its result.
+          if (finished) {
+            Effect.runSync(Deferred.succeed(response, finished))
             return
           }
           if (!running || manager.runningExecutions.get(session.id) !== running) return

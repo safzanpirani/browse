@@ -458,7 +458,10 @@ Bound a call that might stall with `--timeout-ms` (MCP: `timeoutMs`). At the
 deadline the script is stopped like a toolbar stop: the result is an error with
 diagnostic `execute-timeout`, carrying the logs and aftermath written before it,
 and the session stays usable on the same tab with its `state` reset. Time spent
-waiting for an earlier execute in the same session counts against the budget.
+waiting for an earlier execute in the same session counts against the budget,
+and a script that finished just before the deadline is answered by it. While a
+network capture is still finalizing requests, those logs and URLs read
+`[REDACTED: network capture finalization pending]`.
 
 ```bash
 opencode-browser execute --session github --timeout-ms 30000 --file ./slow-flow.js

@@ -527,6 +527,9 @@ export class ExecuteSandbox {
   constructor(readonly options: ExecuteSandboxOptions) {}
 
   execute(code: string, options: ExecuteOptions = {}): Effect.Effect<ExecuteResult> {
+    // Set when user code starts and kept until this execute's result is built, so a timeout while output settles
+    // still reports the logs and aftermath.
+    let ownReader: (() => ExecuteProgress) | undefined
     return Effect.tryPromise({
       try: async () => {
         if (this.realm?.isStopped) {
@@ -535,15 +538,12 @@ export class ExecuteSandbox {
           this.pendingWarnings.push("The previous execute realm stopped; JavaScript state and pending callbacks were reset.")
         }
         const globals = await this.getGlobals(options)
-        let ownReader: (() => ExecuteProgress) | undefined
         const { result, logs, logSummary, aftermath } = await runUserCode({
           code,
           globals,
           ...(this.realm ? { realm: this.realm } : {}),
           onProgressReader: (read) => {
-            // A stopped script that ends late must not clear the reader of the execute that replaced it.
-            if (read) this.readRunningProgress = ownReader = read
-            else if (this.readRunningProgress === ownReader) this.readRunningProgress = undefined
+            this.readRunningProgress = ownReader = read
           },
         })
         await this.networkCapture.settleForOutput()
@@ -610,6 +610,10 @@ export class ExecuteSandbox {
           return result
         },
       }),
+      // A stopped script that ends late must not clear the reader of the execute that replaced it.
+      Effect.ensuring(Effect.sync(() => {
+        if (ownReader && this.readRunningProgress === ownReader) this.readRunningProgress = undefined
+      })),
     )
   }
 
@@ -706,12 +710,26 @@ export class ExecuteSandbox {
 
   /**
    * The running script's logs and aftermath so far, redacted with the session's active network capture. Undefined
-   * while no user code runs (still connecting, or between executes). Read it before abortExecution, which cancels the
-   * capture whose secrets the redaction needs.
+   * while no user code has run yet (still connecting, or between executes). Read it before abortExecution, which
+   * cancels the capture whose secrets the redaction needs.
    */
   executeProgress(): ExecuteProgress | undefined {
     const progress = this.readRunningProgress?.()
     if (!progress) return undefined
+    if (!this.networkCapture.outputSettled()) {
+      // Fail closed: the capture may not know the secrets of requests it is still finalizing, and a timeout can't wait.
+      const withheld = NetworkCapture.finalizationPendingRedaction
+      return {
+        logs: progress.logs.map((log) => ({ ...log, text: withheld, ...(log.location ? { location: { ...log.location, url: withheld } } : {}) })),
+        logSummary: progress.logSummary,
+        aftermath: {
+          ...progress.aftermath,
+          startUrl: progress.aftermath.startUrl === null ? null : withheld,
+          endUrl: progress.aftermath.endUrl === null ? null : withheld,
+          navigations: progress.aftermath.navigations.map(() => withheld),
+        },
+      }
+    }
     return {
       logs: this.redactCaptureLogs(progress.logs),
       logSummary: progress.logSummary,
@@ -1839,8 +1857,8 @@ export async function runUserCode({ code, globals, realm, onProgressReader }: {
   readonly code: string
   readonly globals: SandboxGlobals
   readonly realm?: ExecuteRealm
-  /** Receives a reader for the logs and aftermath so far when user code starts, and undefined once it ends. */
-  readonly onProgressReader?: (read: (() => ExecuteProgress) | undefined) => void
+  /** Receives a reader for the logs and aftermath so far when user code starts; it keeps working after the code ends. */
+  readonly onProgressReader?: (read: () => ExecuteProgress) => void
 }): Promise<{
   readonly result: unknown
   readonly logs: readonly ExecuteLogEntry[]
@@ -1913,7 +1931,6 @@ export async function runUserCode({ code, globals, realm, onProgressReader }: {
     const metadata = buildResultMetadata()
     throw new ExecuteCodeError(error, metadata.logs, metadata.logSummary, metadata.aftermath)
   } finally {
-    onProgressReader?.(undefined)
     globals.page.off("console", onConsole)
     globals.page.off("pageerror", onPageError)
     globals.page.off("framenavigated", onFrameNavigated)

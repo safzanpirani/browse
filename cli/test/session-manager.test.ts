@@ -4,7 +4,7 @@ import type { ExecuteProgress, ExecuteResult } from "../src/execute.ts"
 import { ExecuteRealm } from "../src/execute-realm.ts"
 import { HandoffRegistry } from "../src/handoff.ts"
 import type { ExecuteSandboxLike } from "../src/relay-types.ts"
-import { OpenCodeBrowserSessions } from "../src/session-manager.ts"
+import { OpenCodeBrowserSessions, type SessionHooks } from "../src/session-manager.ts"
 
 const ok = (text: string): ExecuteResult => ({
   text,
@@ -61,7 +61,7 @@ class FakeSandbox implements ExecuteSandboxLike {
   getStatus() { return { connected: true, pageUrl: null, stateKeys: [] } }
 }
 
-function manager(script: (sandbox: FakeSandbox) => Promise<ExecuteResult>, options: { readonly handoffs?: HandoffRegistry } = {}) {
+function manager(script: (sandbox: FakeSandbox) => Promise<ExecuteResult>, options: { readonly handoffs?: HandoffRegistry; readonly hooks?: SessionHooks } = {}) {
   const sandboxes: FakeSandbox[] = []
   const sessions = new OpenCodeBrowserSessions("http://127.0.0.1:0", () => {
     const sandbox = new FakeSandbox(script)
@@ -71,6 +71,7 @@ function manager(script: (sandbox: FakeSandbox) => Promise<ExecuteResult>, optio
     stopGraceMs: 300,
     lifecycleTimeoutMs: 5_000,
     ...(options.handoffs ? { onCancelSessionHandoff: (id: string) => options.handoffs?.cancelForSession(id) !== undefined } : {}),
+    ...options.hooks,
   })
   return { sessions, sandboxes }
 }
@@ -228,6 +229,16 @@ describe("execute with timeoutMs", () => {
     const result = await run(sessions.execute({ sessionId: "t2", code: "...", createIfMissing: true, timeoutMs: 1_000 }))
     expect(result.result).toMatchObject({ isError: false, text: "done" })
     expect(sandboxes[0]?.aborted).toBe(0)
+  })
+
+  test("a script that finished in time is answered at the deadline even while its journal write still blocks", async () => {
+    const { promise: journal, resolve: journaled } = Promise.withResolvers<void>()
+    const { sessions } = manager(async () => ok("done"), { hooks: { onExecuteRecord: () => journal, journalTimeoutMs: 60_000 } })
+    const started = Date.now()
+    const result = await run(sessions.execute({ sessionId: "t3", code: "...", createIfMissing: true, timeoutMs: 100 }))
+    expect(Date.now() - started).toBeLessThan(2_000)
+    expect(result.result).toMatchObject({ isError: false, text: "done" })
+    journaled()
   })
 
   test("a call still queued behind another execute at the deadline never runs", async () => {
