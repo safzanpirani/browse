@@ -230,7 +230,8 @@ export function executeJsonEnvelope(result: ExecuteResponse): ExecuteJsonEnvelop
 }
 
 export function formatSessionContinuation(sessionId: string): string {
-  return `Session: ${sessionId}. Continue with --session ${sessionId}.`
+  const profile = process.env.OPENCODE_BROWSER_PROFILE
+  return `Session: ${sessionId}. Continue with ${profile ? `--profile ${profile} ` : ""}--session ${sessionId}.`
 }
 
 function errorJsonEnvelope(error: unknown): ExecuteJsonEnvelope {

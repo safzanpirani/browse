@@ -33,13 +33,18 @@ export function checkoutRoot(): string | undefined {
 const quoted = (value: string) => (/^[\w@%+=:,./-]+$/.test(value) ? value : JSON.stringify(value))
 
 /**
- * How to tell the user to run `opencode-browser <args>`: through npx from the published package, and with this
- * checkout's bundle from a checkout (where nothing is on PATH and the package may not be published).
+ * How to tell the user to run `opencode-browser <args>`: as the launcher that ran this (OPENCODE_BROWSER_COMMAND, which
+ * omp's `browse` launcher sets), else through npx from the published package, else with this checkout's bundle (where
+ * nothing is on PATH and the package may not be published). A selected profile is kept, so a printed command reaches
+ * the same relay.
  */
 export function cliCommand(args: string): string {
+  const profile = process.env.OPENCODE_BROWSER_PROFILE
+  const full = profile && !/(?:^|\s)--profile[\s=]/.test(args) ? `--profile ${quoted(profile)} ${args}` : args
+  if (process.env.OPENCODE_BROWSER_COMMAND) return `${process.env.OPENCODE_BROWSER_COMMAND} ${full}`
   return fromCheckout()
-    ? `node ${quoted(path.join(packageRoot(), "dist", "cli.mjs"))} ${args}`
-    : `npx opencode-browser-cli ${args}`
+    ? `node ${quoted(path.join(packageRoot(), "dist", "cli.mjs"))} ${full}`
+    : `npx opencode-browser-cli ${full}`
 }
 
 /**

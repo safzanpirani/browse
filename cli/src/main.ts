@@ -66,8 +66,9 @@ PROFILES (one relay and one extension copy per browser profile)
     // `--client` selects which setup to report; the relay status that follows doesn't take it.
     const client = process.argv.findIndex((arg, index) => index > 2 && (arg === "--client" || arg.startsWith("--client=")))
     const selector = client === -1 ? [] : process.argv.splice(client, process.argv[client] === "--client" ? 2 : 1)
+    // `status --json` prints only the relay's JSON, so callers can parse it whole.
     const { printSetupStatus } = await import("./setup.ts")
-    printSetupStatus(selector)
+    if (!process.argv.includes("--json")) printSetupStatus(selector)
   }
   await import("./cli.ts")
 }
