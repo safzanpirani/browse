@@ -18,9 +18,6 @@
 set -uo pipefail
 
 mac="${BROWSE_MAC_HOST:-mac}"
-# Expanded by the Mac's shell.
-mac_launcher="${BROWSE_MAC_LAUNCHER:-\$HOME/.local/bin/browse}"
-mac_home="${BROWSE_MAC_HOME:-\$HOME/.local/share/opencode-browser}"
 # This host's OPENCODE_BROWSER_HOME: the Mac's token and profiles, never a local relay's.
 home="$HOME/.opencode-browser-mac"
 app="${BROWSE_APP:-$HOME/apps/browse}"
@@ -39,10 +36,17 @@ on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$mac" "$@"; }
 die() { echo "$*" >&2; exit 1; }
 # One shell word, for a command line the Mac's shell or this host's launcher parses.
 shq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }
-# The Mac's browse skill folder as one word for the Mac's shell: an override is taken literally (quoted, so `$`,
-# backticks and `$(…)` in it are never run there); the default expands $HOME on the Mac.
+# A Mac path as one word for the Mac's shell: an override is taken literally (quoted, so `$`, backticks and `$(…)` in
+# it are never run there); the default, under $HOME, expands on the Mac. A suffix goes after it unquoted
+# ("$mac_home/relay-token"), which the Mac's shell joins into the same word.
+mac_path() { if [[ -n $1 ]]; then shq "$1"; else printf '"$HOME/%s"' "$2"; fi; }
+mac_launcher="$(mac_path "${BROWSE_MAC_LAUNCHER:-}" .local/bin/browse)"
+mac_home="$(mac_path "${BROWSE_MAC_HOME:-}" .local/share/opencode-browser)"
+mac_skill="$(mac_path "${BROWSE_MAC_SKILL:-}" .agents/skills/browse)"
+# The same paths for messages.
+mac_launcher_name="${BROWSE_MAC_LAUNCHER:-~/.local/bin/browse}"
+mac_home_name="${BROWSE_MAC_HOME:-~/.local/share/opencode-browser}"
 mac_skill_name="${BROWSE_MAC_SKILL:-~/.agents/skills/browse}"
-if [[ -n ${BROWSE_MAC_SKILL:-} ]]; then mac_skill="$(shq "$BROWSE_MAC_SKILL")"; else mac_skill='"$HOME/.agents/skills/browse"'; fi
 # Replaces folder <dest> with folder <new> by rename, so this running script and readers never see it half-written.
 swap_in() {
   rm -rf "$2.old"
@@ -64,8 +68,8 @@ check_port() {
 # The CLI entry the Mac's launcher runs (its exec line, as omp's install writes it).
 mac_entry() {
   local entry
-  entry="$(on_mac "cat \"$mac_launcher\"" | sed -n "s/^exec '[^']*' '\([^']*\)' .*/\1/p")"
-  [[ $entry == /*/dist/cli.mjs ]] || die "cannot read the CLI path from the Mac's launcher ($mac_launcher); is browse installed there?"
+  entry="$(on_mac "cat $mac_launcher" | sed -n "s/^exec '[^']*' '\([^']*\)' .*/\1/p")"
+  [[ $entry == /*/dist/cli.mjs ]] || die "cannot read the CLI path from the Mac's launcher ($mac_launcher_name); is browse installed there?"
   printf '%s' "$entry"
 }
 
@@ -175,8 +179,8 @@ case "${1:-status}" in
     echo "✓ CLI from $mac:$cli at $live → releases/${next##*/} ($(md5sum < "$live/dist/cli.mjs" | cut -c1-12))"
 
     # The token goes through ssh stdout into a 0600 file; it is never printed or passed as an argument.
-    (umask 077 && on_mac "cat \"$mac_home/relay-token\"" > "$home/relay-token.tmp") && [[ -s $home/relay-token.tmp ]] \
-      || { rm -f "$home/relay-token.tmp"; die "cannot read the Mac's relay token at $mac_home/relay-token"; }
+    (umask 077 && on_mac "cat $mac_home/relay-token" > "$home/relay-token.tmp") && [[ -s $home/relay-token.tmp ]] \
+      || { rm -f "$home/relay-token.tmp"; die "cannot read the Mac's relay token at $mac_home_name/relay-token"; }
     mv "$home/relay-token.tmp" "$home/relay-token" || die "cannot write $home/relay-token"
     echo "✓ relay token at $home/relay-token"
 
@@ -234,7 +238,7 @@ EOF
     shift
     stop
     # The Mac's profiles.json is the one source of ports and names.
-    on_mac "cat \"$mac_home/profiles.json\" 2>/dev/null || echo '{\"profiles\":[]}'" > "$state/mac-profiles.json.new" \
+    on_mac "cat $mac_home/profiles.json 2>/dev/null || echo '{\"profiles\":[]}'" > "$state/mac-profiles.json.new" \
       || die "cannot reach $mac over ssh"
     mv "$state/mac-profiles.json.new" "$state/mac-profiles.json"
     # Here each profile's port is its proxy port, so `browse --profile <name>` goes through the tunnel.
@@ -307,7 +311,7 @@ EOF
     for p in "$@"; do check_port "$p"; done
     failed=0
     for p in "$@"; do
-      on_mac "OPENCODE_BROWSER_PORT=$p \"$mac_launcher\" relay restart" 2>&1 || { echo "start-mac $p failed" >&2; failed=1; }
+      on_mac "OPENCODE_BROWSER_PORT=$p $mac_launcher relay restart" 2>&1 || { echo "start-mac $p failed" >&2; failed=1; }
     done
     exit "$failed"
     ;;
@@ -318,7 +322,7 @@ EOF
     for p in "$@"; do check_port "$p"; done
     failed=0
     for p in "$@"; do
-      on_mac "OPENCODE_BROWSER_PORT=$p \"$mac_launcher\" relay stop" 2>&1 || { echo "stop-mac $p failed" >&2; failed=1; }
+      on_mac "OPENCODE_BROWSER_PORT=$p $mac_launcher relay stop" 2>&1 || { echo "stop-mac $p failed" >&2; failed=1; }
     done
     exit "$failed"
     ;;
