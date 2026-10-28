@@ -101,6 +101,16 @@ describe("skill", () => {
     expect(skill).toContain("restarts omp")
   })
 
+  test("ends with the port table and the limits omp scripts hit", () => {
+    const section = skill.slice(skill.lastIndexOf("\n## "))
+    expect(section).toStartWith("\n## Profiles, ports and limits (omp)\n")
+    expect(section).toContain("| 19960-19966 | profiles: `browse --profile <name> <command>` or `OPENCODE_BROWSER_PROFILE=<name>` |")
+    expect(section).toContain("| 19989-19995 | browser-control's relays")
+    for (const text of ["files.write()", "OPENCODE_BROWSER_ALLOW_NODE=1", "idleMinutes=never", "OPENCODE_BROWSER_HUMAN_INPUT=0", "--timeout-ms", "browse-remote"])
+      expect(section).toContain(text)
+    expect(skill.endsWith("tunnels to these relays.\n")).toBe(true)
+  })
+
   test("names only commands and flags the CLI has", () => {
     const cli = fs.readFileSync(path.join(import.meta.dir, "..", "src", "cli.ts"), "utf8")
     const main = fs.readFileSync(path.join(import.meta.dir, "..", "src", "main.ts"), "utf8")

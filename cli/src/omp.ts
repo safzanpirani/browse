@@ -157,12 +157,36 @@ const OMP_NOTE = `> **In omp:** run browse as shell commands through bash: \`${N
 > MCP tool (\`session_new\`, \`tabs_cleanup\`, \`settings { … }\`, \`network_*\`), run the matching \`${NAME}\` command
 > instead; the \`${NAME}\` MCP server is optional. Pass \`--json\` when you need structured output.
 > With several browser profiles, each has its own relay: \`${NAME} profiles list\` shows them, and
-> \`${NAME} --profile <name> <command>\` (or \`OPENCODE_BROWSER_PROFILE=<name>\`) drives that profile's browser.`
+> \`${NAME} --profile <name> <command>\` (or \`OPENCODE_BROWSER_PROFILE=<name>\`) drives that profile's browser. Ports and
+> limits that matter in omp are in the last section.`
+
+/** Appended after the upstream text: the fork's port layout and the limits omp's scripts and watchers hit. */
+const OMP_SECTION = `## Profiles, ports and limits (omp)
+
+Each browser profile has its own relay and its own copy of the extension.
+\`${NAME} profiles add <name>\` makes the copy (load it unpacked in that profile) and pins it to the next free port in
+19960-19966; \`${NAME} profiles list\` shows each profile's port and whether its relay and extension are up.
+
+| Port | Relay |
+|---|---|
+| 19960-19966 | profiles: \`${NAME} --profile <name> <command>\` or \`OPENCODE_BROWSER_PROFILE=<name>\` |
+| 19988 | the plain \`dist/\` extension (no profile selected) |
+| 19989-19995 | browser-control's relays: never point \`${NAME}\` at them |
+
+- Execute code has no \`fs\`: save with \`files.write()\`, or run the relay with \`OPENCODE_BROWSER_ALLOW_NODE=1\` for full
+  Node.
+- Tabs a session opened close after 10 untouched minutes. A watcher that runs longer adopts a tab the user shared
+  (\`${NAME} session adopt\`), or the user sets \`${NAME} settings set idleMinutes=never\`.
+- Human-like input paces every click and key. A speed-sensitive script (5 s click timeouts) runs against a relay
+  started with \`OPENCODE_BROWSER_HUMAN_INPUT=0\`.
+- Bound a script that might stall with \`${NAME} execute --timeout-ms <ms>\`; the session stays usable.
+- From another machine (ampere), the \`browse-remote\` skill tunnels to these relays.`
 
 /**
  * The browse skill for omp: the upstream skill with `opencode-browser` commands renamed to the `browse` launcher, a
- * note mapping its MCP references to the CLI, and the marker. Paths and package names that contain
- * `opencode-browser` (`~/.local/share/opencode-browser`, `opencode-browser-cli`) are left as they are.
+ * note mapping its MCP references to the CLI, a closing section on profiles, ports and limits, and the marker. Paths
+ * and package names that contain `opencode-browser` (`~/.local/share/opencode-browser`, `opencode-browser-cli`) are
+ * left as they are.
  */
 export function ompSkill(upstream: string): string {
   const frontmatter = upstream.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/)?.[0] ?? ""
@@ -174,7 +198,7 @@ export function ompSkill(upstream: string): string {
   // The note goes after the title, or first when the skill has none.
   const title = body.match(/^# .*\n/m)
   const at = title ? (title.index ?? 0) + title[0].length : 0
-  return `${frontmatter}<!-- ${MARKER} -->\n${body.slice(0, at)}\n${OMP_NOTE}\n${title ? "" : "\n"}${body.slice(at)}`
+  return `${frontmatter}<!-- ${MARKER} -->\n${body.slice(0, at)}\n${OMP_NOTE}\n${title ? "" : "\n"}${body.slice(at)}${body.endsWith("\n") ? "" : "\n"}\n${OMP_SECTION}\n`
 }
 
 // ---- omp's mcp.json -------------------------------------------------------------------------------
