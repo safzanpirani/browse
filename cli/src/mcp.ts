@@ -94,8 +94,9 @@ function makeToolSpecs(relay: RelayClient.Interface, currentSession: CurrentSess
       handle: () => Effect.gen(function* () {
         const [version, status] = yield* Effect.all([relay.version, relay.extensionStatus])
         const buildProblem = RelayLifecycle.relayBuildProblem(version)
+        const buildDrift = RelayLifecycle.relayBuildDrift(version)
         const available = updateJson(update())
-        return { endpoint: relay.endpoint, currentSession: currentSession.id, version, status, ...(buildProblem ? { buildProblem } : {}), ...(available ? { update: available } : {}) }
+        return { endpoint: relay.endpoint, currentSession: currentSession.id, version, status, ...(buildProblem ? { buildProblem } : {}), ...(buildDrift ? { buildDrift } : {}), ...(available ? { update: available } : {}) }
       }),
     },
     {

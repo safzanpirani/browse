@@ -280,6 +280,14 @@ export const ExtensionStatus = Schema.Struct({
 
 export interface ExtensionStatus extends Schema.Schema.Type<typeof ExtensionStatus> {}
 
+/**
+ * Version of the relay HTTP contract shared by the CLI, MCP server, and SDK
+ * client. Bump it only when a request/response shape or route meaning changes
+ * incompatibly. A client accepts a running relay with the same value even when
+ * its build id differs, so CLI-only rebuilds do not demand `relay restart`.
+ */
+export const relayClientProtocolVersion = 1
+
 export const RelayVersion = Schema.Struct({
   version: Schema.String,
   buildId: Schema.optionalKey(Schema.String),
@@ -288,6 +296,7 @@ export const RelayVersion = Schema.Struct({
   pid: Schema.optionalKey(Schema.Number),
   managed: Schema.optionalKey(Schema.Boolean),
   shutdownProtocol: Schema.optionalKey(Schema.Literal(2)),
+  clientProtocol: Schema.optionalKey(Schema.Int),
 })
 
 export interface RelayVersion extends Schema.Schema.Type<typeof RelayVersion> {}

@@ -7,6 +7,7 @@ import path from "node:path"
 import WebSocket from "ws"
 import { dataUrlDocument, stableUnpackedExtensionOrigin } from "../src/relay-helpers.ts"
 import { pairingCode, pairingProof, relayToken } from "../src/relay-secrets.ts"
+import { relayClientProtocolVersion } from "../src/relay-schema.ts"
 
 // A relay from source on a free port with its own data root, and a fake extension that pairs with it and answers
 // its commands. No browser.
@@ -181,6 +182,8 @@ afterAll(async () => {
 describe("relay", () => {
   test("HTTP API needs the token; the version probe does not", async () => {
     expect((await fetch(`${base}/version`)).status).toBe(200)
+    // Clients of another build on the same client protocol keep using this relay.
+    expect((await (await fetch(`${base}/version`)).json() as { clientProtocol?: number }).clientProtocol).toBe(relayClientProtocolVersion)
     expect((await fetch(`${base}/extension/status`)).status).toBe(401)
     expect((await fetch(`${base}/extension/status`, { headers: { authorization: "Bearer wrong" } })).status).toBe(401)
     expect((await fetch(`${base}/cli/execute`, { method: "POST", body: "{}" })).status).toBe(401)

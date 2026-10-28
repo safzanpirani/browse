@@ -1,6 +1,6 @@
 import { Effect, FileSystem, Path, Schema } from "effect"
 import * as RelayClient from "./relay-client.ts"
-import { relayBuildProblem } from "./relay-lifecycle.ts"
+import { relayBuildDrift, relayBuildProblem } from "./relay-lifecycle.ts"
 import type { ExtensionStatus, RelayVersion, SessionSummary, TargetSummary } from "./relay-schema.ts"
 import { extensionProtocolVersion } from "./protocol.ts"
 import { cliCommand, installCommand, STORE_LISTED } from "./paths.ts"
@@ -73,6 +73,7 @@ export type DoctorReport = {
     readonly version: string | null
     readonly buildId: string | null
     readonly buildMatches: boolean | null
+    readonly compatible: boolean | null
     readonly error: string | null
   }
   readonly extension: {
@@ -178,9 +179,10 @@ export const createDoctorReport = Effect.fn("Doctor.createReport")(function* (op
   const relayResult = yield* probe(relay.version)
   const relayBuildMatches = relayResult.ok
     ? relayResult.value.buildId
-      ? relayBuildProblem(relayResult.value, opencodeBrowserBuildId) === undefined
+      ? relayResult.value.buildId === opencodeBrowserBuildId
       : null
     : null
+  const relayCompatible = relayResult.ok ? relayBuildProblem(relayResult.value, opencodeBrowserBuildId) === undefined : null
   const [extensionResult, targetsResult, sessionsResult] = relayResult.ok
     ? yield* Effect.all([
       probe(relay.extensionStatus),
@@ -251,6 +253,7 @@ export const createDoctorReport = Effect.fn("Doctor.createReport")(function* (op
       version: relayResult.ok ? relayResult.value.version : null,
       buildId: relayResult.ok ? relayResult.value.buildId ?? null : null,
       buildMatches: relayBuildMatches,
+      compatible: relayCompatible,
       error: relayResult.ok ? null : relayResult.error,
     },
     extension: {
@@ -453,22 +456,21 @@ export function unhealthyTargetsCheck(options: {
 export function relayBuildCheck(options: {
   readonly relayResult: ProbeResult<RelayVersion>
   readonly cliBuildId: string
+  readonly clientProtocol?: number
 }): DoctorCheck {
   const check = makeDoctorCheck("relay-build", "relay build")
   if (!options.relayResult.ok) {
     return check("warn", "relay unreachable; cannot compare builds")
   }
-  const relayBuildId = options.relayResult.value.buildId
-  if (!relayBuildId) {
-    return check("warn", "running relay does not report a build id")
+  const relay = options.relayResult.value
+  if (relayBuildProblem(relay, options.cliBuildId, options.clientProtocol)) {
+    return check("warn", relay.buildId
+      ? `runtime ${relay.buildId} is incompatible with CLI ${options.cliBuildId}`
+      : "running relay does not report a build id")
   }
-  const matches = relayBuildId === options.cliBuildId
-  return check(
-    matches ? "ok" : "warn",
-    matches
-      ? `matches CLI build (${options.cliBuildId})`
-      : `runtime ${relayBuildId} does not match CLI ${options.cliBuildId}`,
-  )
+  return check("ok", relayBuildDrift(relay, options.cliBuildId, options.clientProtocol)
+    ? `runtime ${relay.buildId ?? "unknown"} differs from CLI ${options.cliBuildId}; client protocol ${relay.clientProtocol} is compatible`
+    : `matches CLI build (${options.cliBuildId})`)
 }
 
 function extensionVersionCheck(options: {

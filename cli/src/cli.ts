@@ -565,7 +565,7 @@ const status = Command.make(
     if (json) {
       yield* Console.log(JSON.stringify({
         endpoint: relay.endpoint,
-        relay: { running: true, version: version.version, buildId: version.buildId ?? null, stale: buildProblem !== undefined },
+        relay: { running: true, version: version.version, buildId: version.buildId ?? null, clientProtocol: version.clientProtocol ?? null, stale: buildProblem !== undefined },
         extension: extensionStatus,
         currentSession: current ?? null,
         sessions,
@@ -581,6 +581,9 @@ const status = Command.make(
     yield* Console.log(`Relay: ${relay.endpoint} (${version.version})`)
     if (buildProblem) {
       yield* Console.log(`Warning: ${buildProblem}`)
+    } else {
+      const buildDrift = RelayLifecycle.relayBuildDrift(version)
+      if (buildDrift) yield* Console.log(`Note: ${buildDrift}`)
     }
     yield* Console.log(`Extension: ${extensionStatus.connected ? "connected" : "disconnected"}${extensionStatus.version ? ` (${extensionStatus.version})` : ""}`)
     if ((extensionStatus.rejectedConnections ?? 0) > 0) {

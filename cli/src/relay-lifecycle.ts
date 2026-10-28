@@ -6,7 +6,7 @@ import process from "node:process"
 import { fileURLToPath } from "node:url"
 import { extensionReconnectAlarmPeriodMs } from "./protocol.ts"
 import * as RelayClient from "./relay-client.ts"
-import { RelayShutdownRequest, type ExtensionStatus, type RelayVersion } from "./relay-schema.ts"
+import { relayClientProtocolVersion, RelayShutdownRequest, type ExtensionStatus, type RelayVersion } from "./relay-schema.ts"
 import { cliCommand, installCommand } from "./paths.ts"
 import { opencodeBrowserBuildId } from "./version.ts"
 
@@ -25,6 +25,7 @@ export type EnsureRelayOptions = {
   readonly relay: RelayClient.Interface
   readonly start?: Effect.Effect<void, Error>
   readonly buildId?: string
+  readonly clientProtocol?: number
   readonly retryTimes?: number
   readonly retryDelayMs?: number
 }
@@ -57,25 +58,50 @@ export class ExtensionProtocolIncompatible extends Schema.TaggedError<ExtensionP
   },
 ) {}
 
-export function relayBuildProblem(version: RelayVersion, buildId = opencodeBrowserBuildId): string | undefined {
+/**
+ * Returns why this client cannot use the running relay. Relays that report a
+ * client protocol are compatible whenever it matches, regardless of build id;
+ * legacy relays without one still require the exact build.
+ */
+export function relayBuildProblem(
+  version: RelayVersion,
+  buildId = opencodeBrowserBuildId,
+  clientProtocol = relayClientProtocolVersion,
+): string | undefined {
+  if (version.buildId !== undefined && version.buildId === buildId) return undefined
+  if (version.clientProtocol !== undefined) {
+    if (version.clientProtocol === clientProtocol) return undefined
+    if (version.clientProtocol > clientProtocol) {
+      return `Running relay protocol ${version.clientProtocol} (build ${version.buildId ?? "unknown"}) is newer than CLI protocol ${clientProtocol} (build ${buildId}); refresh or restart this CLI or MCP client. Only use \`${cliCommand("relay restart")}\` from the current installation.`
+    }
+    return `Running relay protocol ${version.clientProtocol} (build ${version.buildId ?? "unknown"}) is incompatible with CLI protocol ${clientProtocol} (build ${buildId}); run \`${cliCommand("relay restart")}\` when no agent is using the browser. This leaves browser tabs open but resets in-memory JavaScript state.`
+  }
   if (!version.buildId) {
     return `Running relay does not report a build id; use \`${cliCommand("relay restart")}\` for upgrade guidance (${buildId}).`
   }
-  if (version.buildId !== buildId) {
-    if (isNewerBuild(version.buildId, buildId)) {
-      return `Running relay build ${version.buildId} is newer than CLI build ${buildId}; refresh or restart this CLI or MCP client. Only use \`${cliCommand("relay restart")}\` from the current installation.`
-    }
-    return `Running relay build ${version.buildId} does not match CLI build ${buildId}; run \`${cliCommand("relay restart")}\` when no agent is using the browser. This leaves browser tabs open but resets in-memory JavaScript state.`
+  if (isNewerBuild(version.buildId, buildId)) {
+    return `Running relay build ${version.buildId} is newer than CLI build ${buildId}; refresh or restart this CLI or MCP client. Only use \`${cliCommand("relay restart")}\` from the current installation.`
   }
-  return undefined
+  return `Running relay build ${version.buildId} does not match CLI build ${buildId}; run \`${cliCommand("relay restart")}\` when no agent is using the browser. This leaves browser tabs open but resets in-memory JavaScript state.`
+}
+
+/** Describes a compatible relay running a different build than this client. */
+export function relayBuildDrift(
+  version: RelayVersion,
+  buildId = opencodeBrowserBuildId,
+  clientProtocol = relayClientProtocolVersion,
+): string | undefined {
+  if (version.buildId === buildId || relayBuildProblem(version, buildId, clientProtocol) !== undefined) return undefined
+  return `Running relay build ${version.buildId ?? "unknown"} differs from CLI build ${buildId} but speaks compatible protocol ${clientProtocol}; run \`${cliCommand("relay restart")}\` only to pick up relay-side changes.`
 }
 
 export const ensureRelay = Effect.fn("RelayLifecycle.ensureRelay")(function* (options: EnsureRelayOptions) {
   const buildId = options.buildId ?? opencodeBrowserBuildId
+  const clientProtocol = options.clientProtocol ?? relayClientProtocolVersion
   const probe = options.relay.version
   const initial = yield* Effect.result(probe)
   if (Result.isSuccess(initial)) {
-    const buildProblem = relayBuildProblem(initial.success, buildId)
+    const buildProblem = relayBuildProblem(initial.success, buildId, clientProtocol)
     return {
       version: initial.success,
       started: false,
@@ -98,7 +124,7 @@ export const ensureRelay = Effect.fn("RelayLifecycle.ensureRelay")(function* (op
     yield* options.start ?? startManagedRelay()
   }
   const version = yield* waitForRelayReady(options)
-  const buildProblem = relayBuildProblem(version, buildId)
+  const buildProblem = relayBuildProblem(version, buildId, clientProtocol)
   return { version, started: relayWasAbsent, ...(buildProblem ? { buildProblem } : {}) } satisfies RelayReadiness
 })
 
@@ -181,7 +207,7 @@ export const restartRelay = Effect.fn("RelayLifecycle.restartRelay")(function* (
   if (!replacement || !replacement.instanceId || replacement.managed !== true || (original && isSameRelayInstance(original, replacement))) {
     return yield* Effect.fail(new Error("Relay restart did not produce a new managed instance; no further shutdown was attempted."))
   }
-  const buildProblem = relayBuildProblem(replacement, buildId)
+  const buildProblem = relayBuildProblem(replacement, buildId, options.clientProtocol ?? relayClientProtocolVersion)
   if (buildProblem) return yield* Effect.fail(new Error(`${buildProblem} A competing relay was left untouched.`))
   return { version: replacement, started, waitForReconnect: true } satisfies RelayReadiness
 })
