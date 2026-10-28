@@ -426,6 +426,11 @@ relay with `OPENCODE_BROWSER_ALLOW_NODE=1` (full Node in execute),
 `OPENCODE_BROWSER_ALLOW_ALL_COOKIES=1` and `OPENCODE_BROWSER_ALLOW_FOREGROUND=1`;
 never ask for them to work around a page.
 
+Chrome applies `context.grantPermissions()` and `context.clearPermissions()` to
+its most recently focused profile, not the session's tab, so the relay refuses
+them while no window of the session's profile has focus. Ask the user to focus
+one, then retry.
+
 A waiting `handoff` shows the user a small card with the page's origin (or, on a
 tab being recorded, a system notification) and the WAIT badge. Only the user's
 own click on Continue or the toolbar button completes it; page script can't.

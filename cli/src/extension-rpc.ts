@@ -2,6 +2,8 @@ import { Effect, Predicate } from "effect"
 import { WebSocket } from "ws"
 import {
   extensionProtocolCompatibility,
+  parseExtensionCapabilities,
+  type ExtensionCapability,
   type ExtensionCommand,
   type ExtensionProtocolCompatibility,
   type ExtensionResponse,
@@ -34,6 +36,7 @@ export class ExtensionRpc {
   protocolVersion: number | null | undefined
   protocolCompatible: boolean | undefined
   protocolLegacy: boolean | undefined
+  private capabilities: ReadonlySet<ExtensionCapability> = new Set()
 
   constructor(private readonly timeouts: ExtensionRpcTimeouts = {}) {}
 
@@ -55,13 +58,23 @@ export class ExtensionRpc {
     this.resetConnectionState(socket)
   }
 
-  markHandshake(version: string | undefined, reportedProtocolVersion: JsonValue | undefined): ExtensionProtocolCompatibility {
+  markHandshake(
+    version: string | undefined,
+    reportedProtocolVersion: JsonValue | undefined,
+    reportedCapabilities?: JsonValue,
+  ): ExtensionProtocolCompatibility {
     const protocol = extensionProtocolCompatibility(reportedProtocolVersion)
     this.version = version
     this.protocolVersion = protocol.version
     this.protocolCompatible = protocol.compatible
     this.protocolLegacy = protocol.legacy
+    this.capabilities = parseExtensionCapabilities(reportedCapabilities)
     return protocol
+  }
+
+  /** Whether the connected extension advertised this optional command in its hello. */
+  supports(capability: ExtensionCapability): boolean {
+    return this.capabilities.has(capability)
   }
 
   markReady(): void {
@@ -87,6 +100,7 @@ export class ExtensionRpc {
     this.protocolVersion = undefined
     this.protocolCompatible = undefined
     this.protocolLegacy = undefined
+    this.capabilities = new Set()
   }
 
   close(): void {

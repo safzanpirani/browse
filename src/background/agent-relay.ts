@@ -5,6 +5,7 @@
 import {
   defaultRelayPort,
   encodeRecordingFrame,
+  extensionCapabilities,
   extensionProtocolVersion,
   extensionReconnectAlarmPeriodMs,
   isJsonObject,
@@ -297,6 +298,7 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
           version: chrome.runtime.getManifest().version,
           build: __OPENCODE_BROWSER_BUILD__,
           protocolVersion: extensionProtocolVersion,
+          capabilities: [...extensionCapabilities],
           profileId: profile.id,
           profileName: profile.name ?? "OpenCode Browser",
           pairing: { nonce },
@@ -575,6 +577,12 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
         return recordingCall<OffscreenCancelRecordingResult>("recording.cancel", number(params, "tabId")).then((result) =>
           result.success ? { success: true } : result,
         )
+      case "windows.focusState": {
+        // This extension instance sees only its own profile's windows, so this is true exactly when one of this
+        // profile's windows has OS focus (the relay checks it before permission commands; see cli/src/profile-focus.ts).
+        const lastFocused = await chrome.windows.getLastFocused()
+        return { focused: lastFocused.focused === true }
+      }
     }
   }
 

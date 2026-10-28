@@ -13,6 +13,19 @@ export const extensionProtocolVersion = 2
 export const extensionReconnectAlarmPeriodMs = 30_000
 const legacyExtensionProtocolVersion = 1
 
+/**
+ * Optional commands an extension advertises in its hello. The relay sends them only when advertised, so an older
+ * extension on the same protocol keeps working. Keep in step with src/agent-relay/protocol.ts.
+ */
+export const extensionCapabilities = ["windows.focusState"] as const
+
+export type ExtensionCapability = typeof extensionCapabilities[number]
+
+export function parseExtensionCapabilities(value: JsonValue | undefined): ReadonlySet<ExtensionCapability> {
+  if (!Array.isArray(value)) return new Set()
+  return new Set(extensionCapabilities.filter((capability) => value.includes(capability)))
+}
+
 export type ExtensionProtocolCompatibility = {
   readonly version: number | null
   readonly compatible: boolean
@@ -114,6 +127,7 @@ const extensionCommandMethodValues = [
   "relay.settings",
   "settings.get",
   "settings.set",
+  "windows.focusState",
 ] as const
 
 const extensionEventMethodValues = [

@@ -15,6 +15,7 @@ import {
 import { CdpClientPool } from "./cdp-client-pool.ts"
 import { beforeInput, forgetTab, humanInputEnabled, humanInputOverride, setHumanInput } from "./human-input.ts"
 import { CdpRouter, tabScopedCookieCommand } from "./cdp-router.ts"
+import { guardFocusedProfilePermission } from "./profile-focus.ts"
 import { CdpRuntime } from "./cdp-runtime.ts"
 import { ExtensionRpc } from "./extension-rpc.ts"
 import { createHttpRequestHandler, hasRelayToken } from "./http-api.ts"
@@ -1041,6 +1042,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     extensionRpc.markHandshake(
       getString(message.params, "version"),
       message.params?.protocolVersion,
+      message.params?.capabilities,
     )
     extensionBuild = getString(message.params, "build")
     extensionOrigin = origin
@@ -1681,6 +1683,11 @@ const makeRelay = Effect.fnUntraced(function* (options: {
       catch: (error) => error instanceof Error ? error : new Error(String(error)),
     })
     const { tabId } = route
+    yield* guardFocusedProfilePermission({
+      method: message.method,
+      canReportFocus: extensionRpc.supports("windows.focusState"),
+      focusState: () => sendToExtension({ method: "windows.focusState" }),
+    })
     if (message.method === ghostCursorCommandMethod) return yield* ghostCursor.command(tabId, message.params)
     if (message.method === "Page.navigate" && route.chromeSessionId === undefined) {
       const dataNavigation = yield* navigateTopFrameToDataUrl(tabId, message.params)

@@ -51,7 +51,11 @@ export const commandMethods = [
   "relay.settings",
   "settings.get",
   "settings.set",
+  "windows.focusState",
 ] as const
+
+/** Optional commands this extension advertises in its hello (cli/src/protocol.ts extensionCapabilities). */
+export const extensionCapabilities = ["windows.focusState"] as const
 
 export type ExtensionCommand = {
   readonly id: number

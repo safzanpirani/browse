@@ -42,7 +42,7 @@ class FakeExtension {
    * Resolves true once the relay proved the code and accepted the extension's proof. A real extension stops when
    * the relay's proof is wrong; `answerAnyway` sends the extension's proof regardless, as an impostor would.
    */
-  async pair(options: { readonly answerAnyway?: boolean; readonly proofPort?: number; readonly settings?: Record<string, unknown> } = {}): Promise<boolean> {
+  async pair(options: { readonly answerAnyway?: boolean; readonly proofPort?: number; readonly settings?: Record<string, unknown>; readonly capabilities?: readonly string[] } = {}): Promise<boolean> {
     await new Promise<void>((resolve, reject) => {
       this.socket.once("open", () => resolve())
       this.socket.once("error", reject)
@@ -57,7 +57,7 @@ class FakeExtension {
     })
     this.socket.send(JSON.stringify({
       method: "hello",
-      params: { version: "0.0.0-test", build: "test", protocolVersion: 2, profileId: "test", profileName: "Test", pairing: { nonce } },
+      params: { version: "0.0.0-test", build: "test", protocolVersion: 2, profileId: "test", profileName: "Test", pairing: { nonce }, ...(options.capabilities ? { capabilities: options.capabilities } : {}) },
     }))
     const params = await challenge
     // The relay must prove it knows the code before the extension obeys it.
@@ -693,5 +693,41 @@ describe("cookie commands", () => {
     ])
     socket.close()
     extension.close()
+  }, 20_000)
+})
+
+describe("permission commands", () => {
+  /** Sends context.grantPermissions()'s CDP command for a fresh session tab; resolves its reply and what reached the extension. */
+  async function grantPermissions(tabId: number, extensionOptions: { readonly capabilities?: readonly string[]; readonly focused?: boolean }) {
+    const targetInfo = { targetId: `TARGET-${tabId}`, type: "page", title: "Example", url: "https://example.com/", attached: true, browserContextId: "CTX" }
+    const extension = new FakeExtension(pairingCode(home))
+      .on("tabs.create", () => ({ tabId }))
+      .on("Target.getTargetInfo", () => ({ targetInfo }))
+      .on("windows.focusState", () => ({ focused: extensionOptions.focused === true }))
+    expect(await extension.pair(extensionOptions.capabilities ? { capabilities: extensionOptions.capabilities } : {})).toBe(true)
+    const socket = await connectCdp(`ws://127.0.0.1:${port}/devtools/browser/test?opencodeBrowserSessionId=permissions-${tabId}`, { authorization: `Bearer ${token}` })
+    if (!(socket instanceof WebSocket)) throw new Error(`CDP connection refused: ${socket}`)
+    expect((await cdpCall(socket, 1, "Target.createTarget", { url: "https://example.com/" })).result?.targetId).toBe(targetInfo.targetId)
+    const reply = await cdpCall(socket, 2, "Browser.grantPermissions", { permissions: ["geolocation"], origin: "https://example.com", browserContextId: "CTX" })
+    const sent = extension.commands.map((command) => command.method === "debugger.sendCommand" ? String(command.params?.method) : command.method)
+    socket.close()
+    extension.close()
+    await until(() => extension.closeCode !== undefined)
+    return { reply, askedFocus: sent.includes("windows.focusState"), forwarded: sent.includes("Browser.grantPermissions") }
+  }
+
+  test("refused while the session's profile has no focused window, since Chrome would apply it to another profile", async () => {
+    const unfocused = await grantPermissions(101, { capabilities: ["windows.focusState"], focused: false })
+    expect(unfocused.reply.error?.message).toContain("refused Browser.grantPermissions")
+    expect(unfocused).toMatchObject({ askedFocus: true, forwarded: false })
+  }, 20_000)
+
+  test("forwarded when the profile is focused, and unchecked for an extension that can't report focus", async () => {
+    const focused = await grantPermissions(102, { capabilities: ["windows.focusState"], focused: true })
+    expect(focused.reply.error).toBeUndefined()
+    expect(focused).toMatchObject({ askedFocus: true, forwarded: true })
+    const older = await grantPermissions(103, {})
+    expect(older.reply.error).toBeUndefined()
+    expect(older).toMatchObject({ askedFocus: false, forwarded: true })
   }, 20_000)
 })
