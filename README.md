@@ -90,6 +90,14 @@ usual folder: every copy has the same extension ID. `add` picks the next free po
 `--port`. Install refreshes the copies' pairing code; after a rebuild, `profiles sync` re-copies the build and
 reloads the connected copies. Without `--profile`, commands use `OPENCODE_BROWSER_PORT` or 19988 as before.
 
+### From another machine
+
+The relays listen on `127.0.0.1` only. `cli/skills/browse-remote` (a skill plus `scripts/mac-relays.sh` and
+`relay-proxy.mjs`) lets a Linux host drive them over ssh: `mac-relays.sh sync` copies this machine's built CLI, its
+relay token (into `~/.opencode-browser-mac`, mode 0600) and the skill there and writes a `browse` launcher with
+`OPENCODE_BROWSER_AUTOSTART=false`; `up` tunnels every profile's port to port + 10000 through a proxy that rewrites the
+`Host` header the relay checks. Its `SKILL.md` has the details.
+
 ## Using it
 
 - **Agents open their own tabs** in the background of the window you last used, grouped at the start of your tab strip
