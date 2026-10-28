@@ -15,6 +15,7 @@ import path from "node:path"
 import { createInterface } from "node:readline/promises"
 import { fileURLToPath } from "node:url"
 import { applyEdits, modify, parse } from "jsonc-parser"
+import { checkOmpInstallable, clientFlag, installOmp, ompAgentDir, OmpError, ompPaths, ompStatus, resolveClients, uninstallOmp, type Client } from "./omp.ts"
 import { cliCommand, dataRoot, installCommand, STORE_LISTED } from "./paths.ts"
 import { formatPairingCode, pairingCode, relayAuthorization, writeExtensionPairing } from "./relay-secrets.ts"
 import { opencodeBrowserVersion } from "./version.ts"
@@ -66,7 +67,7 @@ const checkoutExtensionDirs = (() => {
   return [path.join(repo, "public"), path.join(repo, "dist")]
 })()
 
-export type Settings = { opencode?: string; entry?: string; version?: string }
+export type Settings = { opencode?: string; entry?: string; version?: string; clients?: Client[] }
 
 export type Browser = {
   name: string
@@ -351,21 +352,29 @@ function unpackedFolder() {
 async function install(args: string[]) {
   checkNode()
   const opencode = findOpencode(args)
+  const clients = ompStep(() => resolveClients({
+    flag: clientFlag(args),
+    recorded: readJson<Settings>(files.settings)?.clients,
+    opencode: !!opencode,
+    ompInstalled: existsSync(ompAgentDir(args)),
+  }))
+  const omp = clients.includes("omp") ? ompPaths(root, args) : undefined
+  if (omp) ompStep(() => checkOmpInstallable(omp, args.includes("--mcp")))
 
   mkdirSync(files.dir, { recursive: true })
   const entry = installRuntime()
   log(`✓ OpenCode Browser ${opencodeBrowserVersion} installed${fromSource ? " (from source)" : ""}`)
-  writeFileSync(files.settings, JSON.stringify({ ...(opencode ? { opencode } : {}), entry, version: opencodeBrowserVersion } satisfies Settings, null, 2) + "\n")
+  writeFileSync(files.settings, JSON.stringify({ ...(opencode ? { opencode } : {}), entry, version: opencodeBrowserVersion, clients } satisfies Settings, null, 2) + "\n")
   if (removeLegacyHost()) log("✓ Removed the native messaging host of an earlier version")
 
   const node = process.execPath
-  log(opencode ? `✓ Using opencode at ${opencode}` : "! opencode not found. Install it (https://opencode.ai), or add the browse server to another MCP client (see the README).")
-  const mcp = configureMcp(entry)
-  log(`✓ MCP server ${mcp}`)
+  if (omp) {
+    const skill = readFileSync(path.join(packageRoot, "skills", "browse", "SKILL.md"), "utf8")
+    const runtime = { node, entry, fingerprint: fingerprint(entry) }
+    for (const line of ompStep(() => installOmp({ paths: omp, runtime, skill, mcp: args.includes("--mcp") }))) log(line)
+  }
+  const mcp = clients.includes("opencode") ? configureOpencode(opencode, entry) : undefined
   for (const line of restartOutdatedRelay(entry, node) ?? []) log(line)
-  const legacy = legacyBrowserControl()
-  if (legacy.length)
-    log(`! Browser Control MCP server${legacy.length === 1 ? "" : "s"} ${legacy.map((name) => `"${name}"`).join(", ")} also configured. OpenCode Browser replaces it; remove ${legacy.length === 1 ? "it" : "them"} from ${configFile()} to avoid two sets of browser tools.`)
 
   const connected = await connectedExtension()
   if (existsSync(bundledExtension)) {
@@ -402,7 +411,28 @@ async function install(args: string[]) {
   })
   if (found === "guided" && !STORE_LISTED && env.tty && !ssh && !args.includes("--no-wait")) return awaitConnection(entry)
   // The MCP server entry changed: a running opencode picks it up on restart.
-  if (found === "ready" && !mcp.endsWith("up to date")) log("Restart opencode (if it's running) to load the browse tools.")
+  if (found === "ready" && mcp && !mcp.endsWith("up to date")) log("Restart opencode (if it's running) to load the browse tools.")
+}
+
+/** opencode's part of install: the browse MCP server in its config. Returns what changed there. */
+function configureOpencode(opencode: string | undefined, entry: string) {
+  log(opencode ? `✓ Using opencode at ${opencode}` : "! opencode not found. Install it (https://opencode.ai), or add the browse server to another MCP client (see the README).")
+  const mcp = configureMcp(entry)
+  log(`✓ MCP server ${mcp}`)
+  const legacy = legacyBrowserControl()
+  if (legacy.length)
+    log(`! Browser Control MCP server${legacy.length === 1 ? "" : "s"} ${legacy.map((name) => `"${name}"`).join(", ")} also configured. OpenCode Browser replaces it; remove ${legacy.length === 1 ? "it" : "them"} from ${configFile()} to avoid two sets of browser tools.`)
+  return mcp
+}
+
+/** Runs an omp step, failing setup with its message when it refuses (a file it didn't write, a bad --client). */
+function ompStep<T>(step: () => T): T {
+  try {
+    return step()
+  } catch (error) {
+    if (error instanceof OmpError) fail(error.message)
+    throw error
+  }
 }
 
 /**
@@ -452,6 +482,7 @@ export function printSetupStatus() {
   log(`Version:   ${runtime ? `${runtime.version ?? "unknown"} (${runtime.entry})` : "not installed"}`)
   log(`opencode:  ${settings?.opencode ?? findOpencode([]) ?? "not found"}`)
   log(mcpServers()[MCP_NAME] ? `MCP:       "${MCP_NAME}" configured` : "MCP:       not configured")
+  for (const line of ompStatus(ompPaths(root), existsSync(ompAgentDir()))) log(line)
   log(`Logs:      ${path.join(files.dir, "logs")}`)
   log("")
 }
@@ -499,9 +530,18 @@ async function confirmSecretRemoval(args: string[]) {
 }
 
 async function uninstall(args: string[]) {
+  // `--client omp` removes only what omp needed; the runtime stays for opencode.
+  if (ompStep(() => clientFlag(args))?.join() === "omp") {
+    for (const line of uninstallOmp(ompPaths(root, args))) log(line)
+    const settings = readJson<Settings>(files.settings)
+    if (settings?.clients) writeFileSync(files.settings, JSON.stringify({ ...settings, clients: settings.clients.filter((client) => client !== "omp") }, null, 2) + "\n")
+    return
+  }
   await confirmSecretRemoval(args)
   const host = removeLegacyHost()
   const mcp = [MCP_NAME, LEGACY_MCP_NAME].filter((name) => removeMcp(name))
+  // Before the data root goes: it holds the record of what install wrote for omp.
+  for (const line of uninstallOmp(ompPaths(root, args))) log(line)
   rmSync(files.dir, { recursive: true, force: true })
   log(`✓ Removed ${files.dir}`)
   if (host) log("✓ Removed the native messaging host of an earlier version")

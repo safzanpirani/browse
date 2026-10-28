@@ -28,12 +28,16 @@ if (invokedAs === "opencode-browser-mcp") {
                                  the extensions page, show the folder to load unpacked and wait for it)
     --no-open                    Print the steps without opening anything or copying the path
     --no-wait                    Don't wait for the extension to connect
+    --client <opencode,omp>      Which agents to set up (default: the last install's, else opencode, or omp
+                                 when only omp is installed). omp gets a \`browse\` launcher on PATH and the
+                                 browse skill; --bin-dir, --skills-dir and --omp-dir move them
+    --mcp                        With omp: also add the browse MCP server to omp's mcp.json
   extension                      Show the unpacked extension folder (for "Load unpacked")
   pair                           Print the pairing code the Chrome Web Store extension asks for
   update [--check]               Update a git clone install: pull the newer commits (fast-forward only) and
                                  run setup again; --check only says whether there's an update
   uninstall [--yes]              Remove everything install set up (--yes skips confirming that stored
-                                 secret profiles are deleted)
+                                 secret profiles are deleted); --client omp removes only omp's files
 
 `)
   }
