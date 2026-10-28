@@ -6,7 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import { terminateChildProcess } from "./child-process.ts"
 import { isNodeError, writeJsonFileAtomically } from "./fs-durability.ts"
-import { redactKnownValues, type CredentialSlot } from "./network-redaction.ts"
+import { minimumSecretRunRedactionLength, redactKnownValues, type CredentialSlot } from "./network-redaction.ts"
 
 const StoredCredentialSlot = Schema.Struct({
   ref: Schema.String.check(Schema.isPattern(/^BC_SECRET_[1-9][0-9]*$/)),
@@ -304,7 +304,7 @@ function redactOutput(text: string, slots: readonly CredentialSlot[], maxBytes: 
     }
   }
   return {
-    text: redactKnownValues(bytes.subarray(0, cutoff).toString("utf8"), slots),
+    text: redactKnownValues(bytes.subarray(0, cutoff).toString("utf8"), slots, minimumSecretRunRedactionLength),
     truncated: cutoff < bytes.length,
   }
 }

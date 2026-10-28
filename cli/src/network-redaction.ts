@@ -416,15 +416,21 @@ function sourceName(requestScope: string, location: string, occurrence = 0): str
 }
 
 /**
- * Output redaction replaces every occurrence of a known value. Values this short
+ * Output redaction replaces every occurrence of a known value. In execute output, values this short
  * ("1", "0", "true", "dark") match ordinary text far more often than they protect
- * a credential, so they stay profile slots but are never rewritten in output.
+ * a credential, so they stay profile slots but are never rewritten there.
  */
 const minimumOutputRedactionLength = 6
+/**
+ * `secrets run` output comes from a command holding the real values, so it redacts short credentials
+ * (a 5-character password) too. One- and two-character slots (an account index such as `0`) stay
+ * readable; rewriting them would replace every digit in the output.
+ */
+export const minimumSecretRunRedactionLength = 3
 
-export function redactKnownValues(text: string, slots: readonly RedactionSlot[]): string {
+export function redactKnownValues(text: string, slots: readonly RedactionSlot[], minimumLength = minimumOutputRedactionLength): string {
   return slots
-    .filter((slot) => slot.value.length >= minimumOutputRedactionLength)
+    .filter((slot) => slot.value.length >= minimumLength)
     .sort((left, right) => right.value.length - left.value.length)
     .reduce((output, slot) => replaceOutsideReferences(output, slot.value, `\${${slot.ref}}`), text)
 }

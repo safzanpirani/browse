@@ -37,3 +37,18 @@ describe("AuthProfile.run working directory", () => {
     await expect(run({ cwd: remoteCwd })).rejects.toThrow(`Working directory does not exist on the relay host: ${remoteCwd}`)
   })
 })
+
+test("secrets run output redacts a short credential but leaves a one-character index", async () => {
+  const result = await Effect.runPromise(Effect.gen(function* () {
+    yield* AuthProfile.write({
+      name: "short",
+      baseDir,
+      slots: [
+        { ref: "BC_SECRET_1", value: "p4ss!", sources: ["password"] },
+        { ref: "BC_SECRET_2", value: "0", sources: ["authuser"] },
+      ],
+    })
+    return yield* AuthProfile.run({ name: "short", baseDir, command: "/bin/sh", args: ["-c", 'echo "$BC_SECRET_1 page 0"'] })
+  }))
+  expect(result.stdout.trim()).toBe("${BC_SECRET_1} page 0")
+})

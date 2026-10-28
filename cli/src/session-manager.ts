@@ -495,14 +495,21 @@ export class OpenCodeBrowserSessions {
     readonly createIfMissing: boolean
     readonly targetSelection?: ExecuteTargetSelection
     /**
-     * Wall-clock budget for the whole call, from admission: time queued behind an earlier execute in the session
-     * counts. A script still running at the deadline is stopped like a toolbar stop, keeping its logs so far.
+     * Wall-clock budget for the whole call, from the request: time waiting for a session create/reset to commit and
+     * time queued behind an earlier execute both count. Work still queued at the deadline never runs; a script still
+     * running at the deadline is stopped like a toolbar stop, keeping its logs so far.
      */
     readonly timeoutMs?: number
   }): Effect.Effect<ExecutionResponse, Error> {
     const manager = this
+    const requestedAt = Date.now()
+    const deadlineAt = options.timeoutMs === undefined ? undefined : requestedAt + options.timeoutMs
+    const notRun = (waitingFor: string) => sessionError(
+      "timeout",
+      `Execute timed out after ${options.timeoutMs}ms while waiting for ${waitingFor}; this script did not run.`,
+      options.sessionId,
+    )
     return this.withAdmission(options.sessionId, Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
-      const admittedAt = Date.now()
       const resolved = yield* manager.resolveWorkSession(options.sessionId, options.createIfMissing)
       const session = resolved.session
       const response = yield* Deferred.make<ExecutionResponse, Error>()
@@ -517,6 +524,10 @@ export class OpenCodeBrowserSessions {
           }
           if (manager.sessions.get(session.id) !== session) {
             return yield* sessionError("inactive", `Session is no longer active: ${session.id}`, session.id)
+          }
+          if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+            cancelled = true
+            return yield* notRun(`an earlier execute in session ${session.id} to finish`)
           }
           started = true
           session.updatedAt = new Date().toISOString()
@@ -594,16 +605,12 @@ export class OpenCodeBrowserSessions {
       })))
       const workerFiber = yield* manager.forkTracked(worker, session.id)
       const timeoutMs = options.timeoutMs
-      const deadline = timeoutMs === undefined ? undefined : yield* Effect.sleep(Math.max(0, admittedAt + timeoutMs - Date.now())).pipe(
+      const deadline = deadlineAt === undefined || timeoutMs === undefined ? undefined : yield* Effect.sleep(Math.max(0, deadlineAt - Date.now())).pipe(
         Effect.andThen(Effect.sync(() => {
           if (!started) {
             // Still queued behind an earlier execute: this script never runs.
             cancelled = true
-            Effect.runSync(Deferred.fail(response, sessionError(
-              "timeout",
-              `Execute timed out after ${timeoutMs}ms while waiting for an earlier execute in session ${session.id} to finish; this script did not run.`,
-              session.id,
-            )))
+            Effect.runSync(Deferred.fail(response, notRun(`an earlier execute in session ${session.id} to finish`)))
             return
           }
           // The script finished in time; journaling and persistence go on after the caller has its result.
@@ -631,7 +638,7 @@ export class OpenCodeBrowserSessions {
           )
         })),
       )
-    })))
+    })), deadlineAt === undefined ? undefined : { deadlineAt, expired: () => notRun("the session to finish being created or reset") })
   }
 
   adopt(options: {
@@ -1092,7 +1099,17 @@ export class OpenCodeBrowserSessions {
     }
   }
 
-  private withAdmission<A, E, R>(sessionId: string | undefined, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | Error, R> {
+  private withAdmission<A, E, R>(
+    sessionId: string | undefined,
+    effect: Effect.Effect<A, E, R>,
+    deadline?: { readonly deadlineAt: number; readonly expired: () => Error },
+  ): Effect.Effect<A, E | Error, R> {
+    const stable = (): Effect.Effect<void, Error> => deadline === undefined
+      ? this.awaitStableIdentity(sessionId)
+      : this.awaitStableIdentity(sessionId).pipe(
+        Effect.timeoutOption(Math.max(0, deadline.deadlineAt - Date.now())),
+        Effect.flatMap((waited) => Option.isNone(waited) ? Effect.fail(deadline.expired()) : Effect.void),
+      )
     return Effect.acquireUseRelease(
       Effect.try({
         try: () => {
@@ -1101,7 +1118,7 @@ export class OpenCodeBrowserSessions {
         },
         catch: (cause) => cause instanceof Error ? cause : new Error("Admit session operation", { cause }),
       }),
-      () => this.awaitStableIdentity(sessionId).pipe(Effect.andThen(effect)),
+      () => stable().pipe(Effect.andThen(effect)),
       (release) => Effect.sync(release),
     )
   }

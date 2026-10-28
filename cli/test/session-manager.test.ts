@@ -255,6 +255,19 @@ describe("execute with timeoutMs", () => {
     expect((await first).result.text).toBe("run 1")
     expect((await run(sessions.execute({ sessionId: "q1", code: "...", createIfMissing: false }))).result.text).toBe("run 2")
   })
+
+  test("a call waiting for the session's create to commit at the deadline never runs", async () => {
+    const { promise: gate, resolve: release } = Promise.withResolvers<void>()
+    const { sessions, sandboxes } = manager(async () => ok("ran"), { hooks: { onSessionsChanged: () => gate } })
+    const creating = run(sessions.create("c1"))
+    const started = Date.now()
+    await expect(run(sessions.execute({ sessionId: "c1", code: "...", createIfMissing: false, timeoutMs: 50 })))
+      .rejects.toThrow("this script did not run")
+    expect(Date.now() - started).toBeLessThan(1_000)
+    release()
+    await creating
+    expect(sandboxes.reduce((total, sandbox) => total + sandbox.executions, 0)).toBe(0)
+  })
 })
 
 describe("realm timers", () => {

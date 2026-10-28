@@ -229,6 +229,9 @@ export const stopRelay = Effect.fn("RelayLifecycle.stopRelay")(function* (option
   if (original.shutdownProtocol !== 2) {
     return yield* Effect.fail(new Error("This legacy relay does not support safe shutdown protocol 2; stop its process manually."))
   }
+  if ((original.clientProtocol ?? 0) < 2) {
+    return yield* Effect.fail(new Error(`This relay (protocol ${original.clientProtocol ?? "unknown"}) predates \`relay stop\`. Run \`${cliCommand("relay restart")}\` once, then stop it.`))
+  }
   const request = yield* RelayShutdownRequest.makeEffect({
     instanceId: original.instanceId,
     requestId: crypto.randomUUID(),
@@ -237,11 +240,6 @@ export const stopRelay = Effect.fn("RelayLifecycle.stopRelay")(function* (option
   })
   const shutdown = yield* Effect.result(options.relay.shutdown(request))
   if (Result.isFailure(shutdown) && !isRelayUnreachable(shutdown.failure) && !isRelayInstanceChanged(shutdown.failure)) {
-    // Relays built before `explicit-stop` existed reject it as an invalid request.
-    const rejectedReason = shutdown.failure instanceof RelayClient.RelayRejected && shutdown.failure.status === 400
-    if (rejectedReason && isNewerBuild(opencodeBrowserBuildId, original.buildId)) {
-      return yield* Effect.fail(new Error(`This relay (build ${original.buildId}) predates \`relay stop\`. Run \`${cliCommand("relay restart")}\` once, then stop it.`, { cause: shutdown.failure }))
-    }
     return yield* shutdown.failure
   }
   // A dropped request (reset connection, broken tunnel) proves nothing: confirm the instance is gone.

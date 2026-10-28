@@ -9,7 +9,7 @@
 // `--profile <name>` (or OPENCODE_BROWSER_PROFILE) on any command selects that profile's relay: it sets
 // OPENCODE_BROWSER_PORT. Without either, commands use OPENCODE_BROWSER_PORT or the default 19988.
 // Every copy has the same extension ID (the manifest key), so a browser profile loads at most one of them.
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs"
+import { closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync, writeSync } from "node:fs"
 import path from "node:path"
 import { cliCommand, dataRoot } from "./paths.ts"
 import { ensurePrivateDirectory, extensionPairingFileName, pairingCode, relayAuthorization, writeExtensionPairing } from "./relay-secrets.ts"
@@ -46,6 +46,59 @@ export type ProfileStatus = ProfileRecord & {
 type Env = Record<string, string | undefined>
 
 export class ProfileError extends Error {}
+
+const lockWaitMs = 10_000
+const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+
+function lockOwnerAlive(lock: string): boolean {
+  const pid = Number.parseInt(readFileSync(lock, "utf8"), 10)
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true // being written, or unreadable: treat as live
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+/**
+ * Runs a registry change (read, pick a port, copy, publish) under one lock file, so concurrent `profiles add`
+ * calls in separate processes never pick the same port or drop each other's records. A dead owner's lock is removed.
+ */
+function withProfilesLock<A>(root: string, change: () => A): A {
+  ensurePrivateDirectory(root)
+  const lock = `${profilesFile(root)}.lock`
+  const deadline = Date.now() + lockWaitMs
+  for (;;) {
+    try {
+      const fd = openSync(lock, "wx", 0o600)
+      try {
+        writeSync(fd, `${process.pid}\n`)
+      } finally {
+        closeSync(fd)
+      }
+      break
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+      try {
+        if (!lockOwnerAlive(lock)) {
+          rmSync(lock, { force: true })
+          continue
+        }
+      } catch (readError) {
+        if ((readError as NodeJS.ErrnoException).code === "ENOENT") continue
+        throw readError
+      }
+      if (Date.now() > deadline) throw new ProfileError(`Another browse process holds ${lock}. Retry, or delete it if no browse command is running.`)
+      sleepSync(50)
+    }
+  }
+  try {
+    return change()
+  } finally {
+    rmSync(lock, { force: true })
+  }
+}
 
 export const profilesFile = (root = dataRoot()) => path.join(root, "profiles.json")
 const profileFolder = (root: string, name: string) => path.join(path.resolve(root), "profiles", name)
@@ -134,6 +187,11 @@ export function addProfile(options: AddOptions): { profile: ProfileRecord; picke
   const root = options.root ?? dataRoot()
   const { name } = options
   if (!NAME.test(name)) throw new ProfileError(`"${name}" isn't a valid profile name: use letters, digits, - and _ (at most 40).`)
+  return withProfilesLock(root, () => addProfileLocked(root, options))
+}
+
+function addProfileLocked(root: string, options: AddOptions): { profile: ProfileRecord; picked: boolean } {
+  const { name } = options
   const profiles = readProfiles(root)
   if (profiles.some((profile) => profile.name === name)) throw new ProfileError(`Profile "${name}" already exists.`)
   const port = options.port ?? nextFreePort(profiles)
@@ -156,6 +214,10 @@ export function addProfile(options: AddOptions): { profile: ProfileRecord; picke
 
 /** Forgets a profile and deletes the copy add made; anything else in its folder stays. */
 export function removeProfile(name: string, root = dataRoot()): ProfileRecord {
+  return withProfilesLock(root, () => removeProfileLocked(name, root))
+}
+
+function removeProfileLocked(name: string, root: string): ProfileRecord {
   const profiles = readProfiles(root)
   const profile = profiles.find((entry) => entry.name === name)
   if (!profile) throw new ProfileError(`No profile "${name}". \`${cliCommand("profiles list")}\` shows them.`)
@@ -171,6 +233,10 @@ export function removeProfile(name: string, root = dataRoot()): ProfileRecord {
  * pinned port in the copies there are. Install calls this after pairing, so copies never keep a stale code.
  */
 export function syncProfileCopies(source: string, code: string, root = dataRoot()): ProfileRecord[] {
+  return withProfilesLock(root, () => syncProfileCopiesLocked(source, code, root))
+}
+
+function syncProfileCopiesLocked(source: string, code: string, root: string): ProfileRecord[] {
   const profiles = readProfiles(root)
   const built = existsSync(path.join(source, "manifest.json"))
   for (const profile of profiles) {

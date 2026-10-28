@@ -78,7 +78,7 @@ profiles stay down, and `status` does not start one. Start it on the Mac:
 
 ```bash
 ~/.agents/skills/browse-remote/scripts/mac-relays.sh start-mac 19961   # OPENCODE_BROWSER_PORT=19961 browse relay restart, on the Mac
-~/.agents/skills/browse-remote/scripts/mac-relays.sh stop-mac 19961    # only a relay you started
+~/.agents/skills/browse-remote/scripts/mac-relays.sh stop-mac 19961    # browse relay stop on the Mac (drained; tabs stay)
 ```
 
 It then reports `"connected":false` until that browser profile is open with its extension copy loaded. Ask Safzan to

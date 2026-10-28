@@ -92,6 +92,19 @@ describe("profiles add", () => {
     expect(refusal(() => addProfile({ root, name: "p7", source, code: CODE }))).toMatch(/Pass --port/)
   })
 
+  test("concurrent adds in separate processes get distinct ports and both stay recorded", async () => {
+    const { root, source } = sandbox()
+    const module = path.join(import.meta.dir, "../src/profiles.ts")
+    const script = (name: string) =>
+      `const { addProfile } = await import(${JSON.stringify(module)}); addProfile({ root: ${JSON.stringify(root)}, name: ${JSON.stringify(name)}, source: ${JSON.stringify(source)}, code: ${JSON.stringify(CODE)} })`
+    const children = ["a", "b", "c", "d"].map((name) => Bun.spawn([process.execPath, "-e", script(name)], { stderr: "pipe" }))
+    expect(await Promise.all(children.map((child) => child.exited))).toEqual([0, 0, 0, 0])
+    const profiles = readProfiles(root)
+    expect(profiles.map((profile) => profile.name).sort()).toEqual(["a", "b", "c", "d"])
+    expect(new Set(profiles.map((profile) => profile.port)).size).toBe(4)
+    expect(fs.existsSync(`${profilesFile(root)}.lock`)).toBe(false)
+  })
+
   test("needs a built extension, and leaves a folder it didn't record alone", () => {
     const { root, source } = sandbox()
     expect(refusal(() => addProfile({ root, name: "work", source: path.join(source, "assets"), code: CODE }))).toMatch(/no built extension/)

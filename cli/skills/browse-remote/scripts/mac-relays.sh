@@ -268,37 +268,22 @@ EOF
     shift
     (( $# )) || die "usage: mac-relays.sh start-mac <port>..."
     for p in "$@"; do check_port "$p"; done
+    failed=0
     for p in "$@"; do
-      on_mac "OPENCODE_BROWSER_PORT=$p \"$mac_launcher\" relay restart" 2>&1
+      on_mac "OPENCODE_BROWSER_PORT=$p \"$mac_launcher\" relay restart" 2>&1 || { echo "start-mac $p failed" >&2; failed=1; }
     done
+    exit "$failed"
     ;;
   stop-mac)
-    # Stops the process listening on a Mac port only when it is exactly `<node> <the launcher's CLI entry> serve`,
-    # the relay that CLI runs.
+    # `relay stop` drains the relay that answers on the port with this install's token; it never kills another process.
     shift
     (( $# )) || die "usage: mac-relays.sh stop-mac <port>..."
     for p in "$@"; do check_port "$p"; done
-    entry="$(mac_entry)" || exit 1
+    failed=0
     for p in "$@"; do
-      on_mac "sh -s -- $p $(shq "$entry")" <<'EOF'
-p=$1 entry=$2
-pid=$(lsof -nP -t -iTCP:"$p" -sTCP:LISTEN | head -n 1)
-[ -n "$pid" ] || { echo "no relay on $p"; exit 0; }
-cmd=$(ps -ww -o command= -p "$pid")
-node=${cmd%" $entry serve"}
-case "$node" in
-  "$cmd" | "" | *" "*) ours=no ;;
-  node | */node) ours=yes ;;
-  *) ours=no ;;
-esac
-if [ "$ours" = yes ]; then
-  kill "$pid" && echo "stopped relay $p (pid $pid)"
-else
-  echo "port $p is held by something other than $entry serve (pid $pid: $cmd); left it alone" >&2
-  exit 1
-fi
-EOF
+      on_mac "OPENCODE_BROWSER_PORT=$p \"$mac_launcher\" relay stop" 2>&1 || { echo "stop-mac $p failed" >&2; failed=1; }
     done
+    exit "$failed"
     ;;
   *) echo "usage: mac-relays.sh sync | up [port...] | down | status | start-mac <port>... | stop-mac <port>..." >&2; exit 2 ;;
 esac
