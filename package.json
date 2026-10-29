@@ -16,7 +16,7 @@
   },
   "devDependencies": {
     "@tsconfig/node22": "22.0.2",
-    "@types/bun": "1.4.0",
+    "@types/bun": "1.4.4",
     "@types/chrome": "0.3.4",
     "@typescript/native": "npm:typescript@7.0.2",
     "vite": "8.2.2"
