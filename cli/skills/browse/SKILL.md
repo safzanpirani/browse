@@ -306,6 +306,38 @@ already prevents attachment, give the user the required action directly rather
 than assuming an in-page handoff can be displayed. Verify the intended webpage
 state after the prompt is completed.
 
+### Extension Side Panels And Popups (macOS)
+
+An extension's own UI (a wallet's side panel, an extension popup window, an
+extension page in a tab) is out of `execute`'s reach for the same reason. On
+macOS, `opencode-browser panel` reads and drives it through the accessibility
+API instead. It works on any Chromium window, needs no relay, and needs the app
+that runs it (the terminal or agent host) to have Accessibility access in System
+Settings. The first call compiles a small Swift helper (Xcode Command Line
+Tools) and caches it.
+
+```bash
+opencode-browser panel list                           # open extension UI: side panels, popups, pages
+opencode-browser panel snapshot                        # outline with refs; --find <regex>, --values
+opencode-browser panel click e12 --snapshot            # press, then print the new outline
+opencode-browser panel fill e5 1.5                     # set a text field (fires input events)
+opencode-browser panel fill e7 --stdin < key.txt       # a secret stays out of argv and the transcript
+opencode-browser panel wait 'Transaction (sent|confirmed)' --timeout-ms 60000
+```
+
+Without `--panel`, commands use the only open side panel; with several, pass
+`--panel <text>` matching its title, URL or window title. Refs come from the
+last snapshot of that panel, and an action refuses a ref whose element changed
+role or name since (take a new snapshot). Text field values show as `filled`
+unless `--values`; password field values are never read. Clicks are trusted
+(`isTrusted: true`) and count as a user gesture, but a page that writes the
+clipboard also needs focus, which `panel` never takes.
+
+Use it for extensions the user asked you to operate. Never read a password
+manager's vault through it. A wallet transfer is destructive: read the amount,
+recipient and network from a snapshot, get the user's approval for exactly
+those, then confirm and verify the result.
+
 ## Inspection Tools
 
 Use the least expensive view that answers the question:

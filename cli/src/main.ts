@@ -23,6 +23,9 @@ if (invokedAs === "opencode-browser-mcp") {
 } else if (command === "find") {
   const { runFindCommand } = await import("./find.ts")
   await runFindCommand(process.argv.slice(3))
+} else if (command === "panel") {
+  const { runPanelCommand } = await import("./panel.ts")
+  await runPanelCommand(process.argv.slice(3))
 } else if (command && setupCommands.has(command)) {
   const { runSetup } = await import("./setup.ts")
   await runSetup(command, process.argv.slice(3))
@@ -59,6 +62,16 @@ PROFILES (one relay and one extension copy per browser profile)
   find [query] [--json]          Every profile's relay, extension and attached tabs; with a query, the
                                  matching tabs, the profiles that visited it before, and the command to run
                                  next. Starts no relay
+
+EXTENSION UI (macOS; side panels, popups and pages of other extensions, which chrome.debugger can't reach)
+  panel list [--json]            Extension UI open in Chromium windows
+  panel snapshot [--panel <text>] [--find <regex>] [--values]
+                                 Its outline with refs, read through the accessibility API
+  panel click|focus <ref>        Press or focus an element of the last snapshot
+  panel fill <ref> <value>|--stdin
+                                 Set a text field's value (--stdin keeps a secret out of argv)
+  panel wait <regex> [--gone] [--timeout-ms <ms>]
+                                 Wait until the panel's text matches (or stops matching)
 
 `)
   }

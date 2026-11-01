@@ -137,6 +137,11 @@ proxy that rewrites the `Host` header the relay checks. Its `SKILL.md` has the d
   turned off for the extension, the card is shown after all, and the recording includes it. For a demo video, ask for
   the ghost cursor with `cursor: true` on `recording_start` (`--cursor` on the CLI).
 - **Status:** the extension's options page shows whether the relay is connected and paired, and can copy diagnostics.
+- **Extension side panels and popups (macOS):** Chrome doesn't let one extension drive another's pages, so a wallet's
+  side panel or an extension popup is out of `execute`'s reach. `node cli/dist/cli.mjs panel snapshot`, `panel click`,
+  `panel fill` and `panel wait` read and drive them through the macOS accessibility API instead. The app running the
+  CLI needs Accessibility access (System Settings > Privacy & Security > Accessibility), and the first call compiles a
+  small Swift helper, so it needs the Xcode Command Line Tools.
 
 ## Tools
 

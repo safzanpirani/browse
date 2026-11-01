@@ -131,6 +131,7 @@ describe("skill", () => {
   test("names only commands and flags the CLI has", () => {
     const cli = fs.readFileSync(path.join(import.meta.dir, "..", "src", "cli.ts"), "utf8")
     const main = fs.readFileSync(path.join(import.meta.dir, "..", "src", "main.ts"), "utf8")
+    const panel = fs.readFileSync(path.join(import.meta.dir, "..", "src", "panel.ts"), "utf8")
     const commands = skill.split("\n").filter((line) => /^browse [a-z]/.test(line))
     expect(commands.length).toBeGreaterThan(20)
     for (const line of commands) {
@@ -138,7 +139,7 @@ describe("skill", () => {
       const command = words[1]!
       expect(cli.includes(`"${command}"`) || main.includes(`"${command}"`)).toBe(true)
       for (const flag of words.filter((word) => word.startsWith("--")).map((word) => word.slice(2).split("=")[0]!))
-        expect({ line, flag, defined: cli.includes(`"${flag}"`) }).toEqual({ line, flag, defined: true })
+        expect({ line, flag, defined: cli.includes(`"${flag}"`) || (command === "panel" && panel.includes(`"--${flag}"`)) }).toEqual({ line, flag, defined: true })
     }
   })
 
