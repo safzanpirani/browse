@@ -63,7 +63,7 @@ describe("renderPanelTree", () => {
       children: [{ role: "AXGroup", name: "", actions: ["AXPress"], children: [{ role: "AXButton", name: "Copy", actions: ["AXPress"] }] }],
     }
     const { lines, refs } = renderPanelTree(row)
-    expect(lines).toEqual(['- group "Copy" [ref=e1]', '  - button "Copy" [ref=e2]'])
+    expect(lines).toEqual(["- group [ref=e1]", '  - button "Copy" [ref=e2]'])
     expect(refs.e2!.path).toEqual([0, 0])
   })
 })

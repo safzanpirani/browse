@@ -140,9 +140,9 @@ export function renderPanelTree(root: AxNode, options: { showValues?: boolean } 
       ref = `e${next++}`
       refs[ref] = { path: nodePath, role: node.role, name: node.name }
     }
-    // A nameless clickable row shows the text inside it; when nothing else inside is clickable, that one line is all.
+    // A nameless clickable row with nothing else clickable inside (a wallet's asset entry) is one line of its text.
     const folded = canAct && !node.name && !hasActionableDescendant(node)
-    const label = node.name || (canAct ? descendantText(node) : "")
+    const label = node.name || (folded ? descendantText(node) : "")
     const suffix = [ref ? `ref=${ref}` : undefined, ...details(node, options.showValues === true)].filter(Boolean).join(" ")
     lines.push(`${indent}- ${roleName(node)}${label ? ` ${JSON.stringify(clip(label))}` : ""}${suffix ? ` [${suffix}]` : ""}`)
     if (folded) return
