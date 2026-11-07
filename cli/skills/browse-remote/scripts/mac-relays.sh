@@ -97,13 +97,15 @@ owned() {
   [[ -s $state/$1.pid ]] && read -r pid started recorded_port < "$state/$1.pid" || return 1
   [[ -n $started && $recorded_port == "$port" && $(start_time "$pid") == "$started" ]] && printf '%s' "$pid"
 }
-# Stops every process this script recorded (any port), the per-profile layout's proxy included.
+# Stops every process this script recorded (any port), the per-profile layout's proxy included, and waits up to 5 s
+# for each to exit, so a replacement run never overlaps the old one's cleanup.
 stop() {
   local f pid started
   for f in run listener ssh proxy; do
     if [[ -s $state/$f.pid ]] && read -r pid started _ < "$state/$f.pid" \
       && [[ -n $started && $(start_time "$pid") == "$started" ]]; then
       kill "$pid"
+      for _ in {1..50}; do [[ $(start_time "$pid") == "$started" ]] || break; sleep 0.1; done
     fi
     rm -f "$state/$f.pid"
   done
@@ -136,7 +138,8 @@ ssh_opts=(-N -o BatchMode=yes -o ControlPath=none -o ExitOnForwardFailure=yes -o
 confirm() {
   local deadline=$((SECONDS + 120))
   until tunnel_ok; do
-    if [[ ! -e $unit ]] && ! owned run >/dev/null; then
+    # A manual `up` fails as soon as its background run has exited; one still starting up is waited for.
+    if [[ -n ${bg_pid:-} ]] && ! kill -0 "$bg_pid" 2>/dev/null; then
       echo "tunnel failed:" >&2; eval "$1" >&2; stop; exit 1
     fi
     (( SECONDS < deadline )) || { echo "tunnel not confirmed within 120 s:" >&2; eval "$1" >&2; [[ -e $unit ]] || stop; exit 1; }
@@ -283,6 +286,7 @@ EOF
     else
       stop
       nohup bash "$0" run >"$state/ssh.log" 2>&1 &
+      bg_pid=$!
       confirm "cat $state/ssh.log"
     fi
     bash "$0" status
@@ -294,12 +298,18 @@ EOF
     stop
     record run $$ || die "cannot record the run pid"
     rm -f "$sock"
-    children=()
-    trap 'kill "${children[@]}" 2>/dev/null; rm -f "$sock"' EXIT
+    # Cleanup touches only this run's own processes (checked by pid and start time) and removes the socket only while
+    # run.pid is still this process, so an old run's exit never breaks its replacement.
+    cleanup() {
+      local n pid
+      [[ $(owned run) == "$$" ]] || return 0
+      for n in ssh listener; do pid="$(owned "$n")" && kill "$pid" 2>/dev/null; done
+      rm -f "$sock" "$state/run.pid" "$state/listener.pid" "$state/ssh.pid"
+    }
+    trap cleanup EXIT
     trap 'exit 0' TERM INT
     socat "TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" "UNIX-CONNECT:$sock" &
     listener=$!
-    children+=("$listener")
     record listener "$listener" || die "socat exited at once (another program holds 127.0.0.1:$port?)"
     for _ in {1..25}; do
       listens "$port" "$listener" && break
@@ -307,17 +317,23 @@ EOF
       sleep 0.2
     done
     listens "$port" "$listener" || die "socat did not bind 127.0.0.1:$port"
-    while kill -0 "$listener" 2>/dev/null; do
+    # Both children are supervised: the listener exiting ends the run (systemd then restarts it); ssh exiting is
+    # retried after 5 s while the listener keeps the port.
+    while :; do
       # A killed ssh can leave its socket behind; removing it means $sock exists only once this ssh has authenticated.
       rm -f "$sock"
       ssh "${ssh_opts[@]}" -L "$sock:127.0.0.1:$port" "$mac" &
-      children+=("$!")
-      record ssh "$!"
-      wait "$!"
+      ssh_pid=$!
+      record ssh "$ssh_pid"
+      while kill -0 "$ssh_pid" 2>/dev/null; do
+        kill -0 "$listener" 2>/dev/null || die "the listener exited"
+        sleep 1
+      done
+      wait "$ssh_pid"
       echo "ssh exited ($?); reconnecting in 5 s" >&2
-      sleep 5
+      rm -f "$state/ssh.pid"
+      for _ in {1..5}; do kill -0 "$listener" 2>/dev/null || die "the listener exited"; sleep 1; done
     done
-    die "the listener exited"
     ;;
   service)
     case "${2:-}" in
