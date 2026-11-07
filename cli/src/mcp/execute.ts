@@ -53,6 +53,9 @@ registerMcpTools({
         Effect.gen(function* () {
           const args = yield* Effect.try(() => parseExecuteArguments(input))
           const sessionId = args.session ?? ctx.currentSession.id
+          // `browse --profile <browser> mcp` (OPENCODE_BROWSER_PROFILE) is the browser of the session this server
+          // creates; an established session keeps its own browser unless the caller names one.
+          const browser = args.browser ?? (args.session || ctx.currentSession.established ? undefined : selectedBrowser())
           const connected = RelayLifecycle.ensureExtensionConnected({ relay: ctx.relay, sessionId, waitForReconnect: true })
           yield* connected
           const run = ctx.relay.execute({
@@ -61,8 +64,7 @@ registerMcpTools({
             createIfMissing: !args.session,
             ...(args.timeoutMs === undefined ? {} : { timeoutMs: args.timeoutMs }),
             ...(args.targetSelection ? { targetSelection: args.targetSelection } : {}),
-            // `browse --profile <browser> mcp` (OPENCODE_BROWSER_PROFILE) makes that browser this server's default.
-            ...((args.browser ?? selectedBrowser()) ? { browser: (args.browser ?? selectedBrowser())! } : {}),
+            ...(browser ? { browser } : {}),
           })
           // The status check and the call race the browser's link closing (a worker restart): when the relay answers
           // that the session's browser isn't connected, wait for it once more and run once more.

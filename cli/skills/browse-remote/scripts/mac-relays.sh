@@ -192,6 +192,10 @@ export OPENCODE_BROWSER_UPDATE_CHECK=0
 # Commands the CLI prints (next steps, hints) start with this name.
 export OPENCODE_BROWSER_COMMAND=browse
 # The CLI sends the relay token on every call, so it runs only while 127.0.0.1:$port is this script's own tunnel.
+# A long-lived server would keep sending it after the tunnel closed, so mcp and serve don't run here.
+cmd=\${1-}
+case \$cmd in --profile) cmd=\${3-} ;; --profile=*) cmd=\${2-} ;; esac
+case \$cmd in mcp|serve) echo "browse: \$cmd doesn't run over the Mac tunnel; use the CLI (skill browse-remote)" >&2; exit 1 ;; esac
 BROWSE_PORT=$port $(shq "$skill/scripts/mac-relays.sh") check || exit 1
 exec $(shq "$(command -v node)") $(shq "$live/dist/cli.mjs") "\$@"
 EOF

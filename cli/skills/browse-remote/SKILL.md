@@ -45,7 +45,8 @@ Ubuntu ships `/usr/bin/browse` as a link to `xdg-open`. A non-login shell (`ssh 
 
 Execute code, `files.write()`, network captures and `secrets run` all run on the Mac relay, so files they write are on
 the Mac. Never run `browse install`, `update`, `pair` or `relay` commands here; those belong on the Mac (`start-mac`
-and `stop-mac` below run the relay ones there).
+and `stop-mac` below run the relay ones there). The launcher refuses `mcp` and `serve`: a long-lived server would keep
+sending the token after the tunnel closed, so agents here use the CLI.
 
 ## Both sides run the same build
 
