@@ -12,9 +12,12 @@ the driving API (sessions, execute, adoption, handoffs, the browser table); this
 
 ## Quick start
 
+The tunnel normally runs as the systemd user service `browse-mac-tunnel` (`mac-relays.sh service install`), which
+brings it back after a reboot or a dropped connection within about 10 s. Check it before driving:
+
 ```bash
-~/.agents/skills/browse-remote/scripts/mac-relays.sh up       # tunnel 127.0.0.1:19988 → the Mac's 19988
 ~/.agents/skills/browse-remote/scripts/mac-relays.sh status   # tunnel process, then the relay's /extension/status
+~/.agents/skills/browse-remote/scripts/mac-relays.sh up       # (re)start the tunnel: restarts the service if installed
 
 browse find                                                   # every browser: connection, attached tabs
 browse find figma.com                                         # which browser has it, and the command to run next
@@ -22,7 +25,7 @@ browse session adopt --tab-id 123 --session figma
 browse --profile work execute --session figma2 'return page.url()'
 browse session delete figma
 
-~/.agents/skills/browse-remote/scripts/mac-relays.sh down
+~/.agents/skills/browse-remote/scripts/mac-relays.sh down     # stops it until the next `up` or reboot
 ```
 
 `--profile <name>` picks the paired browser by its "Name for agents" (`work`, `insideiim`, `safzan`, `patty`,
@@ -67,7 +70,9 @@ bash /tmp/mac-relays.sh sync && rm /tmp/mac-relays.sh
 
 ## The Mac relay is not running
 
-`status` showing HTTP 000 or a connection error means nothing listens on the Mac's 19988. Start it there:
+`status` showing HTTP 000 or a connection error means nothing listens on the Mac's 19988. The Mac starts its relay at
+login (LaunchAgent `dev.safzan.browse-relay`, which runs `browse relay restart` once), so this happens only when the
+relay was stopped or crashed since. Start it there:
 
 ```bash
 ~/.agents/skills/browse-remote/scripts/mac-relays.sh start-mac   # browse relay restart, on the Mac
@@ -81,11 +86,12 @@ in its place.
 
 - **HTTP 401**: `~/.opencode-browser-mac/relay-token` is missing or stale (the Mac's was regenerated). Run `sync`.
 - **`isn't the Mac tunnel`** (from the launcher), **`Automatic relay startup is disabled`** or `ECONNREFUSED`: the
-  tunnel is down. Run `up`.
+  tunnel is down. Run `up`; with the service installed, `journalctl --user -u browse-mac-tunnel` shows why it dropped.
 - **ssh tunnel dies at once**: ampere multiplexes `mac`, so `up` passes `ControlPath=none` and binds `127.0.0.1`.
   Cancel a stray multiplexed forward with `ssh -O cancel -L 127.0.0.1:19988:127.0.0.1:19988 mac`.
 - **`No current window`**: Chrome on the Mac has no window. Ask Safzan to open one.
 - **`status` starts with `Setup: not installed`**: expected here, nothing is installed on ampere but the CLI copy.
   Don't run `install`.
 
-Log and pid: `~/.opencode-browser-mac/mac-relays/` (`ssh.log`, `ssh.pid`).
+Log and pid: `~/.opencode-browser-mac/mac-relays/` (`ssh.log` for a manual `up`, `ssh.pid` for both); the service logs
+to the journal.

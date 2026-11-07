@@ -4,12 +4,14 @@
 # (it rejects a Host whose port differs from its own) passes without a proxy.
 #
 #   mac-relays.sh sync        # pull the Mac's built CLI, its relay token, this skill and the browse skill
-#   mac-relays.sh up          # open the tunnel
+#   mac-relays.sh up          # open the tunnel (restarts the service when it is installed)
 #   mac-relays.sh status      # tunnel process, then the relay's /extension/status (with the token)
 #   mac-relays.sh start-mac   # start (or restart) the relay on the Mac with the Mac's browse
 #   mac-relays.sh stop-mac    # stop the Mac's relay (drained; tabs stay)
-#   mac-relays.sh down
+#   mac-relays.sh down        # close the tunnel (stops the service when it is installed)
 #   mac-relays.sh check       # quiet unless 127.0.0.1:<port> isn't this script's tunnel (the launcher's guard)
+#   mac-relays.sh service install|remove   # a systemd user service that keeps the tunnel up across reboots
+#   mac-relays.sh run         # the service's foreground tunnel (systemd runs this; not for interactive use)
 #
 # The relay token is sent only to the tunnel this script started and confirmed (the ssh client's own socket).
 # Overrides: BROWSE_MAC_HOST (mac), BROWSE_PORT (19988, the relay port on both hosts), BROWSE_MAC_LAUNCHER (the Mac's
@@ -29,6 +31,8 @@ state="$home/mac-relays"
 marker="# Written by browse-remote's mac-relays.sh sync, which rewrites it."
 # The browse skill's own line, in place of the Mac install's marker; a browse skill without it is left alone.
 skill_marker="<!-- Written by browse-remote's mac-relays.sh sync, which rewrites it. -->"
+unit_name="browse-mac-tunnel.service"
+unit="$HOME/.config/systemd/user/$unit_name"
 
 [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || { echo "not a port: $port" >&2; exit 1; }
 mkdir -p "$state" && chmod 700 "$home" "$state" || { echo "cannot create $state" >&2; exit 1; }
@@ -108,6 +112,25 @@ listens() { [[ $(ss -Hltnp "sport = :$1" 2>/dev/null) == *"pid=$2,"* ]]; }
 # --noproxy keeps proxy variables from routing the token anywhere but the tunnel.
 authed_curl() {
   printf 'header = "Authorization: Bearer %s"\n' "$(<"$home/relay-token")" | curl -q --noproxy '*' -s -K - "$@"
+}
+
+# The tunnel's ssh options. 127.0.0.1 in the -L spec (not here): the default also tries ::1, which ampere lacks, and
+# ExitOnForwardFailure then aborts. ControlPath=none: a multiplexed client hands its forward to the shared master and
+# exits, so `down` could not close it.
+ssh_opts=(-N -o ControlPath=none -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
+
+# Waits until 127.0.0.1:<port> is the recorded ssh client's own socket; another program holding it never passes. ssh to
+# the Mac has taken 12-45 s to authenticate when the Mac is busy, hence the long deadline. <log command> prints the
+# tunnel's log on failure. Under systemd a dead attempt is retried, so only the deadline fails there.
+confirm() {
+  local deadline=$((SECONDS + 120)) pid
+  until pid="$(owned)" && listens "$port" "$pid"; do
+    if [[ ! -e $unit ]] && ! owned >/dev/null; then
+      echo "ssh tunnel failed:" >&2; eval "$1" >&2; stop; exit 1
+    fi
+    (( SECONDS < deadline )) || { echo "tunnel not confirmed within 120 s:" >&2; eval "$1" >&2; [[ -e $unit ]] || stop; exit 1; }
+    sleep 0.2
+  done
 }
 
 case "${1:-status}" in
@@ -237,24 +260,65 @@ EOF
     fi
     ;;
   up)
-    stop
-    # 127.0.0.1 explicitly: the default also tries ::1, which ampere lacks, and ExitOnForwardFailure then aborts.
-    # ControlPath=none: a multiplexed client hands its forward to the shared master and exits, so `down` could not
-    # close it.
-    nohup ssh -N -o ControlPath=none -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-      -L "127.0.0.1:$port:127.0.0.1:$port" "$mac" >"$state/ssh.log" 2>&1 &
-    record $! || die "ssh exited at once: $(cat "$state/ssh.log")"
-    # Up means the tunnel port is the ssh client's own socket; another program holding it stops the tunnel. ssh to the
-    # Mac has taken 12-45 s to authenticate when the Mac is busy, hence the long deadline.
-    deadline=$((SECONDS + 120))
-    until pid="$(owned)" && listens "$port" "$pid"; do
-      owned >/dev/null || { echo "ssh tunnel failed:" >&2; cat "$state/ssh.log" >&2; stop; exit 1; }
-      (( SECONDS < deadline )) || { echo "tunnel not confirmed within 120 s:" >&2; cat "$state/ssh.log" >&2; stop; exit 1; }
-      sleep 0.2
-    done
+    if [[ -e $unit ]]; then
+      systemctl --user restart "$unit_name" || die "cannot restart $unit_name"
+      confirm "journalctl --user -u $unit_name -n 20 --no-pager"
+    else
+      stop
+      nohup ssh "${ssh_opts[@]}" -L "127.0.0.1:$port:127.0.0.1:$port" "$mac" >"$state/ssh.log" 2>&1 &
+      record $! || die "ssh exited at once: $(cat "$state/ssh.log")"
+      confirm "cat $state/ssh.log"
+    fi
     "$0" status
     ;;
+  run)
+    # systemd's ExecStart: record this process, then become the ssh client, so `owned` sees the same pid and start
+    # time and the launcher's guard accepts the tunnel. BatchMode: a service can't answer a prompt.
+    stop
+    record $$ || die "cannot record the tunnel pid"
+    exec ssh -o BatchMode=yes "${ssh_opts[@]}" -L "127.0.0.1:$port:127.0.0.1:$port" "$mac"
+    ;;
+  service)
+    case "${2:-}" in
+      install)
+        command -v systemctl >/dev/null || die "systemctl is not on PATH"
+        [[ -x $skill/scripts/mac-relays.sh ]] || die "$skill/scripts/mac-relays.sh is missing; run \`$0 sync\` first"
+        stop
+        mkdir -p "$(dirname "$unit")" || die "cannot create $(dirname "$unit")"
+        cat > "$unit.tmp" <<EOF || die "cannot write $unit.tmp"
+[Unit]
+Description=browse: ssh tunnel to the Mac's relay (127.0.0.1:$port)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=BROWSE_PORT=$port BROWSE_MAC_HOST=$mac
+ExecStart=$skill/scripts/mac-relays.sh run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+        mv "$unit.tmp" "$unit" && systemctl --user daemon-reload && systemctl --user enable --now "$unit_name" \
+          || die "cannot enable $unit_name"
+        confirm "journalctl --user -u $unit_name -n 20 --no-pager"
+        echo "✓ $unit_name enabled"
+        "$0" status
+        ;;
+      remove)
+        if [[ -e $unit ]]; then
+          systemctl --user disable --now "$unit_name"
+          rm -f "$unit" && systemctl --user daemon-reload
+        fi
+        stop
+        echo "✓ $unit_name removed"
+        ;;
+      *) die "usage: mac-relays.sh service install|remove" ;;
+    esac
+    ;;
   down)
+    if [[ -e $unit ]]; then systemctl --user stop "$unit_name"; fi
     stop
     echo "mac relay tunnel closed"
     ;;
@@ -279,5 +343,5 @@ EOF
     # `relay stop` drains the relay that answers on the port with this install's token; it never kills another process.
     on_mac "OPENCODE_BROWSER_PORT=$port $mac_launcher relay stop" 2>&1 || die "stop-mac failed"
     ;;
-  *) echo "usage: mac-relays.sh sync | up | down | status | check | start-mac | stop-mac" >&2; exit 2 ;;
+  *) echo "usage: mac-relays.sh sync | up | down | status | check | service install|remove | start-mac | stop-mac" >&2; exit 2 ;;
 esac
