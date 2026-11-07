@@ -3,17 +3,17 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import {
-  clientFlag,
   installOmp,
   launcherTarget,
   OmpError,
   ompPaths,
   ompSkill,
+  ompFlag,
+  ompRequested,
   ompStatus,
-  resolveClients,
   uninstallOmp,
   type OmpPaths,
-} from "../src/omp.ts"
+} from "../src/setup/omp.ts"
 
 const upstreamSkill = fs.readFileSync(path.join(import.meta.dir, "..", "skills", "browse", "SKILL.md"), "utf8")
 const runtime = { node: "/opt/node 22/bin/node", entry: "/src/it's/cli/dist/cli.mjs", fingerprint: "0123456789abcdef" }
@@ -31,11 +31,11 @@ function sandbox(): OmpPaths & { root: string } {
   return { ...paths, root }
 }
 
-const profiles = [
-  { name: "work", port: 19960, label: "Work (Profile 5, work@example.com)", extension: "/x/work/extension", createdAt: "" },
-  { name: "plain", port: 19961, extension: "/x/plain/extension", createdAt: "" },
+const browsers = [
+  { id: "work", name: "work" },
+  { id: "chrome-macbook", name: "Chrome | MacBook" },
 ]
-const install = (paths: OmpPaths, mcp = false) => installOmp({ paths, runtime, skill: upstreamSkill, profiles, mcp })
+const install = (paths: OmpPaths, mcp = false) => installOmp({ paths, runtime, skill: upstreamSkill, browsers, mcp })
 const readJson = (file: string) => JSON.parse(fs.readFileSync(file, "utf8"))
 
 describe("launcher", () => {
@@ -51,14 +51,14 @@ describe("launcher", () => {
 
   test("runs under sh with the arguments it was given", () => {
     const paths = sandbox()
-    installOmp({ paths, runtime: { ...runtime, node: "/bin/echo", entry: "entry" }, skill: upstreamSkill, profiles, mcp: false })
+    installOmp({ paths, runtime: { ...runtime, node: "/bin/echo", entry: "entry" }, skill: upstreamSkill, browsers, mcp: false })
     const result = Bun.spawnSync([paths.launcher, "status", "--json", "a b"])
     expect(result.stdout.toString()).toBe("entry status --json a b\n")
   })
 
   test("names itself, so the commands the CLI prints start with browse", () => {
     const paths = sandbox()
-    installOmp({ paths, runtime: { ...runtime, node: "/bin/sh", entry: "-c" }, skill: upstreamSkill, profiles, mcp: false })
+    installOmp({ paths, runtime: { ...runtime, node: "/bin/sh", entry: "-c" }, skill: upstreamSkill, browsers, mcp: false })
     const result = Bun.spawnSync([paths.launcher, 'printf %s "$OPENCODE_BROWSER_COMMAND"'])
     expect(result.stdout.toString()).toBe("browse")
   })
@@ -84,14 +84,14 @@ describe("launcher", () => {
   test("rewrites its own launcher when the runtime moves", () => {
     const paths = sandbox()
     install(paths)
-    const lines = installOmp({ paths, runtime: { ...runtime, entry: "/new/cli.mjs" }, skill: upstreamSkill, profiles, mcp: false })
+    const lines = installOmp({ paths, runtime: { ...runtime, entry: "/new/cli.mjs" }, skill: upstreamSkill, browsers, mcp: false })
     expect(lines[0]).toContain("updated")
     expect(launcherTarget(paths.launcher)).toBe("/new/cli.mjs")
   })
 })
 
 describe("skill", () => {
-  const skill = ompSkill(upstreamSkill, profiles)
+  const skill = ompSkill(upstreamSkill, browsers)
 
   test("keeps the frontmatter first and marks the file as install's", () => {
     expect(skill.startsWith("---\nname: browse\n")).toBe(true)
@@ -99,37 +99,25 @@ describe("skill", () => {
   })
 
   test("tells omp to run browse through bash, after the title", () => {
-    expect(skill).toMatch(/\n# browse \(OpenCode Browser\)\n\n> \*\*In omp:\*\* run browse as shell commands through bash/)
+    expect(skill).toMatch(/\n# browse\n\n> \*\*In omp:\*\* run browse as shell commands through bash/)
   })
 
-  test("renames the CLI and leaves paths and package names alone", () => {
-    expect(skill).toContain("\nbrowse execute 'return { url: page.url(), title: await page.title() }'\n")
-    expect(skill).toContain('from "opencode-browser-cli"')
-    expect(skill).toContain("~/.local/share/opencode-browser/relays/<port>/lifecycle.jsonl")
-    const body = skill.slice(skill.indexOf("-->"))
-    expect(body).not.toMatch(/opencode-browser (?:execute|session|status|doctor|install|pair|relay|settings|network|secrets|recording|journal|tabs)\b/)
-    expect(skill).toContain("(`browse update`)")
-    expect(skill).toContain("restarts omp")
-  })
-
-  test("ends with the installed profiles, how to find a tab, and the habits and limits omp scripts hit", () => {
+  test("ends with the paired browsers, how to find a tab, and the habits and limits omp scripts hit", () => {
     const section = skill.slice(skill.indexOf("\n## Profiles, habits and limits (omp)\n"))
     expect(section).toStartWith("\n## Profiles, habits and limits (omp)\n")
-    expect(section).toContain("| Profile | Port | Browser profile |\n|---|---|---|\n| work | 19960 | Work (Profile 5, work@example.com) |\n| plain | 19961 |  |\n")
-    expect(section).toContain("`browse --profile work@example.com status`")
-    for (const text of ["browse find figma.com", "19989-19995", "Never sleep", "timeout: 5000", "signed-in account", "files.write()", "OPENCODE_BROWSER_ALLOW_NODE=1", "idleMinutes=never", "OPENCODE_BROWSER_HUMAN_INPUT=0", "--timeout-ms", "browse-remote", "timed out waiting for active execute"])
+    expect(section).toContain("| --profile | Browser name |\n|---|---|\n| work | work |\n| chrome-macbook | Chrome \\| MacBook |\n")
+    for (const text of ["browse find figma.com", "Name for agents", "Never sleep", "timeout: 5000", "signed-in account", "files.write()", "OPENCODE_BROWSER_ALLOW_NODE=1", "idleMinutes=never", "OPENCODE_BROWSER_HUMAN_INPUT=0", "--timeout-ms", "127.0.0.1 only", "timed out waiting for active execute"])
       expect(section).toContain(text)
     expect(skill.endsWith("ask the user to click the toolbar button again. |\n")).toBe(true)
   })
 
-  test("says how to add a profile when there are none", () => {
-    const bare = ompSkill(upstreamSkill, [])
-    expect(bare).toContain("No profiles were set up when this was installed; `browse profiles add <name>` adds one.")
-    expect(bare).toContain("`browse --profile <email> status`")
+  test("says how to pair a browser when none has", () => {
+    expect(ompSkill(upstreamSkill, [])).toContain("No browser had paired when this was installed; `browse pair` prints a code for one.")
   })
 
   test("names only commands and flags the CLI has", () => {
-    const cli = fs.readFileSync(path.join(import.meta.dir, "..", "src", "cli.ts"), "utf8")
+    const cliDir = path.join(import.meta.dir, "..", "src", "cli")
+    const cli = fs.readdirSync(cliDir).map((file) => fs.readFileSync(path.join(cliDir, file), "utf8")).join("\n")
     const main = fs.readFileSync(path.join(import.meta.dir, "..", "src", "main.ts"), "utf8")
     const commands = skill.split("\n").filter((line) => /^browse [a-z]/.test(line))
     expect(commands.length).toBeGreaterThan(20)
@@ -199,7 +187,7 @@ describe("omp's mcp.json", () => {
     config.mcpServers.browse.env.OPENCODE_BROWSER_PORT = "19989"
     fs.writeFileSync(paths.mcpConfig, JSON.stringify(config, null, "\t") + "\n")
     expect(install(paths, true)).toContain('✓ omp MCP server "browse" is up to date')
-    installOmp({ paths, runtime: { ...runtime, fingerprint: "fedcba9876543210" }, skill: upstreamSkill, profiles, mcp: false })
+    installOmp({ paths, runtime: { ...runtime, fingerprint: "fedcba9876543210" }, skill: upstreamSkill, browsers, mcp: false })
     expect(readJson(paths.mcpConfig).mcpServers.browse).toEqual({
       command: runtime.node,
       args: [runtime.entry, "mcp"],
@@ -278,48 +266,19 @@ describe("status", () => {
       "           MCP server not configured (install --client omp --mcp adds it)",
     ])
   })
-
-  test.each(["--client omp", "--client=omp"])("`status %s` reports omp and the relay status still runs", (selector) => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "browse-omp-status-"))
-    temps.push(home)
-    const env: Record<string, string | undefined> = {
-      ...process.env,
-      HOME: home,
-      XDG_CONFIG_HOME: path.join(home, ".config"),
-      OPENCODE_BROWSER_HOME: path.join(home, "data"),
-      // Not installed, so only --client omp makes status report it.
-      OPENCODE_BROWSER_OMP_DIR: path.join(home, "no-omp"),
-      OPENCODE_BROWSER_PORT: "29988",
-      OPENCODE_BROWSER_AUTOSTART: "false",
-      OPENCODE_BROWSER_UPDATE_CHECK: "0",
-    }
-    delete env.PI_CODING_AGENT_DIR
-    const status = (...args: string[]) => Bun.spawnSync([process.execPath, path.join(import.meta.dir, "..", "src", "main.ts"), "status", ...args], { env })
-    const result = status(...selector.split(" "))
-    const output = result.stdout.toString() + result.stderr.toString()
-    expect(output).toContain("omp:       not set up. Run install with --client omp.")
-    expect(output).toContain("Relay: stopped (http://127.0.0.1:29988)")
-    expect(output).not.toMatch(/unrecognized|unknown (?:option|flag)/i)
-    // Plain `status` exits 1 while the relay is stopped; the selector doesn't change that.
-    expect(result.exitCode).toBe(status().exitCode)
-  })
 })
 
 describe("clients", () => {
-  test("--client takes one or both, in either form", () => {
-    expect(clientFlag(["--client", "omp"])).toEqual(["omp"])
-    expect(clientFlag(["--client=omp,opencode"])).toEqual(["opencode", "omp"])
-    expect(clientFlag([])).toBeUndefined()
-    expect(() => clientFlag(["--client", "claude"])).toThrow(OmpError)
-    expect(() => clientFlag(["--client", ""])).toThrow(OmpError)
-  })
-
-  test("without --client: the recorded clients, else opencode, else omp when only omp is installed", () => {
-    expect(resolveClients({ flag: ["omp"], recorded: ["opencode"], opencode: true, ompInstalled: true })).toEqual(["omp"])
-    expect(resolveClients({ flag: undefined, recorded: ["opencode", "omp"], opencode: true, ompInstalled: true })).toEqual(["opencode", "omp"])
-    expect(resolveClients({ flag: undefined, recorded: undefined, opencode: true, ompInstalled: true })).toEqual(["opencode"])
-    expect(resolveClients({ flag: undefined, recorded: undefined, opencode: false, ompInstalled: false })).toEqual(["opencode"])
-    expect(resolveClients({ flag: undefined, recorded: "garbage", opencode: false, ompInstalled: true })).toEqual(["omp"])
+  test("--client takes omp only, in either form; an earlier install's manifest keeps omp on", () => {
+    expect(ompFlag(["--client", "omp"])).toBe(true)
+    expect(ompFlag(["--client=omp"])).toBe(true)
+    expect(ompFlag([])).toBe(false)
+    expect(() => ompFlag(["--client", "opencode"])).toThrow(OmpError)
+    expect(() => ompFlag(["--client", ""])).toThrow(OmpError)
+    const paths = sandbox()
+    expect(ompRequested([], paths.manifest)).toBe(false)
+    install(paths)
+    expect(ompRequested([], paths.manifest)).toBe(true)
   })
 
   test("paths: flags, then environment variables, then defaults", () => {

@@ -1,59 +1,57 @@
-// Builds the published package: dist/cli.mjs (main.ts and everything it loads, with npm dependencies left
-// external and installed by npm) and extension/ (the built unpacked extension, keeping its manifest key so the
-// unpacked ID matches the host's allowed origins). Both carry this package's version.
+// Builds the published package, dist/cli.mjs (main.ts and everything it loads, with npm dependencies left external and
+// installed by npm, and dev dependencies bundled with their licenses in dist/THIRD_PARTY_NOTICES.txt), and the checkout's unpacked extension in ../dist (which `bun run setup` loads). The package ships no
+// extension: a stable npm install gets it from the Chrome Web Store item, and a dev build from the release service, as
+// the zip OPENCODE_BROWSER_EXTENSION_ZIP names (scripts/release-check.ts), whose sha256 is baked in.
 import { $ } from "bun"
-import { chmod, cp, rm } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { cp, readdir, readFile, rm } from "node:fs/promises"
 import path from "node:path"
+import { bundleCli } from "./bundle.ts"
 
 const here = import.meta.dir
-const extension = path.resolve(here, "..")
+const checkout = path.resolve(here, "..")
 const pkg = await Bun.file(path.join(here, "package.json")).json()
 
+// The Chrome Web Store item, from the release workflow's repository variable CWS_ITEM_ID (RELEASING.md); unset in a checkout.
+const storeId = process.env.OPENCODE_BROWSER_STORE_ID?.trim()
+if (storeId && !/^[a-p]{32}$/.test(storeId)) throw new Error(`OPENCODE_BROWSER_STORE_ID is not a Chrome Web Store item ID: ${JSON.stringify(storeId)}`)
+const store = storeId ? { id: storeId } : {}
+// A dev build's unpacked extension zip, which the release workflow publishes to the release service.
+const zip = process.env.OPENCODE_BROWSER_EXTENSION_ZIP?.trim()
+const extension = zip
+  ? await readFile(zip).then((bytes) => ({ file: path.basename(zip), sha256: createHash("sha256").update(bytes).digest("hex"), size: bytes.length }))
+  : undefined
+
 const build = new Date().toISOString()
-await $`bun run build`.cwd(extension).env({ ...process.env, OPENCODE_BROWSER_BUILD: build }).quiet()
+await $`bun run build`.cwd(checkout).env({ ...process.env, OPENCODE_BROWSER_BUILD: build }).quiet()
 await rm(path.join(here, "dist"), { recursive: true, force: true })
+// Earlier builds copied the extension into the package.
 await rm(path.join(here, "extension"), { recursive: true, force: true })
 
-const result = await Bun.build({
-  entrypoints: [path.join(here, "src/main.ts")],
-  outdir: path.join(here, "dist"),
-  naming: "cli.mjs",
-  target: "node",
-  format: "esm",
-  // Runtime dependencies stay external; jsonc-parser (a dev dependency) is bundled.
-  external: Object.keys(pkg.dependencies ?? {}),
-  plugins: [
-    {
-      // jsonc-parser's default entry is UMD with runtime requires; its ESM build bundles cleanly.
-      name: "jsonc-parser-esm",
-      setup(build) {
-        build.onResolve({ filter: /^jsonc-parser$/ }, () => ({
-          path: path.join(path.dirname(Bun.resolveSync("jsonc-parser/package.json", here)), "lib/esm/main.js"),
-        }))
-      },
-    },
-  ],
-  define: {
-    "globalThis.__OPENCODE_BROWSER_VERSION__": JSON.stringify(pkg.version),
-    "globalThis.__OPENCODE_BROWSER_BUILD_ID__": JSON.stringify(new Date().toISOString()),
-  },
-})
-if (!result.success) throw new AggregateError(result.logs, "build failed")
-const cli = path.join(here, "dist", "cli.mjs")
-const source = await Bun.file(cli).text()
-await Bun.write(cli, source.startsWith("#!") ? source : `#!/usr/bin/env node\n${source}`)
-await chmod(cli, 0o755)
+await bundleCli({ outdir: path.join(here, "dist"), version: pkg.version, buildId: build, store, ...(extension ? { extension } : {}) })
 
-await cp(path.join(extension, "dist"), path.join(here, "extension"), {
-  recursive: true,
-  // A checkout's pairing code (written by install into public/ and dist/) and a pinned relay port must never ship in
-  // the package.
-  filter: (file) => !file.endsWith(".map") && !["relay-pairing.json", "relay-port.json"].includes(path.basename(file)),
-})
-const manifestFile = path.join(here, "extension", "manifest.json")
-const manifest = await Bun.file(manifestFile).json()
-manifest.version = pkg.version
-await Bun.write(manifestFile, JSON.stringify(manifest, null, 2) + "\n")
-// install compares this with the build a connected extension reports, to skip a reload that changes nothing.
-await Bun.write(path.join(here, "extension", "build.json"), JSON.stringify({ build }) + "\n")
-console.log(`built dist/cli.mjs and extension/ (${pkg.version})`)
+// install compares this with the build a connected unpacked extension reports, to skip a reload that changes nothing.
+await Bun.write(path.join(checkout, "dist", "build.json"), JSON.stringify({ build }) + "\n")
+// MIT asks for the license with every copy; npm ships LICENSE from the package folder.
+await cp(path.join(checkout, "LICENSE"), path.join(here, "LICENSE"))
+// The same for every package bundled into dist/, found by the source paths the bundler leaves in its comments.
+await Bun.write(path.join(here, "dist", "THIRD_PARTY_NOTICES.txt"), await thirdPartyNotices(path.join(here, "dist")))
+const notes = [store.id && `store ${store.id}`, extension && `dev extension ${extension.file} ${extension.sha256.slice(0, 12)}`].filter(Boolean)
+console.log(`built dist/cli.mjs and ../dist (${[pkg.version, ...notes].join(", ")})`)
+
+async function thirdPartyNotices(dist: string) {
+  const packages = new Set<string>()
+  for (const name of await readdir(dist)) {
+    if (!name.endsWith(".mjs")) continue
+    for (const [, dir] of (await readFile(path.join(dist, name), "utf8")).matchAll(/^\/\/ ((?:[^\n]*\/)?node_modules\/(?:@[^/\n]+\/)?[^/\n]+)\//gm))
+      packages.add(path.resolve(here, dir!))
+  }
+  const sections: string[] = []
+  for (const dir of [...packages].sort()) {
+    const { name, version } = await Bun.file(path.join(dir, "package.json")).json()
+    const license = (await readdir(dir)).find((file) => /^(licen[cs]e|copying)(\.(md|txt))?$/i.test(file))
+    if (!license) throw new Error(`${name} is bundled into dist/ but has no license file to ship with it`)
+    sections.push(`${name}@${version}\n\n${(await readFile(path.join(dir, license), "utf8")).trim()}`)
+  }
+  return `Third-party software bundled into this package:\n\n${sections.join(`\n\n${"-".repeat(80)}\n\n`)}\n`
+}

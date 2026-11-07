@@ -58,7 +58,7 @@ export async function sync(tabId: number, page: PageStatus | undefined, sessionN
     .create(PREFIX + tabId, {
       type: "basic",
       iconUrl: chrome.runtime.getURL("icons/icon-128.png"),
-      title: "OpenCode Browser",
+      title: "browse",
       message: `${sessionName(page?.sessionId)} needs you on ${origin}`,
       ...(page?.message ? { contextMessage: page.message } : {}),
       requireInteraction: true,
@@ -68,7 +68,7 @@ export async function sync(tabId: number, page: PageStatus | undefined, sessionN
 }
 
 /** The setting: "recording" (notify only while the tab is recorded, the default) or "always". */
-export async function mode() {
+async function mode() {
   return handoffNotifications((await chrome.storage.local.get(HANDOFF_NOTIFICATIONS_KEY))[HANDOFF_NOTIFICATIONS_KEY])
 }
 

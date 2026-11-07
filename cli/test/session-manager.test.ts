@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { Effect } from "effect"
-import type { ExecuteProgress, ExecuteResult } from "../src/execute.ts"
+import { Effect, Fiber } from "effect"
+import { boundExecuteResult, jsonValueWarning, maxExecuteResultChars, toJsonSafeValue, type ExecuteResult } from "../src/execute.ts"
 import { ExecuteRealm } from "../src/execute-realm.ts"
-import { HandoffRegistry } from "../src/handoff.ts"
-import type { ExecuteSandboxLike } from "../src/relay-types.ts"
-import { OpenCodeBrowserSessions, type SessionHooks } from "../src/session-manager.ts"
+import { HandoffRegistry } from "../src/session-manager/handoff.ts"
+import type { ConnectedTarget, ExecuteSandboxLike } from "../src/relay/types.ts"
+import { OpenCodeBrowserSessions } from "../src/session-manager.ts"
 
 const ok = (text: string): ExecuteResult => ({
   text,
@@ -37,13 +37,6 @@ class FakeSandbox implements ExecuteSandboxLike {
     return Effect.void
   }
   disconnectSettled() { return Effect.void }
-  progress: ExecuteProgress | undefined
-  /** `aborted` at each executeProgress() read. */
-  readonly progressReadsAt: number[] = []
-  executeProgress() {
-    this.progressReadsAt.push(this.aborted)
-    return this.progress
-  }
   closeSettled() { return Effect.void }
   authenticatedJson(): never { throw new Error("unused") }
   adoptPage() { return Effect.void }
@@ -51,6 +44,7 @@ class FakeSandbox implements ExecuteSandboxLike {
   networkStatus() { return { active: false } as never }
   networkStop(): never { throw new Error("unused") }
   networkCancel() { return Effect.succeed({ cancelled: false }) }
+  networkEnd() { return Effect.succeed({ cancelled: false }) }
   authRefresh(): never { throw new Error("unused") }
   redactNetworkCaptureText(text: string) { return text }
   markTargetCrashed() { return false }
@@ -61,7 +55,7 @@ class FakeSandbox implements ExecuteSandboxLike {
   getStatus() { return { connected: true, pageUrl: null, stateKeys: [] } }
 }
 
-function manager(script: (sandbox: FakeSandbox) => Promise<ExecuteResult>, options: { readonly handoffs?: HandoffRegistry; readonly hooks?: SessionHooks } = {}) {
+function manager(script: (sandbox: FakeSandbox) => Promise<ExecuteResult>, options: { readonly handoffs?: HandoffRegistry } = {}) {
   const sandboxes: FakeSandbox[] = []
   const sessions = new OpenCodeBrowserSessions("http://127.0.0.1:0", () => {
     const sandbox = new FakeSandbox(script)
@@ -71,7 +65,6 @@ function manager(script: (sandbox: FakeSandbox) => Promise<ExecuteResult>, optio
     stopGraceMs: 300,
     lifecycleTimeoutMs: 5_000,
     ...(options.handoffs ? { onCancelSessionHandoff: (id: string) => options.handoffs?.cancelForSession(id) !== undefined } : {}),
-    ...options.hooks,
   })
   return { sessions, sandboxes }
 }
@@ -196,77 +189,22 @@ describe("delete and reset while busy", () => {
   })
 })
 
-describe("execute with timeoutMs", () => {
-  test("stops the script at the deadline, keeps its logs so far and leaves the session usable", async () => {
-    const progress: ExecuteProgress = {
-      logs: [{ source: "script", type: "log", text: "step 1 done" }],
-      logSummary: { totalCount: 1, returnedCount: 1, repeatedCount: 0, omittedCount: 0 },
-      aftermath: { startUrl: "https://example.com/", endUrl: "https://example.com/step-1", navigations: ["https://example.com/step-1"], consoleErrorCount: 0, pageErrorCount: 0, handoffs: 0 },
-    }
-    const { sessions, sandboxes } = manager(async (sandbox) => {
-      if (sandbox.executions === 1) {
-        sandbox.progress = progress
-        // Stalls on the page until the sandbox is aborted.
-        await sandbox.playwrightCall()
-      }
-      return ok("second")
+describe("closing a session's pages", () => {
+  test("delete and reset close every page the session opened, not just its default page", async () => {
+    const closed: string[] = []
+    const pages: Record<string, string[]> = { many: ["T-default", "T-new-page", "T-popup"], again: ["T-other"] }
+    const sessions = new OpenCodeBrowserSessions("http://127.0.0.1:0", () => new FakeSandbox(async () => ok("x")), {
+      lifecycleTimeoutMs: 5_000,
+      onReleaseRelayTarget: (targetId) => Effect.sync(() => { closed.push(targetId) }),
+      relayTargetIdsForSession: (id) => pages[id] ?? [],
     })
-    const started = Date.now()
-    const timedOut = await run(sessions.execute({ sessionId: "t1", code: "...", createIfMissing: true, timeoutMs: 100 }))
-    expect(Date.now() - started).toBeLessThan(2_000)
-    expect(timedOut.result).toMatchObject({ isError: true, diagnostic: "execute-timeout", logs: progress.logs, logSummary: progress.logSummary, aftermath: progress.aftermath })
-    expect(timedOut.result.text).toContain("timed out after 100ms")
-    // The logs were read (and redacted) before the stop aborted the script and cancelled its network capture.
-    expect(sandboxes[0]?.progressReadsAt).toEqual([0])
-    expect(sandboxes[0]?.aborted).toBe(1)
-    const second = await run(sessions.execute({ sessionId: "t1", code: "...", createIfMissing: false }))
-    expect(second.result.text).toBe("second")
-    expect(sandboxes.length).toBe(1)
-  })
-
-  test("a script that finishes in time is not stopped", async () => {
-    const { sessions, sandboxes } = manager(async () => ok("done"))
-    const result = await run(sessions.execute({ sessionId: "t2", code: "...", createIfMissing: true, timeoutMs: 1_000 }))
-    expect(result.result).toMatchObject({ isError: false, text: "done" })
-    expect(sandboxes[0]?.aborted).toBe(0)
-  })
-
-  test("a script that finished in time is answered at the deadline even while its journal write still blocks", async () => {
-    const { promise: journal, resolve: journaled } = Promise.withResolvers<void>()
-    const { sessions } = manager(async () => ok("done"), { hooks: { onExecuteRecord: () => journal, journalTimeoutMs: 60_000 } })
-    const started = Date.now()
-    const result = await run(sessions.execute({ sessionId: "t3", code: "...", createIfMissing: true, timeoutMs: 100 }))
-    expect(Date.now() - started).toBeLessThan(2_000)
-    expect(result.result).toMatchObject({ isError: false, text: "done" })
-    journaled()
-  })
-
-  test("a call still queued behind another execute at the deadline never runs", async () => {
-    const { promise: gate, resolve: release } = Promise.withResolvers<void>()
-    const { sessions, sandboxes } = manager(async (sandbox) => {
-      if (sandbox.executions === 1) await gate
-      return ok(`run ${sandbox.executions}`)
-    })
-    const { response: first } = await startExecute(sessions, "q1")
-    await expect(run(sessions.execute({ sessionId: "q1", code: "...", createIfMissing: false, timeoutMs: 100 })))
-      .rejects.toThrow("waiting for an earlier execute")
-    expect(sandboxes[0]?.executions).toBe(1)
-    release()
-    expect((await first).result.text).toBe("run 1")
-    expect((await run(sessions.execute({ sessionId: "q1", code: "...", createIfMissing: false }))).result.text).toBe("run 2")
-  })
-
-  test("a call waiting for the session's create to commit at the deadline never runs", async () => {
-    const { promise: gate, resolve: release } = Promise.withResolvers<void>()
-    const { sessions, sandboxes } = manager(async () => ok("ran"), { hooks: { onSessionsChanged: () => gate } })
-    const creating = run(sessions.create("c1"))
-    const started = Date.now()
-    await expect(run(sessions.execute({ sessionId: "c1", code: "...", createIfMissing: false, timeoutMs: 50 })))
-      .rejects.toThrow("this script did not run")
-    expect(Date.now() - started).toBeLessThan(1_000)
-    release()
-    await creating
-    expect(sandboxes.reduce((total, sandbox) => total + sandbox.executions, 0)).toBe(0)
+    await run(sessions.execute({ sessionId: "many", code: "...", createIfMissing: true }))
+    expect(await run(sessions.delete("many"))).toEqual({ deleted: true })
+    expect(closed.sort()).toEqual(["T-default", "T-new-page", "T-popup"])
+    closed.length = 0
+    await run(sessions.execute({ sessionId: "again", code: "...", createIfMissing: true }))
+    await run(sessions.reset("again"))
+    expect(closed).toEqual(["T-other"])
   })
 })
 
@@ -292,14 +230,150 @@ describe("realm timers", () => {
   })
 })
 
-describe("session summary", () => {
-  test("names the default page's target id, which find compares with each tab", () => {
-    const { sessions } = manager(() => Promise.resolve(ok("")))
-    sessions.restore([
-      { id: "app", createdAt: "", updatedAt: "", readOnly: false, target: { id: "t1", owner: "relay" } },
-      { id: "bare", createdAt: "", updatedAt: "", readOnly: false },
-    ])
-    expect(sessions.summary("app")?.targetId).toBe("t1")
-    expect(sessions.summary("bare")).not.toHaveProperty("targetId")
+describe("execute result size", () => {
+  test("a result under the limit passes through untouched", () => {
+    expect(boundExecuteResult("ok", { a: 1 }, true)).toEqual({ text: "ok", value: { a: 1 }, hasValue: true })
+  })
+
+  test("a huge result keeps the start of its text, drops the value, and says how to save all of it", () => {
+    const big = "x".repeat(maxExecuteResultChars * 3)
+    const bounded = boundExecuteResult(big, big, true)
+    expect(bounded.hasValue).toBe(false)
+    expect(bounded.text.length).toBeLessThan(maxExecuteResultChars + 100)
+    expect(bounded.text).toContain("[truncated")
+    expect(bounded.warning).toContain("files.write")
+    // A large JSON value with a short inspected text is capped as well.
+    const rows = Array.from({ length: 20_000 }, (_, i) => ({ row: i, text: "lorem ipsum dolor" }))
+    expect(boundExecuteResult("[ ... 20000 items ]", rows, true).hasValue).toBe(false)
   })
 })
+
+describe("execute JSON value warning", () => {
+  const warningFor = (value: unknown) => jsonValueWarning(value, toJsonSafeValue(value))
+
+  test("code that returns nothing gets no warning", () => {
+    expect(warningFor(undefined)).toBeUndefined()
+  })
+
+  test("a returned class instance still says why it has no JSON value", () => {
+    class Locator {}
+    expect(warningFor(new Locator())).toBe("Execute result could not be represented as JSON value: class instance")
+  })
+})
+
+describe("execute timeouts, disconnects, one-shot cleanup, and idle reaping", () => {
+  const rootTab = (id: string, sessionId: string | undefined, owner: "relay" | "user" = "relay"): ConnectedTarget => ({
+    tabId: id.length,
+    sessionId: `cdp-${id}`,
+    owner,
+    ...(sessionId ? { opencodeBrowserSessionId: sessionId } : {}),
+    targetInfo: { targetId: id, type: "page", title: id, url: "about:blank", attached: true, canAccessOpener: false },
+  })
+
+  test("timeoutMs stops a hung script with execute-timeout and frees the session", async () => {
+    const { sessions, sandboxes } = manager(async (sandbox) => {
+      if (sandbox.executions === 1) await sandbox.playwrightCall()
+      return ok("recovered")
+    })
+    const timedOut = await run(sessions.execute({ sessionId: "t1", code: "...", createIfMissing: true, timeoutMs: 40 }))
+    expect(timedOut.result.isError).toBe(true)
+    expect(timedOut.result.diagnostic).toBe("execute-timeout")
+    expect(timedOut.result.text).toContain("Execute timed out after 40ms")
+    expect(sandboxes[0]?.aborted).toBe(1)
+
+    const next = await run(sessions.execute({ sessionId: "t1", code: "...", createIfMissing: false, timeoutMs: 1_000 }))
+    expect(next.result.text).toBe("recovered")
+  })
+
+  test("pauseExecutionTimeout suspends the execute deadline while waiting on a handoff", async () => {
+    const { sessions } = manager(async () => {
+      const resume = sessions.pauseExecutionTimeout("t-pause")
+      await Bun.sleep(90)
+      resume()
+      await Bun.sleep(10)
+      return ok("finished after handoff")
+    })
+    const done = await run(sessions.execute({ sessionId: "t-pause", code: "...", createIfMissing: true, timeoutMs: 50 }))
+    expect(done.result.isError).toBe(false)
+    expect(done.result.text).toBe("finished after handoff")
+  })
+
+  test("disconnecting a caller while execute runs aborts the script and frees the lock", async () => {
+    const { sessions, sandboxes } = manager(async (sandbox) => {
+      if (sandbox.executions === 1) await sandbox.playwrightCall()
+      return ok("next caller")
+    })
+    const fiber = Effect.runFork(sessions.execute({ sessionId: "disc", code: "...", createIfMissing: true }))
+    for (let i = 0; i < 50 && !sessions.isExecuting("disc"); i++) await Bun.sleep(5)
+    expect(sessions.isExecuting("disc")).toBe(true)
+
+    await run(Fiber.interrupt(fiber))
+    for (let i = 0; i < 50 && sessions.isExecuting("disc"); i++) await Bun.sleep(5)
+    expect(sandboxes[0]?.aborted).toBe(1)
+    expect(sessions.isExecuting("disc")).toBe(false)
+
+    const second = await run(sessions.execute({ sessionId: "disc", code: "...", createIfMissing: false }))
+    expect(second.result.text).toBe("next caller")
+  })
+
+  test("removeAfterExecute (--rm) closes all session tabs and deletes the session", async () => {
+    const closed: string[] = []
+    const targets: ConnectedTarget[] = []
+    const sessions = new OpenCodeBrowserSessions("http://127.0.0.1:0", (id) => {
+      targets.push(rootTab("first", id), rootTab("popup", id))
+      return new FakeSandbox(async () => ok("one-shot"))
+    }, {
+      lifecycleTimeoutMs: 5_000,
+      getTargets: () => targets,
+      onReleaseRelayTarget: (id) => Effect.sync(() => { closed.push(id) }),
+    })
+
+    const out = await run(sessions.execute({ code: "return 1", createIfMissing: true, removeAfterExecute: true }))
+    expect(out.result.text).toBe("one-shot")
+    expect(closed).toEqual(["first", "popup"])
+    expect(sessions.listSummaries()).toEqual([])
+  })
+
+  test("reapIdleSessions deletes idle auto-named sessions and never touches explicit sessions", async () => {
+    const closed: string[] = []
+    const targets = [rootTab("agent-tab", "oc-ses_abc"), rootTab("mcp-tab", "mcp-12345678"), rootTab("named-tab", "named")]
+    const sessions = new OpenCodeBrowserSessions("http://127.0.0.1:0", () => new FakeSandbox(async () => ok("x")), {
+      lifecycleTimeoutMs: 5_000,
+      getTargets: () => targets,
+      onReleaseRelayTarget: (id) => Effect.sync(() => { closed.push(id) }),
+    })
+    for (const id of ["oc-ses_abc", "mcp-12345678", "named"]) await run(sessions.execute({ sessionId: id, code: "...", createIfMissing: true }))
+    sessions.noteClient("named", 4242)
+    for (const session of sessions.sessions.values()) session.updatedAt = new Date(0).toISOString()
+
+    // A session id with six hex characters is not one of the eight MCP makes up, so it is explicit and stays.
+    await run(sessions.execute({ sessionId: "mcp-abcdef", code: "...", createIfMissing: true }))
+    sessions.sessions.get("mcp-abcdef")!.updatedAt = new Date(0).toISOString()
+
+    expect(await run(sessions.reapIdleSessions({ maxIdleMs: 100, now: 101, isTargetBusy: (id) => id === "mcp-tab" }))).toEqual(["oc-ses_abc"])
+    expect(sessions.sessions.has("oc-ses_abc")).toBe(false)
+    expect(sessions.sessions.has("mcp-12345678")).toBe(true)
+    expect(sessions.sessions.has("named")).toBe(true)
+
+    expect(await run(sessions.reapIdleSessions({ maxIdleMs: 100, now: 101 }))).toEqual(["mcp-12345678"])
+    expect(closed).toEqual(["agent-tab", "mcp-tab"])
+    expect(sessions.sessions.get("named")?.clientPid).toBe(4242)
+
+    // A user-requested reset keeps the client pid so orphan collection still knows who owns it.
+    expect(await run(sessions.reset("named"))).toMatchObject({ session: { id: "named" } })
+    expect(sessions.sessions.get("named")?.clientPid).toBe(4242)
+  })
+
+  test("sweepOrphanedRelayTargets closes only relay-owned targets without a session", async () => {
+    const closed: string[] = []
+    const sessions = new OpenCodeBrowserSessions("http://127.0.0.1:0", () => new FakeSandbox(async () => ok("x")), {
+      getTargets: () => [rootTab("orphan", "gone"), rootTab("live", "live"), rootTab("user", "gone", "user"), rootTab("raw", undefined)],
+      onReleaseRelayTarget: (id) => Effect.sync(() => { closed.push(id) }),
+    })
+    await run(sessions.execute({ sessionId: "live", code: "...", createIfMissing: true }))
+    await run(sessions.sweepOrphanedRelayTargets())
+    expect(closed).toEqual(["orphan"])
+  })
+})
+
+

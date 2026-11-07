@@ -1,12 +1,10 @@
-// The extension side of the OpenCode Browser relay's protocol (version 2). The relay (cli/src/relay.ts)
-// runs agent sessions for the browse MCP server and the opencode-browser CLI, and drives tabs through this extension.
+// The extension side of the browse relay's protocol (version 2). The relay (cli/src/relay.ts)
+// runs agent sessions for the browse MCP server and the browse CLI, and drives tabs through this extension.
 // Keep it in step with cli/src/protocol.ts and cli/src/recording-protocol.ts.
 
 type JsonPrimitive = string | number | boolean | null
-export type JsonValue = JsonPrimitive | JsonValue[] | { readonly [key: string]: JsonValue }
+type JsonValue = JsonPrimitive | JsonValue[] | { readonly [key: string]: JsonValue }
 export type JsonObject = { readonly [key: string]: JsonValue }
-
-export const extensionProtocolVersion = 2
 
 /** The relay's default port (cli/src/relay-helpers.ts defaultPort). */
 export const defaultRelayPort = 19988
@@ -28,7 +26,7 @@ export type PageStatus = {
   readonly recording?: boolean
 }
 
-export const commandMethods = [
+const commandMethods = [
   "ping",
   "debugger.attach",
   "debugger.detach",
@@ -51,11 +49,7 @@ export const commandMethods = [
   "relay.settings",
   "settings.get",
   "settings.set",
-  "windows.focusState",
 ] as const
-
-/** Optional commands this extension advertises in its hello (cli/src/protocol.ts extensionCapabilities). */
-export const extensionCapabilities = ["windows.focusState"] as const
 
 export type ExtensionCommand = {
   readonly id: number
@@ -63,8 +57,8 @@ export type ExtensionCommand = {
   readonly params?: JsonObject
 }
 
-export function parseExtensionCommand(input: string): ExtensionCommand {
-  const parsed: unknown = JSON.parse(input)
+export function parseExtensionCommand(input: string | unknown): ExtensionCommand {
+  const parsed: unknown = typeof input === "string" ? JSON.parse(input) : input
   if (
     !isJsonObject(parsed) ||
     typeof parsed.id !== "number" ||

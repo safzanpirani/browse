@@ -4,7 +4,20 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { readonly [key: string]: 
 
 export type JsonObject = { readonly [key: string]: JsonValue }
 
-export const extensionProtocolVersion = 2
+/** Used by the extension worker, the relay handshake and the public /version probe. */
+export const extensionProtocolVersion = 3
+/**
+ * The oldest extension protocol this relay still speaks. The store extension and the npm package update on their own
+ * schedules, so a relay keeps accepting older extensions for a while: raise this only when dropping support for them,
+ * and bump extensionProtocolVersion only for changes an older relay can't handle.
+ */
+export const minExtensionProtocolVersion = 3
+
+export const unpackedExtensionId = "afeafocngkodbmaipcngoamamfmekgfo"
+export const browserUnresponsive = "The browser isn't responding (asleep or frozen?). Wake it and try again."
+export const unpackedReloadAdvice = "Reload browse on your browser's extensions page (↻)."
+// A close reason, not an RPC. Older workers just see extension-older; newer workers verify the build locally.
+export const checkoutReloadPrefix = "Extension protocol incompatible: extension-older; reload "
 
 /**
  * Chrome's minimum alarm period. A disconnected extension's MV3 worker sleeps
@@ -12,19 +25,6 @@ export const extensionProtocolVersion = 2
  */
 export const extensionReconnectAlarmPeriodMs = 30_000
 const legacyExtensionProtocolVersion = 1
-
-/**
- * Optional commands an extension advertises in its hello. The relay sends them only when advertised, so an older
- * extension on the same protocol keeps working. Keep in step with src/agent-relay/protocol.ts.
- */
-export const extensionCapabilities = ["windows.focusState"] as const
-
-export type ExtensionCapability = typeof extensionCapabilities[number]
-
-export function parseExtensionCapabilities(value: JsonValue | undefined): ReadonlySet<ExtensionCapability> {
-  if (!Array.isArray(value)) return new Set()
-  return new Set(extensionCapabilities.filter((capability) => value.includes(capability)))
-}
 
 export type ExtensionProtocolCompatibility = {
   readonly version: number | null
@@ -36,7 +36,29 @@ export function extensionProtocolCompatibility(value: JsonValue | undefined): Ex
   const legacy = value === undefined
   const valid = typeof value === "number" && Number.isSafeInteger(value) && value > 0
   const version = valid ? value : legacy ? legacyExtensionProtocolVersion : null
-  return { version, compatible: version === extensionProtocolVersion, legacy }
+  return { version, compatible: version !== null && version >= minExtensionProtocolVersion && version <= extensionProtocolVersion, legacy }
+}
+
+/** Which side is behind when the protocols don't match: the extension (too old) or this CLI (the extension is newer). */
+export function extensionProtocolSkew(version: number | null | undefined): "extension-older" | "extension-newer" | undefined {
+  if (typeof version !== "number") return undefined
+  if (version > extensionProtocolVersion) return "extension-newer"
+  if (version < minExtensionProtocolVersion) return "extension-older"
+  return undefined
+}
+
+/** What to tell the user about a protocol mismatch: update the side that's behind, with the command. */
+export function extensionProtocolAdvice(version: number | null | undefined, commands: { readonly install: string }, distribution?: "unpacked" | "store"): string {
+  const skew = extensionProtocolSkew(version)
+  const versions = `extension protocol ${version ?? "unknown"}, this relay speaks ${minExtensionProtocolVersion === extensionProtocolVersion ? extensionProtocolVersion : `${minExtensionProtocolVersion} to ${extensionProtocolVersion}`}`
+  if (skew === "extension-newer")
+    return `The browse extension is newer than this browse CLI (${versions}). Update the CLI: run \`${commands.install}\` (an npm install with automatic updates also catches up by itself within a day), then restart opencode.`
+  if (skew === "extension-older") {
+    const store = "The Chrome Web Store updates it within a few hours (to update now, open chrome://extensions, turn on Developer mode and click Update)."
+    const next = distribution === "unpacked" ? unpackedReloadAdvice : distribution === "store" ? store : `For an unpacked extension: ${unpackedReloadAdvice} For a store extension: ${store}`
+    return `The browse extension is older than this browse CLI (${versions}). ${next}`
+  }
+  return `The browse extension and this browse CLI don't speak the same protocol (${versions}). Run \`${commands.install}\` again and update the extension.`
 }
 
 export type CdpRequest = {
@@ -127,11 +149,12 @@ const extensionCommandMethodValues = [
   "relay.settings",
   "settings.get",
   "settings.set",
-  "windows.focusState",
 ] as const
 
 const extensionEventMethodValues = [
+  "protocol",
   "hello",
+  "auth.code",
   "auth.response",
   "ready",
   "toolbar.clicked",

@@ -1,22 +1,52 @@
 #!/usr/bin/env node
-// opencode-browser: one command for OpenCode Browser.
-//   Setup (setup.ts): install, extension, pair, uninstall, profiles (profiles.ts). Updating (update.ts): update.
+// browse: one command for setup, updates and driving the browser.
+//   Setup (setup.ts): install, extension, pair, uninstall. Updating (update.ts): update.
 //   Driving the browser (cli.ts): serve, relay, execute, session, network, secrets, recording, journal,
 //   doctor, skill, mcp, status. The relay is the local server agents use; the extension connects to it.
-// `opencode-browser mcp` runs the MCP server over stdio (as does the bundle invoked as `opencode-browser-mcp`).
+//   find (find.ts): which browser has a site attached, without starting the relay.
+// `browse mcp` runs the MCP server over stdio (as does the bundle invoked as `opencode-browser-mcp`).
+// `--profile <browser>` on any command picks the paired browser new sessions use (browser-profile.ts).
+import fs from "node:fs"
+import os from "node:os"
 import path from "node:path"
-import { applyProfileSelection } from "./profiles.ts"
+import { applyProfileSelection } from "./browser-profile.ts"
 
-// `--profile <name>` / OPENCODE_BROWSER_PROFILE pick a profile's relay port, before any command reads it.
 applyProfileSelection()
-const setupCommands = new Set(["install", "uninstall", "extension", "pair", "profiles"])
+const embeddedVersion = globalThis.__OPENCODE_BROWSER_VERSION__
+const setupCommands = new Set(["install", "uninstall", "extension", "pair", "set"])
 const command = process.argv[2]
 const invokedAs = path.basename(process.argv[1] ?? "")
 
-if (invokedAs === "opencode-browser-mcp") {
+// Earlier layouts (~/.browse, and the old opencode-browser data root) move to the XDG folders on the first run.
+// opencode briefly shows the update, and no other command pays for the import.
+const legacyDataRoot = process.platform === "win32"
+  ? path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "opencode-browser")
+  : path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "opencode-browser")
+if (command !== "--version" && command !== "-v" && !process.env.OPENCODE_BROWSER_HOME &&
+  [path.join(os.homedir(), ".browse"), legacyDataRoot].some((root) => fs.existsSync(root))) {
+  try {
+    const { migrateLegacy } = await import("./setup/migrate.ts")
+    migrateLegacy()
+  } catch {
+    // Migration must never stop browse from starting; the next run tries again.
+  }
+}
+
+if (command === "--version" || command === "-v") {
+  const opencodeBrowserVersion = embeddedVersion ?? (await import("./version.ts")).opencodeBrowserVersion
+  process.stdout.write(`${opencodeBrowserVersion}\n`)
+} else if (command === "mcp" && process.env.OPENCODE_BROWSER_MCP_DIRECT !== "1" && (await import("./mcp/supervisor.ts")).supervisesMcp()) {
+  // An installed binary or npm global package: supervise the server so updates swap it (mcp/supervisor.ts).
+  const { runBinaryMcp } = await import("./mcp/supervisor.ts")
+  await runBinaryMcp(process.argv.slice(3))
+} else if (invokedAs === "opencode-browser-mcp" || (command === "mcp" && process.argv.length === 3)) {
   const { NodeRuntime } = await import("@effect/platform-node")
   const { runMcpServer } = await import("./mcp.ts")
   runMcpServer.pipe(NodeRuntime.runMain)
+} else if (command === "self-update" || command === "runtime-switch") {
+  // The relay's auto-update children (auto-update.ts); not for people.
+  const { runSelfUpdate, runRuntimeSwitch } = await import("./update/runtime-update.ts")
+  await (command === "self-update" ? runSelfUpdate : runRuntimeSwitch)(process.argv.slice(3))
 } else if (command === "update") {
   const { runUpdateCommand } = await import("./update.ts")
   await runUpdateCommand(process.argv.slice(3))
@@ -29,46 +59,51 @@ if (invokedAs === "opencode-browser-mcp") {
 } else {
   if (!command || command === "--help" || command === "-h") {
     process.stdout.write(`SETUP
-  install [--opencode <path>]    Install OpenCode Browser: add the browse MCP server to opencode, pair
-                                 the extension, and check which browsers have it (when none does, open
-                                 the extensions page, show the folder to load unpacked and wait for it)
-    --no-open                    Print the steps without opening anything or copying the path
-    --no-wait                    Don't wait for the extension to connect
-    --client <opencode,omp>      Which agents to set up (default: the last install's, else opencode, or omp
-                                 when only omp is installed). omp gets a \`browse\` launcher on PATH and the
-                                 browse skill; --bin-dir, --skills-dir and --omp-dir move them
+  install [--opencode <path>]    Install browse: choose agents for the browse MCP server, check which browsers
+                                 have the extension and pair it (when none does, say to add it from the Chrome
+                                 Web Store, open its page, and wait for it)
+    --remote                     For a browser on another computer: open the relay to other computers and print
+                                 its address and a one-time pairing code instead of pairing a browser here
+    --no-open                    Print the steps without opening anything
+    --no-wait                    Don't wait for the extension to be added or connect
+    --wait-seconds <seconds>     How long to wait for a connection (default 180 in a terminal, 90 otherwise)
+    -a, --agent <names...>       Configure named agents (repeatable); '*' or --all-agents selects every supported agent
+    -y, --yes                    Skip the picker; use the calling agent or detected agents
+    --client omp                 Set up omp: a \`browse\` launcher on PATH (a checkout's) and the browse skill;
+                                 --bin-dir, --skills-dir and --omp-dir move them. Without --agent, only omp
     --mcp                        With omp: also add the browse MCP server to omp's mcp.json
-  extension                      Show the unpacked extension folder (for "Load unpacked")
-  pair                           Print the pairing code the Chrome Web Store extension asks for
-  update [--check]               Update a git clone install: pull the newer commits (fast-forward only) and
-                                 run setup again; --check only says whether there's an update
+  extension                      Show where to get the extension (the unpacked folder of a checkout or a dev
+                                 install, or the store page)
+  pair [--wait-seconds <seconds>] Start the relay, print a one-time code (valid 10 minutes) and wait for the
+                                 browser that redeems it (default 180 seconds)
+    --list                       Show paired browsers: id, name, profile, when paired and last seen
+    --revoke <browser>           Unpair a browser (its id, name or profile) and disconnect it;
+                                 \`--revoke legacy\` retires the shared code of earlier versions
+  set hostname <address>         Where the relay listens: 127.0.0.1 (this computer, the default) or 0.0.0.0
+                                 (browsers on other computers can connect too, after pairing)
+  update [--check]               Update now: rerun whatever installed browse (the install script for a binary
+                                 install, npm install -g for an npm one); --check only says whether there's an
+                                 update. A git clone pulls the newer commits and runs setup again.
   uninstall [--yes]              Remove everything install set up (--yes skips confirming that stored
                                  secret profiles are deleted); --client omp removes only omp's files
 
-PROFILES (one relay and one extension copy per browser profile)
-  profiles add <name>            Copy the extension for a browser profile, pinned to its own relay port
-    --port <port>                The relay port (default: the next free one in 19960-19966)
-    --label <text>               A note shown by list, e.g. which browser profile loads it
-  profiles list [--json]         Each profile's port, folder, and whether its relay and extension are up
-  profiles remove <name>         Forget a profile and delete its extension copy
-  profiles sync [--no-reload]    Copy the current build and pairing code into every profile (after a
-                                 rebuild) and reload the connected extensions
-  --profile <name>               On any command: use that profile's relay (OPENCODE_BROWSER_PROFILE works
-                                 too; without either, OPENCODE_BROWSER_PORT or 19988). An email or browser
-                                 profile folder from exactly one profile's label works as the name
-  find [query] [--json]          Every profile's relay, extension and attached tabs; with a query, the
-                                 matching tabs, the profiles that visited it before, and the command to run
-                                 next. Starts no relay
+BROWSERS (one relay drives every paired browser; each Chrome profile with browse is one)
+  --profile <browser>            On any command: new sessions (execute, session new) and settings use this
+                                 browser: its id from \`status\`, set by "Name for agents" on its Options page.
+                                 OPENCODE_BROWSER_PROFILE works too; without either, the default browser
+  find [query] [--json]          Every browser's attached tabs and the sites its sessions visited; with a query,
+                                 the matching tabs and the command to run next. Starts no relay
+
+browse keeps its files in $XDG_CONFIG_HOME/browse, $XDG_DATA_HOME/browse, $XDG_STATE_HOME/browse and
+$XDG_CACHE_HOME/browse (defaults under ~/.config, ~/.local/share, ~/.local/state and ~/.cache), and the
+executable in ~/.local/bin (or $XDG_BIN_HOME).
 
 `)
   }
-  if (command === "status") {
-    // `--client` selects which setup to report; the relay status that follows doesn't take it.
-    const client = process.argv.findIndex((arg, index) => index > 2 && (arg === "--client" || arg.startsWith("--client=")))
-    const selector = client === -1 ? [] : process.argv.splice(client, process.argv[client] === "--client" ? 2 : 1)
-    // `status --json` prints only the relay's JSON, so callers can parse it whole.
+  if (command === "status" && !process.argv.includes("--json")) {
     const { printSetupStatus } = await import("./setup.ts")
-    if (!process.argv.includes("--json")) printSetupStatus(selector)
+    printSetupStatus()
   }
-  await import("./cli.ts")
+  const { runCli } = await import("./cli.ts")
+  runCli()
 }

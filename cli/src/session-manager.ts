@@ -1,119 +1,54 @@
-import { Deferred, Effect, Exit, Fiber, Latch, Option, Result, Schema, Semaphore } from "effect"
-import { defaultPageClosedWarning, ExecuteSandbox, hasExplicitTargetSelection, type ExecuteProgress, type ExecuteResult, type ExecuteTargetSelection } from "./execute.ts"
+import { Deferred, Effect, Option, Semaphore } from "effect"
+import { ExecuteSandbox, type ExecuteTargetSelection } from "./execute.ts"
 import type { NetworkCaptureOptions, NetworkCaptureResult, NetworkCaptureStatus, NetworkCaptureStopOptions } from "./network-capture.ts"
-import { cliCommand } from "./paths.ts"
-import { generateSessionId } from "./relay-helpers.ts"
-import type { OpenCodeBrowserSession, ExecuteSandboxLike, SessionSummary, SessionTarget } from "./relay-types.ts"
-import type { AuthenticatedJsonOutcome, AuthenticatedJsonRequest } from "./relay-schema.ts"
-import type { PersistedSession } from "./session-catalog.ts"
+import { generateSessionId } from "./relay/helpers.ts"
+import type { AuthenticatedJsonOutcome, AuthenticatedJsonRequest } from "./relay/schema.ts"
+import type { ConnectedTarget, ExecuteSandboxLike, OpenCodeBrowserSession, SessionSummary, SessionTarget } from "./relay/types.ts"
+import type { PersistedSession } from "./session-manager/catalog.ts"
+import { SessionAdmission } from "./session-manager/admission.ts"
+import { adoptTargetForSession, closeSessionSettledWithTimeout, sessionRelayTargetIds, type AdoptionContext } from "./session-manager/adoption.ts"
+import { executeInSession, type ExecutionContext } from "./session-manager/execution.ts"
+import {
+  sessionError,
+  sessionSummary,
+  trySession,
+  type AdoptionResult,
+  type ExecutionResponse,
+  type RunningExecution,
+  type SessionCreateOptions,
+  type SessionExecuteRecord,
+  type SessionHooks,
+  type SessionStopReport,
+} from "./session-manager/types.ts"
 import {
   MemoryTargetOwnership,
   type TargetOwnership,
   type TargetOwnershipChange,
-  type TargetOwnershipReservation,
-} from "./target-registry.ts"
+} from "./cdp/target-registry.ts"
 
-export type SessionExecuteRecord = {
-  readonly sessionId: string
-  readonly code: string
-  readonly durationMs: number
-  readonly result: ExecuteResult
+export {
+  adoptionTipForUrl,
+  defaultExecuteTimeoutMs,
+  SessionError,
+  shouldAppendAdoptionTip,
+  type SessionExecuteRecord,
+  type SessionHooks,
+  type SessionStopReport,
+} from "./session-manager/types.ts"
+
+/**
+ * Session ids an MCP server picks for itself (the MCP supervisor and `browse mcp` both use eight hex characters).
+ * Shared with the relay's orphan collector so both agree on which sessions nobody named.
+ */
+const mcpSessionPattern = /^mcp-[0-9a-f]{8}$/i
+
+export function isMcpSession(id: string): boolean {
+  return mcpSessionPattern.test(id)
 }
 
-type CreatedSessionSummary = SessionSummary & { readonly created?: boolean }
-
-type ExecutionResponse = { readonly result: ExecuteResult; readonly session: CreatedSessionSummary }
-
-type AdoptionResult = {
-  readonly adoptedUrl: string
-  readonly session: CreatedSessionSummary
-  readonly releasedTargetIds: readonly string[]
-}
-
-export type SessionHooks = {
-  /** Called when a session starts (true) or finishes (false) an execute. */
-  readonly onExecuteStateChange?: (sessionId: string, executing: boolean) => void
-  /** Called after each execute completes, for journaling. Failure is logged and ignored. */
-  readonly onExecuteRecord?: (record: SessionExecuteRecord) => unknown | Promise<unknown>
-  /** How long lifecycle commands wait for a permit or sandbox operation. */
-  readonly lifecycleTimeoutMs?: number
-  /** Maximum time best-effort journal I/O may retain an execute permit. */
-  readonly journalTimeoutMs?: number
-  /** Current user-owned attached page URLs, used for relay-side adoption hints. */
-  readonly getUserAttachedPageUrls?: () => readonly string[]
-  /** Reconcile relay visibility and presentation after authoritative ownership changes. */
-  readonly onTargetOwnershipChange?: (change: TargetOwnershipChange) => void
-  /** Close a live relay-owned target by its durable target id. */
-  readonly onReleaseRelayTarget?: (targetId: string) => Effect.Effect<void, Error>
-  /** Persist session identity and target continuity after durable lifecycle changes. */
-  readonly onSessionsChanged?: (sessions: readonly PersistedSession[]) => unknown | Promise<unknown>
-  /** Cancel the session's pending handoff so its waiter fails; true when one was pending. */
-  readonly onCancelSessionHandoff?: (sessionId: string) => boolean
-  /** How long a stopped script may take to settle before its sandbox is abandoned and the execute lock released. */
-  readonly stopGraceMs?: number
-}
-
-/** What a stop, delete or reset had to end in the session first. */
-export type SessionStopReport = {
-  /** A running execute was stopped (its caller got an error). */
-  readonly execute: boolean
-  /** A pending handoff was cancelled. */
-  readonly handoff: boolean
-  /** The stopped script didn't settle within the grace period; its sandbox (and execute state) was replaced. */
-  readonly forced: boolean
-}
-
-/** Why a running execute was stopped; a timeout also carries what the script produced before the deadline. */
-type ExecutionStop = {
-  readonly message: string
-  readonly diagnostic: string
-  readonly progress?: ExecuteProgress
-}
-
-type RunningExecution = {
-  readonly stop: (stop: ExecutionStop) => void
-  /** Settles once the execute lock is released, with whether the script had to be abandoned. */
-  readonly released: Deferred.Deferred<{ readonly forced: boolean }>
-}
-
-export class SessionError extends Schema.TaggedError<SessionError>()(
-  "OpenCodeBrowserSessions.SessionError",
-  {
-    message: Schema.String,
-    reason: Schema.Literals([
-      "already-exists",
-      "inactive",
-      "invalid-request",
-      "not-found",
-      "setup-failed",
-      "target-owned",
-      "timeout",
-    ]),
-    sessionId: Schema.optionalKey(Schema.String),
-  },
-) {}
-
-const sessionError = (
-  reason: SessionError["reason"],
-  message: string,
-  sessionId?: string,
-): SessionError => new SessionError({ message, reason, ...(sessionId ? { sessionId } : {}) })
-
-export const adoptionTipForUrl = (url: string): string => {
-  const selector = targetUrlHintSelector(url)
-  return `Tip: an attached tab is open (${url}). Use session_adopt with targetUrl '${selector}' (CLI: ${cliCommand(`session adopt --target-url '${selector}'`)}) to drive it instead of this new tab.`
-}
-
-export const shouldAppendAdoptionTip = (options: {
-  readonly explicitTargetSelection: boolean
-  readonly sessionCreated: boolean
-  readonly warnings: readonly string[]
-  readonly userAttachedPageUrls: readonly string[]
-}): boolean => {
-  if (options.explicitTargetSelection || options.userAttachedPageUrls.length === 0) {
-    return false
-  }
-  return options.sessionCreated || options.warnings.includes(defaultPageClosedWarning)
+/** Sessions browse names itself (an MCP server's implicit session, a generated id, or an opencode session). */
+export function isAutoNamedSession(id: string): boolean {
+  return isMcpSession(id) || /^[a-z]+-[a-z]+-\d{3}$/.test(id) || id.startsWith("oc-")
 }
 
 export class OpenCodeBrowserSessions {
@@ -125,14 +60,9 @@ export class OpenCodeBrowserSessions {
   private readonly runningExecutions = new Map<string, RunningExecution>()
   private readonly adoptSemaphore = Semaphore.makeUnsafe(1)
   private readonly targetOwnership: TargetOwnership
-  private persistenceTail = Promise.resolve()
-  private drainedPersistenceTail: Promise<void> | undefined
-  private admission: "open" | "draining" | "closed" = "open"
-  private pendingWork = 0
-  private readonly pendingSessionWork = new Map<string, number>()
-  private readonly identityChanges = new Map<string, Deferred.Deferred<void, Error>>()
-  private readonly idle = Latch.makeUnsafe(true)
-  private userAttachedPageUrlsProvider: (() => readonly string[]) | undefined
+  private readonly admission: SessionAdmission
+  private readonly adoptionContext: AdoptionContext
+  private readonly executionContext: ExecutionContext
 
   constructor(
     private readonly endpointUrl: string,
@@ -143,21 +73,44 @@ export class OpenCodeBrowserSessions {
     this.createSandbox = createSandbox ?? ((id, onDefaultTargetChange) => new ExecuteSandbox({ endpointUrl: this.endpointUrl, sessionId: id, onDefaultTargetChange }))
     this.hooks = hooks ?? {}
     this.targetOwnership = targetOwnership ?? new MemoryTargetOwnership()
-    this.userAttachedPageUrlsProvider = this.hooks.getUserAttachedPageUrls
-  }
-
-  setUserAttachedPageUrlsProvider(provider: () => readonly string[]): void {
-    this.userAttachedPageUrlsProvider = provider
+    this.admission = new SessionAdmission(this.sessions, this.hooks)
+    this.adoptionContext = {
+      sessions: this.sessions,
+      hooks: this.hooks,
+      targetOwnership: this.targetOwnership,
+      adoptSemaphore: this.adoptSemaphore,
+      admission: this.admission,
+      resolveWorkSession: (id, createIfMissing, requestedBrowser) => this.resolveWorkSession(id, createIfMissing, requestedBrowser),
+      resolveBrowser: (requested, session) => this.resolveBrowser(requested, session),
+      createOpenCodeBrowserSession: (id, readOnly, timestamps) => this.createOpenCodeBrowserSession(id, readOnly, timestamps),
+      closeOpenCodeBrowserSessionSettled: (session) => this.closeOpenCodeBrowserSessionSettled(session),
+      closeRelayTarget: (targetId) => this.closeRelayTarget(targetId),
+      releaseSessionTargetOwnership: (session) => this.releaseSessionTargetOwnership(session),
+      notifyTargetOwnershipChange: (change) => this.notifyTargetOwnershipChange(change),
+    }
+    this.executionContext = {
+      sessions: this.sessions,
+      hooks: this.hooks,
+      admission: this.admission,
+      runningExecutions: this.runningExecutions,
+      resolveWorkSession: (id, createIfMissing, requestedBrowser) => this.resolveWorkSession(id, createIfMissing, requestedBrowser),
+      resolveBrowser: (requested, session) => this.resolveBrowser(requested, session),
+      setExecuting: (id, executing) => this.setExecuting(id, executing),
+      endStoppedScript: (session) => this.endStoppedScript(session),
+      stopGraceMs: () => this.stopGraceMs(),
+      replaceSandbox: (session) => this.replaceSandbox(session),
+      recordExecute: (record) => this.recordExecute(record),
+      cleanupCreatedSession: (session) => this.cleanupCreatedSession(session),
+      stopExecution: (sessionId, message, diagnostic) => this.stopExecution(sessionId, message, diagnostic),
+    }
   }
 
   listSummaries(): SessionSummary[] {
-    return Array.from(this.sessions.values()).map((session) => {
-      return this.sessionSummary(session)
-    })
+    return Array.from(this.sessions.values()).map((session) => sessionSummary(session))
   }
 
   restore(entries: readonly PersistedSession[]): void {
-    this.assertAdmission()
+    this.admission.assertAdmission()
     if (this.sessions.size > 0) throw new Error("Cannot restore sessions after session management has started")
     const ids = new Set<string>()
     const targetOwners = new Set<string>()
@@ -174,7 +127,10 @@ export class OpenCodeBrowserSessions {
         createdAt: entry.createdAt,
         updatedAt: entry.updatedAt,
       })
+      if (entry.allowedOrigins && entry.allowedOrigins.length > 0) session.allowedOrigins = entry.allowedOrigins
+      if (entry.browser) session.browser = { id: entry.browser, ...(entry.browserKey ? { key: entry.browserKey } : {}) }
       if (entry.target) session.target = entry.target
+      if (entry.clientPid !== undefined) session.clientPid = entry.clientPid
       session.sandbox.restore(entry.target)
       this.sessions.set(entry.id, session)
     }
@@ -194,35 +150,39 @@ export class OpenCodeBrowserSessions {
     if (target) session.target = target
     else delete session.target
     session.updatedAt = new Date().toISOString()
-    this.schedulePersistence()
+    this.admission.schedulePersistence()
   }
 
-  createNew(id: string | undefined, options?: { readonly readOnly?: boolean }): OpenCodeBrowserSession {
-    this.assertAdmission()
-    if (id !== undefined) this.assertStableIdentity(id)
+  createNew(id: string | undefined, options?: SessionCreateOptions): OpenCodeBrowserSession {
+    this.admission.assertAdmission()
+    if (id !== undefined) this.admission.assertStableIdentity(id)
     return this.createAcceptedSession(id, options)
   }
 
-  private createAcceptedSession(id: string | undefined, options?: { readonly readOnly?: boolean }): OpenCodeBrowserSession {
+  private createAcceptedSession(id: string | undefined, options?: SessionCreateOptions): OpenCodeBrowserSession {
     const sessionId = id ?? generateSessionId(this.sessions)
     if (this.sessions.has(sessionId)) {
       throw sessionError("already-exists", `Session already exists: ${sessionId}`, sessionId)
     }
+    const browser = this.resolveBrowser(options?.browser)
     const session = this.createOpenCodeBrowserSession(sessionId, options?.readOnly === true)
+    if (options?.allowedOrigins && options.allowedOrigins.length > 0) session.allowedOrigins = options.allowedOrigins
+    if (browser) session.browser = browser
     this.sessions.set(sessionId, session)
-    this.schedulePersistence()
+    this.admission.schedulePersistence()
     return session
   }
 
-  create(id: string | undefined, options?: { readonly readOnly?: boolean }): Effect.Effect<OpenCodeBrowserSession, Error> {
-    return this.withAdmission(id, this.createPersistedSession(id, options).pipe(Effect.uninterruptible))
+  create(id: string | undefined, options?: SessionCreateOptions): Effect.Effect<OpenCodeBrowserSession, Error> {
+    return this.admission.withAdmission(id, this.createPersistedSession(id, options).pipe(Effect.uninterruptible))
   }
 
   ensure(id: string, options?: { readonly readOnly?: boolean }): Effect.Effect<SessionSummary, Error> {
     const manager = this
-    return this.withAdmission(id, Effect.gen(function* () {
+    return this.admission.withAdmission(id, Effect.gen(function* () {
       const existing = manager.sessions.get(id)
       if (existing) {
+        yield* trySession(() => manager.resolveBrowser(undefined, existing))
         if (options?.readOnly === true && !existing.readOnly) {
           return yield* sessionError(
             "invalid-request",
@@ -230,19 +190,19 @@ export class OpenCodeBrowserSessions {
             id,
           )
         }
-        return manager.sessionSummary(existing)
+        return sessionSummary(existing)
       }
       const session = yield* manager.createPersistedSession(id, options)
-      return manager.sessionSummary(session)
+      return sessionSummary(session)
     }).pipe(Effect.uninterruptible))
   }
 
-  private readonly createPersistedSession = Effect.fnUntraced(function* (this: OpenCodeBrowserSessions, id: string | undefined, options?: { readonly readOnly?: boolean }) {
+  private readonly createPersistedSession = Effect.fnUntraced(function* (this: OpenCodeBrowserSessions, id: string | undefined, options?: SessionCreateOptions) {
     const manager = this
-    const sessionId = id ?? generateSessionId(this.sessions)
-    return yield* manager.withIdentityChange(sessionId, Effect.gen(function* () {
-      const session = manager.createAcceptedSession(sessionId, options)
-      yield* manager.flushPersistenceWithRollback(() => Effect.gen(function* () {
+    const sessionId = id ?? generateSessionId(manager.sessions)
+    return yield* manager.admission.withIdentityChange(sessionId, Effect.gen(function* () {
+      const session = yield* trySession(() => manager.createAcceptedSession(sessionId, options))
+      yield* manager.admission.flushPersistenceWithRollback(() => Effect.gen(function* () {
         if (manager.sessions.get(session.id) === session) manager.sessions.delete(session.id)
         yield* manager.closeOpenCodeBrowserSession(session)
       }))
@@ -251,12 +211,8 @@ export class OpenCodeBrowserSessions {
   })
 
   getOrCreate(id: string): { readonly session: OpenCodeBrowserSession; readonly created: boolean } {
-    this.assertAdmission()
-    this.assertStableIdentity(id)
-    return this.getOrCreateAcceptedSession(id)
-  }
-
-  private getOrCreateAcceptedSession(id: string): { readonly session: OpenCodeBrowserSession; readonly created: boolean } {
+    this.admission.assertAdmission()
+    this.admission.assertStableIdentity(id)
     const existing = this.sessions.get(id)
     if (existing) {
       return { session: existing, created: false }
@@ -266,6 +222,25 @@ export class OpenCodeBrowserSessions {
 
   isReadOnly(id: string): boolean {
     return this.sessions.get(id)?.readOnly === true
+  }
+
+  /** The session's allowed-origin patterns, or undefined when it has no allowlist. */
+  allowedOrigins(id: string): readonly string[] | undefined {
+    return this.sessions.get(id)?.allowedOrigins
+  }
+
+  /** Replace a session's allowed-origin patterns (already normalized); an empty list removes the allowlist. */
+  setAllowedOrigins(id: string, patterns: readonly string[]): Effect.Effect<SessionSummary, Error> {
+    const manager = this
+    return Effect.gen(function* () {
+      const session = manager.sessions.get(id)
+      if (!session) return yield* sessionError("not-found", `Session not found: ${id}`, id)
+      if (patterns.length > 0) session.allowedOrigins = patterns
+      else delete session.allowedOrigins
+      session.updatedAt = new Date().toISOString()
+      manager.admission.schedulePersistence()
+      return sessionSummary(session)
+    })
   }
 
   isExecuting(id: string): boolean {
@@ -280,14 +255,15 @@ export class OpenCodeBrowserSessions {
   stopExecution(id: string, message: string, diagnostic = "user-stopped"): boolean {
     const running = this.runningExecutions.get(id)
     if (!running) return false
-    running.stop({ message, diagnostic })
+    running.stop(message, diagnostic)
     return true
   }
 
-  /**
-   * Ends whatever holds the session before delete or reset: a running execute and a pending handoff (which can also
-   * belong to an authenticated request). Waits a bounded time for the execute lock to be released.
-   */
+  /** Pauses a running execute's outer timeout while a handoff waits on the user; returns a resume callback. */
+  pauseExecutionTimeout(id: string): () => void {
+    return this.runningExecutions.get(id)?.pauseTimeout() ?? (() => {})
+  }
+
   private stopForLifecycle(id: string, operation: "delete" | "reset"): Effect.Effect<SessionStopReport | undefined> {
     const manager = this
     return Effect.gen(function* () {
@@ -295,7 +271,7 @@ export class OpenCodeBrowserSessions {
       const handoff = manager.cancelSessionHandoff(id)
       const running = manager.runningExecutions.get(id)
       if (!running) return handoff ? { execute: false, handoff, forced: false } : undefined
-      running.stop({ message, diagnostic: `session-${operation}` })
+      running.stop(message, `session-${operation}`)
       const released = yield* Deferred.await(running.released).pipe(
         Effect.timeoutOption(manager.stopGraceMs() + 2_000),
       )
@@ -317,11 +293,37 @@ export class OpenCodeBrowserSessions {
   }
 
   hasPendingWork(id: string): boolean {
-    return this.pendingSessionWork.has(id)
+    return this.admission.hasPendingWork(id)
   }
 
   hasActiveNetworkCapture(): boolean {
-    return Array.from(this.sessions.values()).some((session) => session.sandbox.networkStatus().active)
+    for (const session of this.sessions.values()) {
+      if (session.sandbox.networkStatus().active) return true
+    }
+    return false
+  }
+
+  /** Sessions with a network capture running, and since when. */
+  activeNetworkCaptures(): { readonly sessionId: string; readonly startedAt?: string }[] {
+    return Array.from(this.sessions.values()).flatMap((session) => {
+      const status = session.sandbox.networkStatus()
+      return status.active ? [{ sessionId: session.id, ...(status.startedAt ? { startedAt: status.startedAt } : {}) }] : []
+    })
+  }
+
+  /** Records the process using a session (its MCP server or CLI), so the session can be cleaned up once it is gone. */
+  noteClient(id: string, pid: number): void {
+    const session = this.sessions.get(id)
+    if (!session || session.clientPid === pid) return
+    session.clientPid = pid
+    this.admission.schedulePersistence()
+  }
+
+  /** Ends a session's network capture without a result (its client went away, or a forced restart). */
+  networkEnd(id: string, reason: string): Effect.Effect<boolean> {
+    const session = this.sessions.get(id)
+    if (!session) return Effect.succeed(false)
+    return session.sandbox.networkEnd(reason).pipe(Effect.map(({ cancelled }) => cancelled))
   }
 
   private collectSessionIds(matches: (session: OpenCodeBrowserSession) => boolean): string[] {
@@ -364,19 +366,19 @@ export class OpenCodeBrowserSessions {
 
   delete(id: string): Effect.Effect<{ readonly deleted: boolean; readonly stopped?: SessionStopReport }, Error> {
     const manager = this
-    return this.withAdmission(id, Effect.gen(function* () {
+    return this.admission.withAdmission(id, Effect.gen(function* () {
       const session = manager.sessions.get(id)
       if (!session) {
         return { deleted: false }
       }
       const stopped = yield* manager.stopForLifecycle(id, "delete")
-      const deleted = yield* manager.withLifecyclePermit(session, "delete", manager.withIdentityChange(id, Effect.gen(function* () {
+      const deleted = yield* manager.withLifecyclePermit(session, "delete", manager.admission.withIdentityChange(id, Effect.gen(function* () {
         if (manager.sessions.get(id) !== session) {
           return false
         }
-        if (session.target?.owner === "relay") yield* manager.closeRelayTarget(session.target.id).pipe(Effect.ignore)
+        yield* manager.closeSessionRelayTargets(session)
         manager.sessions.delete(id)
-        yield* manager.commitPersistence(() => Effect.sync(() => {
+        yield* manager.admission.commitPersistence(() => Effect.sync(() => {
           manager.sessions.set(id, session)
         }))
         yield* manager.releaseSessionTargetOwnership(session)
@@ -389,25 +391,28 @@ export class OpenCodeBrowserSessions {
 
   reset(id: string): Effect.Effect<{ readonly session: SessionSummary; readonly stopped?: SessionStopReport } | undefined, Error> {
     const manager = this
-    return this.withAdmission(id, Effect.gen(function* () {
+    return this.admission.withAdmission(id, Effect.gen(function* () {
       const existing = manager.sessions.get(id)
       if (!existing) {
         return undefined
       }
       const stopped = yield* manager.stopForLifecycle(id, "reset")
-      const session = yield* manager.withLifecyclePermit(existing, "reset", manager.withIdentityChange(id, Effect.gen(function* () {
+      const session = yield* manager.withLifecyclePermit(existing, "reset", manager.admission.withIdentityChange(id, Effect.gen(function* () {
         if (manager.sessions.get(id) !== existing) {
           return yield* sessionError("inactive", `Session is no longer active: ${id}`, id)
         }
-        if (existing.target?.owner === "relay") yield* manager.closeRelayTarget(existing.target.id).pipe(Effect.ignore)
+        yield* manager.closeSessionRelayTargets(existing)
         const session = manager.createOpenCodeBrowserSession(id, existing.readOnly)
+        if (existing.allowedOrigins) session.allowedOrigins = existing.allowedOrigins
+        if (existing.browser) session.browser = existing.browser
+        if (existing.clientPid !== undefined) session.clientPid = existing.clientPid
         manager.sessions.set(id, session)
-        yield* manager.commitPersistence(() => Effect.sync(() => {
+        yield* manager.admission.commitPersistence(() => Effect.sync(() => {
           manager.sessions.set(id, existing)
         }))
         yield* manager.releaseSessionTargetOwnership(existing)
         yield* manager.closeOpenCodeBrowserSession(existing)
-        return manager.sessionSummary(session)
+        return sessionSummary(session)
       })))
       return { session, ...(stopped ? { stopped } : {}) }
     }))
@@ -448,7 +453,7 @@ export class OpenCodeBrowserSessions {
     beforePermit?: (session: OpenCodeBrowserSession) => Effect.Effect<void, Error>,
   ): Effect.Effect<A, Error> {
     const manager = this
-    return this.withAdmission(id, Effect.suspend(() => {
+    return this.admission.withAdmission(id, Effect.suspend(() => {
       const session = manager.sessions.get(id)
       if (!session) return Effect.fail(sessionError("not-found", `Session not found: ${id}`, id))
       return (beforePermit ? beforePermit(session) : Effect.void).pipe(
@@ -456,6 +461,7 @@ export class OpenCodeBrowserSessions {
           if (manager.sessions.get(id) !== session) {
             return yield* sessionError("inactive", `Session is no longer active: ${id}`, id)
           }
+          yield* trySession(() => manager.resolveBrowser(undefined, session))
           return yield* use(session)
         }))),
       )
@@ -471,12 +477,12 @@ export class OpenCodeBrowserSessions {
       sessionId,
       "authenticated request",
       (session) => Effect.gen(function* () {
-        manager.setExecuting(session.id, true)
+        yield* manager.setExecuting(session.id, true)
         const result = yield* session.sandbox.authenticatedJson(pageRequest).pipe(
-          Effect.ensuring(Effect.sync(() => manager.setExecuting(session.id, false))),
+          Effect.ensuring(manager.setExecuting(session.id, false)),
         )
         session.updatedAt = new Date().toISOString()
-        yield* manager.commitPersistence()
+        yield* manager.admission.commitPersistence()
         return result
       }),
       (session) => session.readOnly && request.method !== "GET"
@@ -493,152 +499,21 @@ export class OpenCodeBrowserSessions {
     readonly sessionId?: string
     readonly code: string
     readonly createIfMissing: boolean
-    readonly targetSelection?: ExecuteTargetSelection
-    /**
-     * Wall-clock budget for the whole call, from the request: time waiting for a session create/reset to commit and
-     * time queued behind an earlier execute both count. Work still queued at the deadline never runs; a script still
-     * running at the deadline is stopped like a toolbar stop, keeping its logs so far.
-     */
+    readonly removeAfterExecute?: boolean
     readonly timeoutMs?: number
+    readonly targetSelection?: ExecuteTargetSelection
+    readonly browser?: string
   }): Effect.Effect<ExecutionResponse, Error> {
-    const manager = this
-    const requestedAt = Date.now()
-    const deadlineAt = options.timeoutMs === undefined ? undefined : requestedAt + options.timeoutMs
-    const notRun = (waitingFor: string) => sessionError(
-      "timeout",
-      `Execute timed out after ${options.timeoutMs}ms while waiting for ${waitingFor}; this script did not run.`,
-      options.sessionId,
-    )
-    return this.withAdmission(options.sessionId, Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
-      const resolved = yield* manager.resolveWorkSession(options.sessionId, options.createIfMissing)
-      const session = resolved.session
-      const response = yield* Deferred.make<ExecutionResponse, Error>()
-      let started = false
-      let cancelled = false
-      let running: RunningExecution | undefined
-      /** The finished script's response while the session journals and persists it. */
-      let finished: ExecutionResponse | undefined
-      const operation = Effect.gen(function* () {
-          if (cancelled) {
-            return yield* sessionError("inactive", `Session execute was cancelled before starting: ${session.id}`, session.id)
-          }
-          if (manager.sessions.get(session.id) !== session) {
-            return yield* sessionError("inactive", `Session is no longer active: ${session.id}`, session.id)
-          }
-          if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
-            cancelled = true
-            return yield* notRun(`an earlier execute in session ${session.id} to finish`)
-          }
-          started = true
-          session.updatedAt = new Date().toISOString()
-          manager.setExecuting(session.id, true)
-          const stopSignal = Deferred.makeUnsafe<ExecutionStop>()
-          const released = Deferred.makeUnsafe<{ readonly forced: boolean }>()
-          running = {
-            released,
-            stop: (stop) => {
-              Effect.runSync(Deferred.succeed(stopSignal, stop))
-              Effect.runSync(Deferred.succeed(response, {
-                result: stoppedExecuteResult(stop),
-                session: manager.createdSummary(session, resolved.created),
-              }))
-            },
-          }
-          const current = running
-          manager.runningExecutions.set(session.id, current)
-          let forced = false
-          const startedAt = Date.now()
-          // The script runs in its own fiber so a stop can release the execute lock without waiting for it: a stopped
-          // script that never settles (it awaits a timer the stop cleared) is abandoned, not awaited.
-          const result = yield* Effect.gen(function* () {
-            const script = yield* session.sandbox
-              .execute(options.code, { ...(options.targetSelection ? { targetSelection: options.targetSelection } : {}) })
-              .pipe(Effect.forkDetach({ startImmediately: true }))
-            const first = yield* Effect.raceFirst(
-              Fiber.join(script).pipe(Effect.map((value) => ({ settled: true as const, value }))),
-              Deferred.await(stopSignal).pipe(Effect.map((stop) => ({ settled: false as const, stop }))),
-            )
-            if (first.settled) return first.value
-            yield* manager.endStoppedScript(session)
-            // Its own outcome no longer matters (the caller has the stop); only whether it settled does.
-            const settled = yield* Fiber.join(script).pipe(Effect.exit, Effect.timeoutOption(manager.stopGraceMs()))
-            if (Option.isNone(settled)) {
-              forced = true
-              // Again: a stop during connect lets the script finish connecting after the first abort.
-              yield* manager.endStoppedScript(session)
-              manager.replaceSandbox(session)
-            }
-            return stoppedExecuteResult(first.stop)
-          }).pipe(Effect.ensuring(Effect.sync(() => {
-            if (manager.runningExecutions.get(session.id) === current) manager.runningExecutions.delete(session.id)
-            manager.setExecuting(session.id, false)
-            Effect.runSync(Deferred.succeed(released, { forced }))
-          })))
-          if (resolved.created && result.setupFailed) {
-            return yield* sessionError("setup-failed", result.text, session.id)
-          }
-          const userAttachedPageUrls = manager.userAttachedPageUrlsProvider?.() ?? []
-          const resultWithHint = shouldAppendAdoptionTip({
-            explicitTargetSelection: hasExplicitTargetSelection(options.targetSelection),
-            sessionCreated: resolved.created,
-            warnings: result.warnings,
-            userAttachedPageUrls,
-          })
-            ? { ...result, warnings: [...result.warnings, adoptionTipForUrl(userAttachedPageUrls[0] ?? "about:blank")] }
-            : result
-          session.updatedAt = new Date().toISOString()
-          finished = { result: resultWithHint, session: manager.createdSummary(session, resolved.created) }
-          yield* manager.recordExecute({
-            sessionId: session.id,
-            code: session.sandbox.redactNetworkCaptureText(options.code),
-            durationMs: Date.now() - startedAt,
-            result: resultWithHint,
-          })
-          yield* manager.commitPersistence()
-          return finished
-        })
-      const worker = session.executeSemaphore.withPermit(operation.pipe(Effect.matchEffect({
-        onFailure: (error) => (resolved.created
-          ? manager.cleanupCreatedSession(session)
-          : Effect.void).pipe(Effect.andThen(Deferred.fail(response, error))),
-        onSuccess: (value) => Deferred.succeed(response, value),
-      })))
-      const workerFiber = yield* manager.forkTracked(worker, session.id)
-      const timeoutMs = options.timeoutMs
-      const deadline = deadlineAt === undefined || timeoutMs === undefined ? undefined : yield* Effect.sleep(Math.max(0, deadlineAt - Date.now())).pipe(
-        Effect.andThen(Effect.sync(() => {
-          if (!started) {
-            // Still queued behind an earlier execute: this script never runs.
-            cancelled = true
-            Effect.runSync(Deferred.fail(response, notRun(`an earlier execute in session ${session.id} to finish`)))
-            return
-          }
-          // The script finished in time; journaling and persistence go on after the caller has its result.
-          if (finished) {
-            Effect.runSync(Deferred.succeed(response, finished))
-            return
-          }
-          if (!running || manager.runningExecutions.get(session.id) !== running) return
-          // Read before the stop aborts the script, which cancels the network capture its redaction needs.
-          const progress = session.sandbox.executeProgress()
-          running.stop({ message: executeTimeoutMessage(timeoutMs), diagnostic: "execute-timeout", ...(progress ? { progress } : {}) })
-        })),
-        Effect.forkDetach({ startImmediately: true }),
-      )
-      return yield* restore(Deferred.await(response)).pipe(
-        Effect.ensuring(deadline ? Fiber.interrupt(deadline) : Effect.void),
-        Effect.onInterrupt(() => Effect.suspend(() => {
-          if (started) return Effect.void
-          cancelled = true
-          return Fiber.interrupt(workerFiber).pipe(
-            Effect.asVoid,
-            Effect.andThen(resolved.created
-              ? session.executeSemaphore.withPermit(manager.cleanupCreatedSession(session))
-              : Effect.void),
-          )
-        })),
-      )
-    })), deadlineAt === undefined ? undefined : { deadlineAt, expired: () => notRun("the session to finish being created or reset") })
+    return executeInSession(this.executionContext, options)
+  }
+
+  /** The targets a session (or a new one in `browser`, else the default browser) may adopt: its browser's. */
+  targetsForAdoption(sessionId: string | undefined, targets: readonly ConnectedTarget[], browser?: string) {
+    return trySession(() => {
+      const session = sessionId === undefined ? undefined : this.sessions.get(sessionId)
+      const resolved = this.resolveBrowser(browser, session)
+      return targets.filter((target) => !resolved?.key || this.hooks.targetBrowserKey?.(target.tabId) === resolved.key)
+    })
   }
 
   adopt(options: {
@@ -646,145 +521,40 @@ export class OpenCodeBrowserSessions {
     readonly createIfMissing: boolean
     readonly targetId: string
     readonly targetUrl: string
+    readonly tabId?: number
+    /** The browser a session created here belongs to. */
+    readonly browser?: string
   }): Effect.Effect<AdoptionResult, Error> {
-    const manager = this
-    return this.withAdmission(options.sessionId, Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
-      const resolved = yield* manager.resolveWorkSession(options.sessionId, options.createIfMissing)
-      const session = resolved.session
-      const result = yield* Deferred.make<AdoptionResult, Error>()
-      let state: "pending" | "reserved" | "committed" = "pending"
-      let cancelled = false
-      let reservation: TargetOwnershipReservation | undefined
-      let previousTarget: SessionTarget | undefined
-      let previousRelayClosed = false
-      const timeoutMs = manager.hooks.lifecycleTimeoutMs ?? 10_000
-      const timeoutError = sessionError("timeout", `Session adopt for ${session.id} timed out after ${timeoutMs}ms`, session.id)
-      const adoptionCancelled = () => cancelled
-      const cancel = Effect.sync(() => {
-        if (cancelled) {
-          return
-        }
-        cancelled = true
-        if (reservation && state === "reserved") {
-          manager.notifyTargetOwnershipChange(manager.targetOwnership.rollbackTargetOwnership(reservation))
-        }
-      })
-      const operation = Effect.gen(function* () {
-          if (manager.sessions.get(session.id) !== session) {
-            return yield* sessionError("inactive", `Session is no longer active: ${session.id}`, session.id)
-          }
-          if (adoptionCancelled()) {
-            return yield* timeoutError
-          }
-          reservation = yield* Effect.try({
-            try: () => manager.targetOwnership.reserveTargetOwnership(options.targetId, session.id),
-            catch: (cause) => cause instanceof Error ? cause : new Error("Reserve target ownership", { cause }),
-          })
-          state = "reserved"
-          manager.notifyTargetOwnershipChange({ targetIds: [options.targetId], tabIds: reservation.tabId < 0 ? [] : [reservation.tabId] })
-          previousTarget = session.target
-          yield* session.sandbox.adoptPage(options.targetId)
-          if (adoptionCancelled()) {
-            return yield* timeoutError
-          }
-          const activeReservation = reservation
-          previousTarget = session.target ?? previousTarget
-          const previousTargetId = previousTarget?.id
-          if (previousTarget?.owner === "relay" && previousTarget.id !== options.targetId) {
-            yield* manager.closeRelayTarget(previousTarget.id)
-            previousRelayClosed = true
-          }
-          session.target = { id: options.targetId, owner: "user" }
-          session.updatedAt = new Date().toISOString()
-          yield* manager.commitPersistence()
-          if (adoptionCancelled()) {
-            return yield* timeoutError
-          }
-          yield* Effect.try({
-            try: () => {
-              manager.notifyTargetOwnershipChange(manager.targetOwnership.commitTargetOwnership({
-                reservation: activeReservation,
-                ...(previousTargetId ? { previousAdoptedTargetId: previousTargetId } : {}),
-              }))
-              state = "committed"
-            },
-            catch: (cause) => cause instanceof Error ? cause : new Error("Commit target ownership", { cause }),
-          })
-          const releasedTargetIds = previousTargetId && previousTargetId !== options.targetId ? [previousTargetId] : []
-          const value = { adoptedUrl: options.targetUrl, releasedTargetIds, session: manager.createdSummary(session, resolved.created) }
-          yield* Deferred.succeed(result, value)
-          return value
-        })
-      const transaction = session.executeSemaphore.withPermit(operation.pipe(Effect.matchEffect({
-        onFailure: (error) => Effect.gen(function* () {
-          if (reservation && state !== "committed") {
-            manager.notifyTargetOwnershipChange(manager.targetOwnership.rollbackTargetOwnership(reservation))
-          }
-          if (manager.sessions.get(session.id) === session && (resolved.created || state !== "pending")) {
-            const cleanup = yield* Effect.result(manager.cleanupSettledAdoption(session, resolved.created, previousTarget, previousRelayClosed))
-            if (Result.isFailure(cleanup)) {
-              yield* Deferred.fail(result, cleanup.failure)
-              return
-            }
-          }
-          yield* Deferred.fail(result, error)
-        }),
-        onSuccess: () => Effect.void,
-      })))
-      const worker = manager.adoptSemaphore.withPermit(transaction)
-      yield* manager.forkTracked(worker, session.id)
-      return yield* restore(Deferred.await(result).pipe(
-        Effect.timeoutOrElse({
-          duration: timeoutMs,
-          orElse: () => cancel.pipe(Effect.andThen(Effect.fail(timeoutError))),
-        }),
-        Effect.onInterrupt(() => cancel),
-      ))
-    })))
+    return adoptTargetForSession(this.adoptionContext, options)
   }
 
   /** Stop admission without cancelling accepted work or disconnecting sessions. */
   beginDrain(): Effect.Effect<void, Error> {
-    const manager = this
-    return Effect.gen(function* () {
-      if (manager.admission === "open") manager.admission = "draining"
-      while (true) {
-        yield* manager.idle.await
-        const pending = manager.persistenceTail
-        yield* manager.flushPersistence()
-        // Target callbacks can append persistence while the previous tail settles.
-        if (manager.pendingWork === 0 && pending === manager.persistenceTail) {
-          manager.drainedPersistenceTail = pending
-          return
-        }
-      }
-    })
+    return this.admission.beginDrain()
   }
 
   /** Recheck synchronously at commit: late catalog writes invalidate a completed drain. */
   isDrained(): boolean {
-    return this.admission !== "open"
-      && this.pendingWork === 0
-      && this.drainedPersistenceTail === this.persistenceTail
+    return this.admission.isDrained()
   }
 
   /** Call only after cancelling or completing the reversible drain waiter. */
   resume(): void {
-    if (this.admission === "draining") this.admission = "open"
+    this.admission.resume()
   }
 
   closeAll(): Effect.Effect<void> {
     const manager = this
     return Effect.gen(function* () {
-      manager.admission = "closed"
-      yield* manager.beginDrain().pipe(Effect.ignore)
+      manager.admission.markClosed()
+      yield* manager.admission.beginDrain().pipe(Effect.ignore)
       yield* manager.adoptSemaphore.withPermit(Effect.gen(function* () {
         yield* Effect.forEach(Array.from(manager.sessions.values()), (session) => {
           return session.executeSemaphore.withPermit(
             manager.disconnectOpenCodeBrowserSession(session),
           )
         }, { concurrency: "unbounded", discard: true })
-        yield* manager.flushPersistence().pipe(Effect.ignore)
+        yield* manager.admission.flushPersistence().pipe(Effect.ignore)
         manager.sessions.clear()
       }))
     }).pipe(Effect.uninterruptible)
@@ -792,23 +562,61 @@ export class OpenCodeBrowserSessions {
 
   summary(id: string): SessionSummary | undefined {
     const session = this.sessions.get(id)
-    if (!session) {
-      return undefined
-    }
-    return this.sessionSummary(session)
+    return session ? sessionSummary(session) : undefined
   }
 
-  private setExecuting(id: string, executing: boolean): void {
-    if (executing) {
-      this.executing.add(id)
-    } else {
-      this.executing.delete(id)
-    }
-    try {
-      this.hooks.onExecuteStateChange?.(id, executing)
-    } catch (error) {
-      console.error("Session execute-state hook failed", error)
-    }
+  /** Reaps idle auto-named and oc-* sessions; explicit (named) sessions keep their state and are never reset here. */
+  reapIdleSessions(options: {
+    readonly now?: number
+    readonly maxIdleMs: number
+    readonly isTargetBusy?: (targetId: string) => boolean
+  }): Effect.Effect<readonly string[]> {
+    const manager = this
+    return Effect.gen(function* () {
+      const now = options.now ?? Date.now()
+      const reaped: string[] = []
+      for (const session of Array.from(manager.sessions.values())) {
+        if (!isAutoNamedSession(session.id)) continue
+        if (manager.isExecuting(session.id) || manager.hasPendingWork(session.id) || session.sandbox.networkStatus().active) {
+          continue
+        }
+        const updatedAtMs = Date.parse(session.updatedAt)
+        if (!Number.isFinite(updatedAtMs) || now - updatedAtMs < options.maxIdleMs) {
+          continue
+        }
+        const targetIds = sessionRelayTargetIds(manager.hooks, session)
+        if (session.target) targetIds.add(session.target.id)
+        if (Array.from(targetIds).some((id) => options.isTargetBusy?.(id))) continue
+        const done = yield* manager.delete(session.id).pipe(Effect.map((result) => result.deleted), Effect.orElseSucceed(() => false))
+        if (done) reaped.push(session.id)
+      }
+      return reaped
+    })
+  }
+
+  /** Called once after startup inventory; unknown/user-owned tabs are never inferred. */
+  sweepOrphanedRelayTargets(): Effect.Effect<void> {
+    return Effect.forEach(this.hooks.getTargets?.() ?? [], (target) =>
+      target.owner === "relay" && target.opencodeBrowserSessionId && !this.sessions.has(target.opencodeBrowserSessionId)
+        ? this.closeRelayTarget(target.targetInfo.targetId).pipe(Effect.ignore)
+        : Effect.void, { discard: true })
+  }
+
+  persist(): Effect.Effect<void, Error> {
+    return this.admission.flushPersistence()
+  }
+
+  private setExecuting(id: string, executing: boolean): Effect.Effect<void> {
+    return Effect.suspend(() => {
+      if (executing) this.executing.add(id)
+      else this.executing.delete(id)
+      try {
+        return this.hooks.onExecuteStateChange?.(id, executing) ?? Effect.void
+      } catch (error) {
+        console.error("Session execute-state hook failed", error)
+      }
+      return Effect.void
+    })
   }
 
   private recordExecute(record: SessionExecuteRecord): Effect.Effect<void> {
@@ -816,7 +624,7 @@ export class OpenCodeBrowserSessions {
     if (!hook) return Effect.void
     return Effect.tryPromise({
       try: async () => {
-        const release = this.retainWork(record.sessionId)
+        const release = this.admission.retainWork(record.sessionId)
         try {
           return await hook(record)
         } finally {
@@ -855,7 +663,6 @@ export class OpenCodeBrowserSessions {
     return session
   }
 
-  /** Ends a stopped script: its pending handoff fails, its Playwright calls reject and its timers stop. */
   private endStoppedScript(session: OpenCodeBrowserSession): Effect.Effect<void> {
     this.cancelSessionHandoff(session.id)
     return session.sandbox.abortExecution().pipe(
@@ -865,84 +672,89 @@ export class OpenCodeBrowserSessions {
     )
   }
 
-  /**
-   * A stopped script that didn't settle keeps its sandbox (and whatever it still references); the session continues
-   * with a fresh sandbox on the same default tab. Its execute `state` is lost.
-   */
   private replaceSandbox(session: OpenCodeBrowserSession): void {
     if (this.sessions.get(session.id) !== session) return
     session.sandbox = this.createSandbox(session.id, (target) => this.updateTarget(session, target))
     session.sandbox.restore(session.target, "The previous script was stopped and did not end in time, so this session's JavaScript state and snapshot refs were reset.")
   }
 
-  /** Resolve execute/adopt work before any permit; the caller owns cleanup of a created session. */
-  private resolveWorkSession(id: string | undefined, createIfMissing: boolean): Effect.Effect<{ readonly session: OpenCodeBrowserSession; readonly created: boolean }, SessionError> {
-    return Effect.suspend(() => {
-      if (id === undefined) {
-        return createIfMissing
-          ? Effect.succeed({ session: this.createAcceptedSession(undefined), created: true })
-          : Effect.fail(sessionError("invalid-request", "sessionId is required when createIfMissing is false"))
+  private resolveBrowser(requested?: string, session?: OpenCodeBrowserSession): OpenCodeBrowserSession["browser"] {
+    const browser = this.hooks.resolveBrowser?.(requested?.trim() || undefined, session)
+    if (browser && "error" in browser) throw sessionError(browser.unavailable ? "browser-unavailable" : "invalid-request", browser.error, session?.id)
+    if (browser && session && session.browser?.id !== browser.id) {
+      session.browser = browser
+      this.admission.schedulePersistence()
+    }
+    return browser
+  }
+
+  private resolveWorkSession(id: string | undefined, createIfMissing: boolean, requestedBrowser?: string) {
+    return trySession(() => {
+      const existing = id === undefined ? undefined : this.sessions.get(id)
+      if (existing) {
+        this.resolveBrowser(requestedBrowser, existing)
+        return { session: existing, created: false }
       }
-      if (createIfMissing) return Effect.succeed(this.getOrCreateAcceptedSession(id))
-      const session = this.sessions.get(id)
-      return session ? Effect.succeed({ session, created: false }) : Effect.fail(sessionError("not-found", `Session not found: ${id}`, id))
+      if (!createIfMissing) {
+        throw id === undefined
+          ? sessionError("invalid-request", "sessionId is required when createIfMissing is false")
+          : sessionError("not-found", `Session not found: ${id}`, id)
+      }
+      return { session: this.createAcceptedSession(id, requestedBrowser ? { browser: requestedBrowser } : undefined), created: true }
     })
   }
 
-  private createdSummary(session: OpenCodeBrowserSession, created: boolean): CreatedSessionSummary {
-    return { ...this.sessionSummary(session), ...(created ? { created: true } : {}) }
-  }
-
-  private sessionSummary(session: OpenCodeBrowserSession): SessionSummary {
-    const status = session.sandbox.getStatus()
-    return {
-      id: session.id,
-      createdAt: session.createdAt,
-      updatedAt: session.updatedAt,
-      connected: status.connected,
-      pageUrl: status.pageUrl,
-      stateKeys: status.stateKeys,
-      ...(session.readOnly ? { readOnly: true } : {}),
-      ...(session.target ? { targetId: session.target.id } : {}),
-    }
-  }
-
   private closeOpenCodeBrowserSession(session: OpenCodeBrowserSession): Effect.Effect<void> {
-    return this.forkTracked(this.closeOpenCodeBrowserSessionSettled(session), session.id).pipe(
-      Effect.flatMap((worker) => this.withLifecycleTimeout(Fiber.join(worker), `Close session ${session.id}`)),
-      Effect.ignore,
-    )
+    return closeSessionSettledWithTimeout(this.admission, this.hooks, session, this.closeOpenCodeBrowserSessionSettled(session))
   }
 
   private disconnectOpenCodeBrowserSession(session: OpenCodeBrowserSession): Effect.Effect<void> {
     return Effect.acquireUseRelease(
-      Effect.sync(() => this.retainWork(session.id)),
+      Effect.sync(() => this.admission.retainWork(session.id)),
       () => session.sandbox.disconnectSettled().pipe(Effect.ignore),
       (release) => Effect.sync(release),
     )
   }
 
   private closeOpenCodeBrowserSessionSettled(session: OpenCodeBrowserSession): Effect.Effect<void> {
-    return session.sandbox.closeSettled().pipe(Effect.ignore)
+    return session.sandbox.closeSettled({ clearState: true }).pipe(Effect.ignore)
   }
 
   private releaseSessionTargetOwnership(session: OpenCodeBrowserSession): Effect.Effect<void> {
-    const target = session.target
-    if (!target) return Effect.void
-    this.notifyTargetOwnershipChange(this.targetOwnership.releaseTargetOwnership(target.id, session.id))
+    const ids = sessionRelayTargetIds(this.hooks, session)
+    if (session.target) ids.add(session.target.id)
+    for (const id of ids) this.notifyTargetOwnershipChange(this.targetOwnership.releaseTargetOwnership(id, session.id))
     delete session.target
     return Effect.void
   }
 
+  private closeSessionRelayTargets(session: OpenCodeBrowserSession): Effect.Effect<void> {
+    return Effect.gen({ self: this }, function* () {
+      const closed = new Set<string>()
+      const defaultId = session.target?.owner === "relay" ? session.target.id : undefined
+      if (defaultId) {
+        yield* this.closeRelayTarget(defaultId).pipe(Effect.ignore)
+        closed.add(defaultId)
+      }
+      while (true) {
+        const pending = Array.from(sessionRelayTargetIds(this.hooks, session)).filter((id) => !closed.has(id))
+        if (pending.length === 0) return
+        // Each release may poll for up to the grace period; run a few at once instead of one after another.
+        yield* Effect.forEach(pending, (targetId) =>
+          this.closeRelayTarget(targetId).pipe(
+            Effect.ignore,
+            Effect.andThen(Effect.sync(() => { closed.add(targetId) })),
+          ), { concurrency: 4, discard: true })
+      }
+    })
+  }
+
   private closeRelayTarget(targetId: string): Effect.Effect<void, Error> {
-    const close = this.hooks.onReleaseRelayTarget?.(targetId)
-    return close ?? Effect.void
+    return this.hooks.onReleaseRelayTarget?.(targetId) ?? Effect.void
   }
 
   private notifyTargetOwnershipChange(change: TargetOwnershipChange): void {
-    if (change.targetIds.length === 0 && change.tabIds.length === 0) {
-      return
-    }
+    if (change.targetIds.length === 0 && change.tabIds.length === 0) return
     try {
       this.hooks.onTargetOwnershipChange?.(change)
     } catch (error) {
@@ -950,189 +762,16 @@ export class OpenCodeBrowserSessions {
     }
   }
 
-  private persistedSession(session: OpenCodeBrowserSession): PersistedSession {
-    const target = session.target
-    return {
-      id: session.id,
-      createdAt: session.createdAt,
-      updatedAt: session.updatedAt,
-      readOnly: session.readOnly,
-      ...(target ? { target } : {}),
-    }
-  }
-
-  private persistedSessions(): PersistedSession[] {
-    return Array.from(this.sessions.values(), (session) => this.persistedSession(session))
-  }
-
-  private schedulePersistence(sessions = this.persistedSessions()): void {
-    const hook = this.hooks.onSessionsChanged
-    if (!hook) return
-    const release = this.retainWork()
-    const previous = this.persistenceTail
-    this.persistenceTail = previous.catch(() => {}).then(async () => {
-      try {
-        await hook(sessions)
-      } finally {
-        release()
-      }
-    })
-    void this.persistenceTail.catch((error) => {
-      console.error("Failed to persist OpenCode Browser sessions", error)
-    })
-  }
-
-  private flushPersistence(): Effect.Effect<void, Error> {
-    return Effect.tryPromise({
-      try: () => this.persistenceTail,
-      catch: (cause) => cause instanceof Error ? cause : new Error("Persist OpenCode Browser sessions", { cause }),
-    })
-  }
-
-  private commitPersistence(rollback?: () => Effect.Effect<void>): Effect.Effect<void, Error> {
-    this.schedulePersistence()
-    return rollback ? this.flushPersistenceWithRollback(rollback) : this.flushPersistence()
-  }
-
-  private flushPersistenceWithRollback(rollback: () => Effect.Effect<void>): Effect.Effect<void, Error> {
-    return this.flushPersistence().pipe(Effect.catch((error) => Effect.gen({ self: this }, function* () {
-      yield* rollback()
-      this.schedulePersistence()
-      yield* this.flushPersistence().pipe(Effect.ignore)
-      return yield* Effect.fail(error)
-    })))
-  }
-
-  persist(): Effect.Effect<void, Error> {
-    return this.flushPersistence()
-  }
-
-  private cleanupSettledAdoption(
-    session: OpenCodeBrowserSession,
-    created: boolean,
-    previousTarget?: SessionTarget,
-    previousRelayClosed = false,
-  ): Effect.Effect<void, Error> {
-    const manager = this
-    return Effect.gen(function* () {
-      const activeTarget = session.target
-      yield* manager.releaseSessionTargetOwnership(session)
-      if (previousTarget && previousTarget.id !== activeTarget?.id) {
-        manager.notifyTargetOwnershipChange(manager.targetOwnership.releaseTargetOwnership(previousTarget.id, session.id))
-        if (previousTarget.owner === "relay" && !previousRelayClosed) yield* manager.closeRelayTarget(previousTarget.id)
-      }
-      yield* manager.closeOpenCodeBrowserSessionSettled(session)
-      if (manager.sessions.get(session.id) !== session) {
-        return
-      }
-      if (created) {
-        manager.sessions.delete(session.id)
-      } else {
-        const replacement = manager.createOpenCodeBrowserSession(session.id, session.readOnly, {
-          createdAt: session.createdAt,
-        })
-        manager.sessions.set(session.id, replacement)
-      }
-      yield* manager.commitPersistence()
-    })
-  }
-
   private cleanupCreatedSession(session: OpenCodeBrowserSession): Effect.Effect<void> {
     const manager = this
     return Effect.gen(function* () {
       if (manager.sessions.get(session.id) !== session) return
+      yield* manager.closeSessionRelayTargets(session)
       manager.sessions.delete(session.id)
       yield* manager.releaseSessionTargetOwnership(session)
       yield* manager.closeOpenCodeBrowserSession(session)
-      yield* manager.commitPersistence().pipe(Effect.ignore)
+      yield* manager.admission.commitPersistence().pipe(Effect.ignore)
     })
-  }
-
-  private assertAdmission(): void {
-    if (this.admission !== "open") {
-      throw sessionError("inactive", this.admission === "closed"
-        ? "OpenCode Browser sessions are closing"
-        : "OpenCode Browser sessions are draining")
-    }
-  }
-
-  private assertStableIdentity(id: string): void {
-    if (this.identityChanges.has(id)) {
-      throw sessionError("inactive", `Session lifecycle change is still committing: ${id}`, id)
-    }
-  }
-
-  private awaitStableIdentity(id: string | undefined): Effect.Effect<void, Error> {
-    return Effect.suspend(() => {
-      const pending = id === undefined ? undefined : this.identityChanges.get(id)
-      return pending ? Deferred.await(pending).pipe(Effect.andThen(this.awaitStableIdentity(id))) : Effect.void
-    })
-  }
-
-  /** Keep same-ID callers behind the entire commit/rollback, including corrective persistence. */
-  private withIdentityChange<A>(id: string, effect: Effect.Effect<A, Error>): Effect.Effect<A, Error> {
-    return Effect.suspend(() => {
-      // Check and claim synchronously: the run loop may yield between separate effects.
-      const pending = this.identityChanges.get(id)
-      if (pending) return Deferred.await(pending).pipe(Effect.andThen(this.withIdentityChange(id, effect)))
-      const settled = Deferred.makeUnsafe<void, Error>()
-      this.identityChanges.set(id, settled)
-      return effect.pipe(Effect.onExit((exit) => Effect.suspend(() => {
-        if (this.identityChanges.get(id) === settled) this.identityChanges.delete(id)
-        // Waiters observe the change's failure or interruption and do not proceed past it.
-        return Deferred.done(settled, Exit.asVoid(exit))
-      })))
-    })
-  }
-
-  private retainWork(sessionId?: string): () => void {
-    this.pendingWork += 1
-    if (sessionId !== undefined) this.pendingSessionWork.set(sessionId, (this.pendingSessionWork.get(sessionId) ?? 0) + 1)
-    this.idle.closeUnsafe()
-    return () => {
-      this.pendingWork -= 1
-      if (sessionId !== undefined) {
-        const remaining = (this.pendingSessionWork.get(sessionId) ?? 1) - 1
-        if (remaining === 0) this.pendingSessionWork.delete(sessionId)
-        else this.pendingSessionWork.set(sessionId, remaining)
-      }
-      if (this.pendingWork === 0) this.idle.openUnsafe()
-    }
-  }
-
-  private withAdmission<A, E, R>(
-    sessionId: string | undefined,
-    effect: Effect.Effect<A, E, R>,
-    deadline?: { readonly deadlineAt: number; readonly expired: () => Error },
-  ): Effect.Effect<A, E | Error, R> {
-    const stable = (): Effect.Effect<void, Error> => deadline === undefined
-      ? this.awaitStableIdentity(sessionId)
-      : this.awaitStableIdentity(sessionId).pipe(
-        Effect.timeoutOption(Math.max(0, deadline.deadlineAt - Date.now())),
-        Effect.flatMap((waited) => Option.isNone(waited) ? Effect.fail(deadline.expired()) : Effect.void),
-      )
-    return Effect.acquireUseRelease(
-      Effect.try({
-        try: () => {
-          this.assertAdmission()
-          return this.retainWork(sessionId)
-        },
-        catch: (cause) => cause instanceof Error ? cause : new Error("Admit session operation", { cause }),
-      }),
-      () => stable().pipe(Effect.andThen(effect)),
-      (release) => Effect.sync(release),
-    )
-  }
-
-  private forkTracked<A, E, R>(effect: Effect.Effect<A, E, R>, sessionId: string): Effect.Effect<Fiber.Fiber<A, E>, never, R> {
-    return Effect.uninterruptibleMask(() => Effect.suspend(() => {
-      // Transfer the lease before forking; caller interruption cannot strand it.
-      const release = this.retainWork(sessionId)
-      return effect.pipe(
-        Effect.ensuring(Effect.sync(release)),
-        Effect.forkDetach({ startImmediately: true }),
-      )
-    }))
   }
 
   private withLifecyclePermit<A, E, R>(
@@ -1143,7 +782,6 @@ export class OpenCodeBrowserSessions {
     return Effect.suspend(() => {
       let state: "waiting" | "started" | "timed-out" = "waiting"
       const timeout = sessionError("timeout", `Session ${operation} timed out waiting for active execute in ${session.id}`, session.id)
-      // withPermit installs release atomically; racing a bare take can lose a granted permit.
       return Effect.raceFirst(
         session.executeSemaphore.withPermit(Effect.suspend((): Effect.Effect<A, E | Error, R> => {
           if (state === "timed-out") return Effect.fail(timeout)
@@ -1157,42 +795,5 @@ export class OpenCodeBrowserSessions {
         })),
       )
     })
-  }
-
-  private withLifecycleTimeout<A, E, R>(effect: Effect.Effect<A, E, R>, label: string): Effect.Effect<A, E | Error, R> {
-    const timeoutMs = this.hooks.lifecycleTimeoutMs ?? 10_000
-    return effect.pipe(
-      Effect.timeoutOrElse({
-        duration: timeoutMs,
-        orElse: () => Effect.fail(sessionError("timeout", `${label} timed out after ${timeoutMs}ms`)),
-      }),
-    )
-  }
-}
-
-function stoppedExecuteResult(stop: ExecutionStop): ExecuteResult {
-  return {
-    text: stop.message,
-    isError: true,
-    logs: stop.progress?.logs ?? [],
-    logSummary: stop.progress?.logSummary ?? { totalCount: 0, returnedCount: 0, repeatedCount: 0, omittedCount: 0 },
-    warnings: [],
-    diagnostic: stop.diagnostic,
-    ...(stop.progress ? { aftermath: stop.progress.aftermath } : {}),
-  }
-}
-
-function executeTimeoutMessage(timeoutMs: number): string {
-  return `Execute timed out after ${timeoutMs}ms and was stopped: its Playwright connection was closed so it cannot touch the page again, ` +
-    "and the session's `state` was reset. The page stays as the script left it; the logs and aftermath cover the work done before the deadline. " +
-    "Check the page with a short follow-up execute on the same session."
-}
-
-function targetUrlHintSelector(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl)
-    return parsed.host || rawUrl
-  } catch {
-    return rawUrl
   }
 }

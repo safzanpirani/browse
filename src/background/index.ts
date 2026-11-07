@@ -1,6 +1,7 @@
 // Service worker: keeps the link to the local browse relay (agent-relay.ts), which drives tabs for agents. The
-// toolbar button lets agents use the current tab, or stops them; the status page (welcome.html, also the options
-// page) shows the connection.
+// toolbar button lets agents use the current tab, or stops them (before setup, it opens the onboarding page). The
+// onboarding page (onboarding.html) walks through setup; the settings page (settings.html, the options page) shows the
+// connection.
 import { AGENT_DIAGNOSTICS, STATUS_PORT, type FromStatusPage, type ToStatusPage } from "../shared/protocol"
 import { createAgentRelay } from "./agent-relay"
 import { TabCleanup } from "./tab-cleanup"
@@ -14,8 +15,19 @@ const agents = createAgentRelay({
 })
 
 chrome.action.onClicked.addListener((tab) => {
+  // Before setup (or while the relay refuses this browser, or speaks another version) a click can't reach an agent:
+  // show the onboarding page, which says what to do, instead of queueing it silently.
+  const { status } = agents.state()
+  if (status === "unpaired" || status === "untrusted" || status === "incompatible") return void openOnboarding()
   if (tab.id !== undefined) agents.attachTab(tab.id)
 })
+
+declare const __OPENCODE_BROWSER_TEST_HOOKS__: boolean
+// Test builds only (OPENCODE_BROWSER_TEST_HOOKS=1 when building): the stress harness clicks the toolbar button through
+// this worker's DevTools target, as CDP can't click browser UI. Pages can't reach the worker's globals, and other
+// builds compile this out.
+if (__OPENCODE_BROWSER_TEST_HOOKS__)
+  Object.assign(globalThis, { __opencodeBrowserTest: { toolbarClick: (tabId: number) => agents.attachTab(tabId) } })
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== STATUS_PORT || port.sender?.id !== chrome.runtime.id) return
@@ -24,8 +36,10 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener((message: FromStatusPage) => {
     if (message.type === "agents.reconnect") agents.reconnect()
     if (message.type === "tabs.cleanup") void TabCleanup.cleanup({ minutes: 0 })
-    if (message.type === "pairing.set")
-      void agents.pair(message.code).then((ok) => post(port, { type: "pairing.result", ok }))
+    if (message.type === "autoUpdate.set") agents.setAutoUpdate(message.mode)
+    if (message.type === "pairing.link") void agents.pairLink(message.code).then((ok) => post(port, { type: "pairing.link.result", ok }))
+    if (message.type === "relay.connect")
+      void agents.connectTo(message.address, message.code).then((result) => post(port, { type: "relay.result", ...result }))
   })
   post(port, { type: "agents", state: agents.state() })
 })
@@ -45,8 +59,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 })
 
 chrome.runtime.onInstalled.addListener((details) => {
-  if (details.reason === "install") void chrome.tabs.create({ url: chrome.runtime.getURL("welcome.html") })
+  if (details.reason === "install") void chrome.tabs.create({ url: chrome.runtime.getURL("onboarding.html?first-run") })
 })
+
+/** Focuses an open onboarding tab, or opens one. */
+async function openOnboarding() {
+  const page = chrome.runtime.getURL("onboarding.html")
+  const open = (await chrome.tabs.query({}).catch(() => [])).find((tab) => tab.url?.startsWith(page))
+  if (open?.id === undefined) return void chrome.tabs.create({ url: page })
+  await chrome.tabs.update(open.id, { active: true })
+  if (open.windowId !== undefined) await chrome.windows.update(open.windowId, { focused: true })
+}
 
 // Tab-specific badges reset when a tab navigates; the relay's state for it doesn't.
 chrome.tabs.onUpdated.addListener((_tabId, change, tab) => {
@@ -68,7 +91,7 @@ async function updateBadges(tabs?: chrome.tabs.Tab[]) {
         .setBadgeBackgroundColor({ tabId: tab.id, color: BADGE_COLORS[badge?.text ?? ""] ?? BADGE_COLORS.default })
         .catch(() => undefined)
       await chrome.action
-        .setTitle({ tabId: tab.id, title: badge?.title ?? "OpenCode Browser · Click to let agents use this tab" })
+        .setTitle({ tabId: tab.id, title: badge?.title ?? "browse · Click to let agents use this tab" })
         .catch(() => undefined)
     }),
   )

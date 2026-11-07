@@ -1,9 +1,7 @@
 node_modules/
 dist/
-release/
-# Per-install pairing code written by `install` (see cli/src/relay-secrets.ts)
+/release/
+# One-time pairing code written by `install` (see cli/src/browser-pairing.ts)
 relay-pairing.json
-# Per-profile relay port written into profile copies by `profiles add` (see cli/src/profiles.ts)
-relay-port.json
-# Publish lock the extension build holds while it swaps a build into dist/ (see scripts/build-extension.ts)
-/dist.lock*
+cli/LICENSE
+release-notes.md

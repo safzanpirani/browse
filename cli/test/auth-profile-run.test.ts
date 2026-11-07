@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import * as AuthProfile from "../src/auth-profile.ts"
+import * as AuthProfile from "../src/auth/profile.ts"
 
 const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "browse-auth-run-"))
 const workDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "browse-auth-cwd-")))

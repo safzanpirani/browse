@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test"
-import { pairingProof, randomNonce } from "../../src/background/pairing"
 import { installChrome, settle, type StubEvent } from "../chrome-stub"
+import { installFakeRelaySocket } from "../relay-stub"
 
 // Where agent tabs open (tabs.create, tabs.group) and popup adoption (agent-relay.ts adoptOpened): a tab an agent's
 // page opens joins the agent's tabs, and the relay hears of it (tabs.opened) once it is in place. Both with agent tabs
@@ -9,49 +9,12 @@ import { installChrome, settle, type StubEvent } from "../chrome-stub"
 
 const stub = installChrome()
 ;(globalThis as { __OPENCODE_BROWSER_BUILD__?: string }).__OPENCODE_BROWSER_BUILD__ = "test"
-const CODE = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+/** This browser's token for the relay, as a code exchange left it. */
+const TOKEN = "test-token-0123456789abcdefghijklmnopqrstuv"
 const PORT = 19907
-type Message = { id?: number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: unknown }
+const socket = installFakeRelaySocket({ port: PORT, token: TOKEN })
 
-/** The relay's side of the link: answers the pairing handshake, records what the extension sends. */
-class FakeRelaySocket {
-  static readonly CONNECTING = 0
-  static readonly OPEN = 1
-  static readonly CLOSING = 2
-  static readonly CLOSED = 3
-  static current: FakeRelaySocket | undefined
-  readonly received: Message[] = []
-  readyState = FakeRelaySocket.CONNECTING
-  onopen: ((event: unknown) => void) | null = null
-  onmessage: ((event: { data: string }) => void) | null = null
-  onclose: ((event: unknown) => void) | null = null
-  constructor(readonly url: string) {
-    FakeRelaySocket.current = this
-    setTimeout(() => {
-      this.readyState = FakeRelaySocket.OPEN
-      this.onopen?.({})
-    }, 0)
-  }
-  send(data: string) {
-    const message = JSON.parse(data) as Message
-    this.received.push(message)
-    if (message.method === "hello") void this.challenge(String((message.params?.pairing as { nonce: string }).nonce))
-  }
-  private async challenge(extensionNonce: string) {
-    const nonce = randomNonce()
-    this.deliver({ method: "auth.challenge", params: { nonce, proof: await pairingProof(CODE, "relay", PORT, nonce, extensionNonce) } })
-  }
-  deliver(message: Message) {
-    this.onmessage?.({ data: JSON.stringify(message) })
-  }
-  close() {}
-}
-
-globalThis.fetch = (async (input: string | URL) =>
-  String(input).endsWith("/relay-pairing.json") ? Response.json({ code: CODE }) : new Response("not found", { status: 404 })) as typeof fetch
-;(globalThis as { WebSocket: unknown }).WebSocket = FakeRelaySocket
-
-await stub.chrome.storage.local.set({ agentRelayPort: PORT })
+await stub.chrome.storage.local.set({ agentRelayPort: PORT, agentRelayTokens: { [`127.0.0.1:${PORT}`]: TOKEN } })
 const { createAgentRelay } = await import("../../src/background/agent-relay")
 const { TabCleanup } = await import("../../src/background/tab-cleanup")
 const relay = createAgentRelay({ changed: () => {}, badgesChanged: () => {} })
@@ -61,7 +24,6 @@ async function until(check: () => boolean) {
   expect(check()).toBe(true)
 }
 const event = (path: string) => path.split(".").reduce<any>((value, key) => value[key], stub.chrome) as StubEvent
-const socket = () => FakeRelaySocket.current!
 let nextCommand = 1
 async function command(method: string, params: Record<string, unknown>) {
   const id = nextCommand++
@@ -110,6 +72,7 @@ beforeEach(async () => {
   stub.state.focusedWindowId = undefined
   socket().received.length = 0
   await stub.chrome.storage.local.remove("agentTabsWindow")
+  await stub.chrome.storage.local.set({ agentTabsGrouping: "session" })
   await stub.chrome.storage.session.remove("agentWindowId")
 })
 

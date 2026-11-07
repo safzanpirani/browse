@@ -1,0 +1,614 @@
+name: Release
+run-name: "${{ github.event_name == 'workflow_dispatch' && format('Release {0} {1}', inputs.bump, inputs.version) || '' }}"
+
+# Releases browse: the extension zip, the @opencode/browse npm package and the browse binaries (an npm package
+# @opencode/browse-<target> per platform, and the same targets on Anomaly's release service, which the install script
+# downloads). RELEASING.md has the flow and the setup.
+#
+#   push to dev                        dev:    <next>-dev.<run> to the release service (extension + every binary
+#                                              target) and npm dist-tag dev
+#   dispatch on dev, bump or version   stable: tag v<version>, the release service (extension + every binary target),
+#                                              npm latest, the Chrome Web Store, the GitHub release;
+#                                              repository admins and maintainers only, release_notes required
+#   dispatch without bump or version   check:  builds, checks and attests the stable artifacts; every publish script
+#                                              runs as a dry run and publishes nothing
+#
+# Builds are separated from publishing:
+# - build and build-binaries run repository code (bun install, typecheck, tests, scripts/release-check.ts,
+#   cli/script/compile.ts) with no environment, secrets or id-token, and upload the artifacts with a SHA256SUMS whose
+#   digest they output.
+# - sign-macos (optional, off until the repository variable MACOS_SIGNING is true) runs only .github/release/ scripts.
+# - tag runs only .github/release/tag-release.sh (git and jq) with the release deploy key.
+# - attest and every publish job check out only .github/release/, verify each artifact against the digest of the job
+#   that made it (and the attestation), and run those scripts on the artifacts as data. They never execute repository
+#   code. Jobs that hold a secret or publish run in environment release, which admits only dev.
+# .github/ (CODEOWNERS) is the security boundary for releases.
+
+on:
+  push:
+    branches: [dev]
+    # Docs alone cut no dev build.
+    paths-ignore: ["**/*.md"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "check: build, check and attest, publish nothing. patch, minor, major: a stable release from dev"
+        required: false
+        type: choice
+        options: [check, patch, minor, major]
+        default: check
+      version:
+        description: Exact stable version instead of a bump (optional)
+        required: false
+        type: string
+      release_notes:
+        description: Required with bump or version. A summary line, then ## Major / ## Improvements / ## Fixes (bun run release drafts them)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && (inputs.bump != 'check' || inputs.version) && 'stable' || github.event_name }}
+  # Never cancel a release halfway through publishing. Of the dev pushes that land during a dev run, only the newest
+  # waits (GitHub replaces an older pending run in the group).
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      version: ${{ steps.plan.outputs.version }}
+      channel: ${{ steps.plan.outputs.channel }}
+      npm_tag: ${{ steps.plan.outputs.npm_tag }}
+      dry_run: ${{ steps.plan.outputs.dry_run }}
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: /.github/release/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: plan
+        name: Plan
+        run: bash .github/release/plan-release.sh
+        env:
+          GH_TOKEN: ${{ github.token }} # reads cli/package.json and the triggering actor's repository role
+          INPUT_BUMP: ${{ inputs.bump }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_RELEASE_NOTES: ${{ inputs.release_notes }}
+
+  # Stable only: commits the versions and changelog/<version>.md on the dispatched dev commit and pushes only the tag
+  # v<version>, with the release deploy key (the only actor besides the code owners the v* tag ruleset admits).
+  # Runs git and jq only.
+  tag:
+    name: Tag
+    needs: plan
+    if: needs.plan.outputs.mode == 'stable'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          ssh-key: ${{ secrets.RELEASE_TAG_KEY }}
+      - id: tag
+        name: Tag
+        run: bash .github/release/tag-release.sh
+        env:
+          BROWSE_VERSION: ${{ needs.plan.outputs.version }}
+          BROWSE_RELEASE_NOTES: ${{ inputs.release_notes }}
+
+  # ---- Build: repository code; no environment, secrets or id-token -------------------------------------------------
+
+  build:
+    name: Build and check
+    needs: [plan, tag]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.upload.outputs.digest }}
+    env:
+      MODE: ${{ needs.plan.outputs.mode }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.tag.outputs.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install (extension)
+        run: bun install --frozen-lockfile
+
+      - name: Install (cli)
+        run: bun install --frozen-lockfile
+        working-directory: cli
+
+      # Stamped into the checkout only (never committed).
+      - name: Stamp the dev version
+        if: needs.plan.outputs.mode == 'dev'
+        run: bun scripts/version.ts set "$VERSION"
+
+      - name: Versions agree (cli/package.json, package.json, manifest) and the changelog is ready
+        run: |
+          bun scripts/release-check.ts --versions-only
+          [ "$(node -p 'require("./cli/package.json").version')" = "$VERSION" ] || { echo "::error::The checkout isn't version $VERSION."; exit 1; }
+          if [ "$MODE" = stable ]; then bun scripts/changelog.ts check "$VERSION"; fi
+
+      - name: Typecheck (extension)
+        run: bun run typecheck
+
+      - name: Typecheck (cli)
+        run: bun run typecheck
+        working-directory: cli
+
+      - name: Test
+        run: bun run test
+
+      # The extension zip (the store zip, or a dev build's unpacked zip) and the npm tarball (with the store item ID,
+      # and a dev build's zip sha256, baked in: cli/build.ts), with the artifact checks: `bun run release:check`.
+      - name: Build and check the extension zip and npm tarball
+        env:
+          OPENCODE_BROWSER_STORE_ID: ${{ vars.CWS_ITEM_ID }}
+        run: |
+          if [ "$MODE" = stable ]; then bun scripts/release-check.ts --tag "v$VERSION" --require-changelog
+          else bun scripts/release-check.ts; fi
+
+      - id: upload
+        name: Upload
+        uses: ./.github/release/upload
+        with:
+          name: build
+          path: release
+
+  # The browse binaries (bun build --compile, cli/script/compile.ts), one npm tarball per platform
+  # (opencode-browse-<target>-<version>.tgz, cli/script/pack.ts), cross-compiled here against each target's Bun runtime
+  # from the pinned Bun release, checked against its SHASUMS256.txt. A dev build's binaries carry the sha256 of the
+  # build job's extension zip, like the npm package, so build's artifact is downloaded (and verified) as data.
+  build-binaries:
+    name: Build binaries
+    needs: [plan, tag, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.upload.outputs.digest }}
+    env:
+      MODE: ${{ needs.plan.outputs.mode }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.tag.outputs.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+
+      - name: Install (cli)
+        run: bun install --frozen-lockfile
+        working-directory: cli
+
+      - name: Stamp the dev version
+        if: needs.plan.outputs.mode == 'dev'
+        run: bun scripts/version.ts set "$VERSION"
+
+      - name: Download the build
+        uses: ./.github/release/download
+        with:
+          pattern: build
+          digests: build=${{ needs.build.outputs.digest }}
+
+      # The Bun release is the one setup-bun installed from package.json's packageManager.
+      - name: Compile and pack
+        working-directory: cli
+        env:
+          OPENCODE_BROWSER_STORE_ID: ${{ vars.CWS_ITEM_ID }}
+        run: |
+          [ "$(node -p 'require("./package.json").version')" = "$VERSION" ] || { echo "::error::The checkout isn't version $VERSION."; exit 1; }
+          if [ "$MODE" = dev ]; then export OPENCODE_BROWSER_EXTENSION_ZIP="$RUNNER_TEMP/in/build/browse-extension-$VERSION.zip"; fi
+          BUN_COMPILE_RELEASE="bun-v$(bun --version)" bun script/compile.ts
+          bun script/pack.ts --out "$RUNNER_TEMP/binaries"
+
+      - name: Smoke test the linux-x64 binaries
+        run: |
+          for target in linux-x64 linux-x64-baseline; do
+            dir=$(mktemp -d)
+            tar -xzf "$RUNNER_TEMP/binaries/opencode-browse-$target-$VERSION.tgz" -C "$dir"
+            actual=$("$dir/package/bin/browse" --version)
+            [ "$actual" = "$VERSION" ] || { echo "::error::$target --version printed $actual, expected $VERSION"; exit 1; }
+            echo "$target: $actual"
+          done
+
+      # The linux-x64 binary as a user gets it: cli/node_modules is moved out of the way, so a file it reads at run time
+      # from a path built on __dirname (the build machine's node_modules, baked into the executable) fails here too.
+      # `browse serve` is the relay install and the MCP server start; `browse mcp` serves the tools. Put back for the
+      # upload.
+      - name: Smoke test the relay and MCP server without node_modules
+        run: |
+          set -eu
+          dir=$(mktemp -d)
+          tar -xzf "$RUNNER_TEMP/binaries/opencode-browse-linux-x64-$VERSION.tgz" -C "$dir"
+          binary="$dir/package/bin/browse"
+          home=$(mktemp -d)
+          port=29988
+          relay=
+          restore() {
+            if [ -n "$relay" ]; then kill "$relay" 2>/dev/null || true; fi
+            if [ -d cli/node_modules.away ]; then mv cli/node_modules.away cli/node_modules; fi
+          }
+          trap restore EXIT
+          mv cli/node_modules cli/node_modules.away
+          env -i HOME="$home" PATH=/usr/bin:/bin OPENCODE_BROWSER_PORT="$port" OPENCODE_BROWSER_MANAGED_RELAY=1 \
+            "$binary" serve > "$RUNNER_TEMP/relay.log" 2>&1 &
+          relay=$!
+          up=
+          for _ in $(seq 1 60); do
+            if curl -sf --max-time 2 "http://127.0.0.1:$port/version" > "$RUNNER_TEMP/version.json"; then up=1; break; fi
+            kill -0 "$relay" 2>/dev/null || break
+            sleep 0.5
+          done
+          if [ -z "$up" ]; then
+            cat "$RUNNER_TEMP/relay.log"
+            echo "::error::The relay from the linux-x64 binary did not answer /version without node_modules."
+            exit 1
+          fi
+          echo "relay: $(cat "$RUNNER_TEMP/version.json")"
+          # Closing its stdin interrupts the MCP server (Effect exits 130), which isn't a failure; the tools are the test.
+          {
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"release-smoke","version":"0"}}}'
+            sleep 2
+            printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+            sleep 5
+          } | env -i HOME="$home" PATH=/usr/bin:/bin OPENCODE_BROWSER_PORT="$port" timeout 60 "$binary" mcp > "$RUNNER_TEMP/mcp.json" || true
+          tools=$(grep -o '"name":"[a-z0-9_-]*"' "$RUNNER_TEMP/mcp.json" | wc -l)
+          if [ "$tools" -lt 1 ]; then
+            cat "$RUNNER_TEMP/mcp.json"
+            echo "::error::The linux-x64 binary's MCP server listed no tools without node_modules."
+            exit 1
+          fi
+          echo "mcp: $tools tools"
+
+      - id: upload
+        name: Upload
+        uses: ./.github/release/upload
+        with:
+          name: binaries
+          path: ${{ runner.temp }}/binaries
+
+  # OPTIONAL, off by default: signs the macOS binaries with a Developer ID (hardened runtime, .github/release/entitlements/
+  # cli.plist) once the repository variable MACOS_SIGNING is true and environment release has APPLE_SIGNING_CERTIFICATE
+  # (a base64 .p12 without a password). Until then this job is skipped and the macOS packages ship with the ad-hoc
+  # signature bun build --compile gives them, which runs: neither the install script's curl nor npm sets quarantine.
+  sign-macos:
+    name: Sign the macOS binaries (optional)
+    needs: [plan, build-binaries]
+    if: ${{ !cancelled() && needs.build-binaries.result == 'success' && vars.MACOS_SIGNING == 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    environment: ${{ needs.plan.outputs.dry_run != 'true' && 'release' || '' }}
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.upload.outputs.digest }}
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: /.github/release/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Download
+        uses: ./.github/release/download
+        with:
+          pattern: binaries
+          digests: binaries=${{ needs.build-binaries.outputs.digest }}
+      # The sign script looks the identity up in build.keychain; codesign finds the key through the user search list.
+      - name: Import certificate
+        if: needs.plan.outputs.dry_run != 'true'
+        run: |
+          [ -n "$APPLE_SIGNING_CERTIFICATE" ] || { echo "::error::MACOS_SIGNING is true but environment release has no APPLE_SIGNING_CERTIFICATE."; exit 1; }
+          cert="$RUNNER_TEMP/cert.p12"
+          keychain_password=$(openssl rand -base64 32)
+          printf '%s' "$APPLE_SIGNING_CERTIFICATE" | base64 --decode > "$cert"
+          security create-keychain -p "$keychain_password" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$keychain_password" build.keychain
+          security import "$cert" -k build.keychain -P "" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" build.keychain > /dev/null
+          # shellcheck disable=SC2046 # one keychain path per word
+          security list-keychains -d user -s build.keychain $(security list-keychains -d user | tr -d '"')
+          rm -f "$cert"
+        env:
+          APPLE_SIGNING_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE }}
+      - name: Sign
+        run: bash .github/release/sign-macos.sh "$RUNNER_TEMP/in/binaries" "$RUNNER_TEMP/signed"
+        env:
+          BROWSE_VERSION: ${{ needs.plan.outputs.version }}
+          BROWSE_DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+      - id: upload
+        name: Upload
+        uses: ./.github/release/upload
+        with:
+          name: binaries-signed
+          path: ${{ runner.temp }}/signed
+      - name: Delete keychain
+        if: always() && needs.plan.outputs.dry_run != 'true'
+        run: |
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security delete-keychain build.keychain || true
+
+  # ---- Attest and publish: only .github/release/ is checked out; artifacts are data ---------------------------------
+
+  # Build provenance for the zip and every tarball (the signed macOS ones too, when sign-macos ran). No secrets; id-token
+  # only for Sigstore.
+  attest:
+    name: Attest build provenance
+    needs: [plan, build, build-binaries, sign-macos]
+    # Explicit: on dev runs tag is skipped, and the implicit success() would skip everything downstream of it.
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success' && needs.build-binaries.result == 'success'
+      && (needs.sign-macos.result == 'success' || needs.sign-macos.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.upload.outputs.digest }}
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: /.github/release/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Download
+        uses: ./.github/release/download
+        with:
+          pattern: "{build,binaries,binaries-signed}"
+          digests: >-
+            build=${{ needs.build.outputs.digest }} binaries=${{ needs.build-binaries.outputs.digest }}
+            binaries-signed=${{ needs.sign-macos.outputs.digest }}
+      # Every file the artifacts list, by the checksums verify-artifacts.sh just checked; a signed macOS tarball replaces
+      # the unsigned one of the same name, which is never published.
+      - name: Subjects
+        run: |
+          sums=()
+          for name in binaries-signed binaries build; do
+            if [ -f "$RUNNER_TEMP/in/$name/SHA256SUMS" ]; then sums+=("$RUNNER_TEMP/in/$name/SHA256SUMS"); fi
+          done
+          awk '!seen[substr($0, 67)]++' "${sums[@]}" > "$RUNNER_TEMP/subjects.txt"
+          cat "$RUNNER_TEMP/subjects.txt"
+      - id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/subjects.txt
+      - name: Keep the attestation bundle with the release
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: mkdir -p "$RUNNER_TEMP/attestation" && cp "$BUNDLE" "$RUNNER_TEMP/attestation/attestation.sigstore.json"
+      - id: upload
+        name: Upload
+        uses: ./.github/release/upload
+        with:
+          name: attestation
+          path: ${{ runner.temp }}/attestation
+
+  # Every channel: the extension zip and the CLI binaries to Anomaly's release service. Dev publishes from every push
+  # to dev; stable from a dispatch on dev; a check run prints the same list as a dry run. The job's OIDC token is the
+  # only credential; the service checks it against registry/browse.json (workflow, refs/heads/dev, environment release).
+  publish-release-service:
+    name: Publish to the release service
+    needs: [plan, build, build-binaries, sign-macos, attest]
+    if: >-
+      ${{ !cancelled() && needs.attest.result == 'success'
+      && (needs.sign-macos.result == 'success' || needs.sign-macos.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ needs.plan.outputs.dry_run != 'true' && 'release' || '' }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: /.github/release/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Download
+        uses: ./.github/release/download
+        with:
+          pattern: "{build,binaries,binaries-signed}"
+          digests: >-
+            build=${{ needs.build.outputs.digest }} binaries=${{ needs.build-binaries.outputs.digest }}
+            binaries-signed=${{ needs.sign-macos.outputs.digest }}
+      - name: Publish
+        run: |
+          signed=()
+          if [ "$SIGN_MACOS" = success ]; then signed=("$RUNNER_TEMP/in/binaries-signed"); fi
+          bash .github/release/publish-release-service.sh "$RUNNER_TEMP/in/build" "$RUNNER_TEMP/in/binaries" "${signed[@]}"
+        env:
+          SIGN_MACOS: ${{ needs.sign-macos.result }}
+          GH_TOKEN: ${{ github.token }}
+          BROWSE_VERSION: ${{ needs.plan.outputs.version }}
+          BROWSE_CHANNEL: ${{ needs.plan.outputs.channel }}
+          BROWSE_DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+          NOTES_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+
+  # After the release service has the extension zip the dev package fetches. A check run publishes with --dry-run and
+  # no environment. The platform packages @opencode/browse-<target> first, then @opencode/browse.
+  publish-npm:
+    name: Publish to npm
+    needs: [plan, build, build-binaries, sign-macos, attest, publish-release-service]
+    if: >-
+      ${{ !cancelled() && needs.attest.result == 'success'
+      && needs.publish-release-service.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ needs.plan.outputs.dry_run != 'true' && 'release' || '' }}
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing and provenance
+      attestations: read
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: /.github/release/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24 # npm 11.5.1+ for trusted publishing
+          package-manager-cache: false
+      - name: Download
+        uses: ./.github/release/download
+        with:
+          pattern: "{build,binaries,binaries-signed}"
+          digests: >-
+            build=${{ needs.build.outputs.digest }} binaries=${{ needs.build-binaries.outputs.digest }}
+            binaries-signed=${{ needs.sign-macos.outputs.digest }}
+      - name: Publish
+        run: |
+          signed=()
+          if [ "$SIGN_MACOS" = success ]; then signed=("$RUNNER_TEMP/in/binaries-signed"); fi
+          bash .github/release/publish-npm.sh "$RUNNER_TEMP/in/build" "$RUNNER_TEMP/in/binaries" "${signed[@]}"
+        env:
+          SIGN_MACOS: ${{ needs.sign-macos.result }}
+          GH_TOKEN: ${{ github.token }}
+          BROWSE_VERSION: ${{ needs.plan.outputs.version }}
+          BROWSE_NPM_TAG: ${{ needs.plan.outputs.npm_tag }}
+          BROWSE_DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+
+  # Stable (and check, as a dry run): every store upload is reviewed, too slow for a build per push, so dev builds
+  # never go to the store.
+  publish-cws:
+    name: Publish to the Chrome Web Store
+    needs: [plan, build, attest]
+    if: ${{ !cancelled() && needs.plan.outputs.channel == 'latest' && needs.attest.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: ${{ needs.plan.outputs.dry_run != 'true' && 'release' || '' }}
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: /.github/release/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Download
+        uses: ./.github/release/download
+        with:
+          pattern: build
+          digests: build=${{ needs.build.outputs.digest }}
+      - name: Upload and submit for review
+        run: bash .github/release/publish-cws.sh "$RUNNER_TEMP/in/build"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BROWSE_VERSION: ${{ needs.plan.outputs.version }}
+          BROWSE_DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+          CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+          CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+          CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+          CWS_PUBLISHER_ID: ${{ vars.CWS_PUBLISHER_ID }}
+          CWS_ITEM_ID: ${{ vars.CWS_ITEM_ID }}
+
+  # Once npm and the store both have the version: the GitHub release on the tag the tag job pushed.
+  publish-github-release:
+    name: GitHub release
+    needs: [plan, build, attest, publish-npm, publish-cws]
+    if: ${{ !cancelled() && needs.plan.outputs.channel == 'latest' && needs.publish-npm.result == 'success' && needs.publish-cws.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: ${{ needs.plan.outputs.dry_run != 'true' && 'release' || '' }}
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: /.github/release/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Download
+        uses: ./.github/release/download
+        with:
+          pattern: "{build,attestation}"
+          digests: build=${{ needs.build.outputs.digest }} attestation=${{ needs.attest.outputs.digest }}
+      - name: Publish
+        run: bash .github/release/publish-github-release.sh "$RUNNER_TEMP/in/build" "$RUNNER_TEMP/in/attestation"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BROWSE_VERSION: ${{ needs.plan.outputs.version }}
+          BROWSE_DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+          BROWSE_RELEASE_NOTES: ${{ inputs.release_notes }}
+
+  # Brings the release commit back to dev, so dev builds count up from the new version: pushed straight to dev with the
+  # release deploy key (the dev ruleset admits it besides admins), replayed on the newest dev if dev moved. Git only.
+  push-release-to-dev:
+    name: Release commit to dev
+    needs: [plan, tag, publish-github-release]
+    if: ${{ !cancelled() && needs.plan.outputs.mode == 'stable' && needs.publish-github-release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          ssh-key: ${{ secrets.RELEASE_TAG_KEY }}
+      - name: Push
+        run: bash .github/release/push-release-to-dev.sh "$SHA"
+        env:
+          BROWSE_VERSION: ${{ needs.plan.outputs.version }}
+          SHA: ${{ needs.tag.outputs.sha }}

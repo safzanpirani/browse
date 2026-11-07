@@ -1,14 +1,13 @@
-import { fileURLToPath } from "node:url"
 import { NodeHttpClient } from "@effect/platform-node"
 import { Context, Effect, Layer, Match, Redacted, Schema } from "effect"
-import * as AuthenticatedOriginInternal from "./authenticated-origin.ts"
-import * as RelayClient from "./relay-client.ts"
-import * as RelayLifecycle from "./relay-lifecycle.ts"
+import * as AuthenticatedOriginInternal from "./auth/authenticated-origin.ts"
+import * as RelayClient from "./relay/client.ts"
+import * as RelayLifecycle from "./relay/lifecycle.ts"
 import type {
   AuthenticatedJsonMethod,
   AuthenticatedJsonOutcome,
   SessionSummary,
-} from "./relay-schema.ts"
+} from "./relay/schema.ts"
 
 export type Json = Schema.Schema.Type<typeof Schema.Json>
 
@@ -117,7 +116,7 @@ export interface AuthenticatedOriginCapability {
 
 export type AuthenticatedOrigin = AuthenticatedOriginCapability
 
-/** Reveal a sensitive response using OpenCode Browser's Effect runtime. */
+/** Reveal a sensitive response using browse's Effect runtime. */
 export const reveal = <A>(value: Redacted.Redacted<A>): A => Redacted.value(value)
 
 export interface AuthenticatedOriginOptions {
@@ -188,7 +187,7 @@ export const make = Effect.fn("OpenCodeBrowserClient.make")(function* (options: 
   const readiness = yield* RelayLifecycle.ensureRelay({
     relay,
     // The consumer may run under Bun; the relay is a Node application.
-    start: RelayLifecycle.startManagedRelay(fileURLToPath(import.meta.url), "node", []),
+    start: RelayLifecycle.startManagedRelay(undefined, "node", []),
   }).pipe(Effect.mapError((error) => clientError("connect", error)))
   if (readiness.buildProblem) {
     return yield* new ClientError({
@@ -253,30 +252,30 @@ export function origin(originUrl: string, options: OriginClientOptions): OriginC
       Effect.flatMap((cap) => cap.json(request as JsonOptions<Schema.Top> & { readonly sensitive?: false })),
     )) as AuthenticatedOriginCapability["json"]
 
+  const callJson = async <T = unknown>(
+    method: "GET" | "POST",
+    path: `/${string}`,
+    callOptions?: { readonly headers?: Readonly<Record<string, string>>; readonly timeoutMs?: number },
+    body?: Json,
+  ): Promise<T> => {
+    const cap = await resolveOrigin()
+    return (await Effect.runPromise(cap.json({
+      path,
+      method,
+      ...(body === undefined ? {} : { body }),
+      ...(callOptions?.headers ? { headers: callOptions.headers } : {}),
+      ...(callOptions?.timeoutMs === undefined ? {} : { timeoutMs: callOptions.timeoutMs }),
+      response: Schema.Json,
+    }))) as T
+  }
+
   return {
     origin: normalizedOrigin,
     session: options.session,
-    get: async <T = unknown>(path: `/${string}`, callOptions?: { readonly headers?: Readonly<Record<string, string>>; readonly timeoutMs?: number }) => {
-      const cap = await resolveOrigin()
-      return (await Effect.runPromise(cap.json({
-        path,
-        method: "GET",
-        ...(callOptions?.headers ? { headers: callOptions.headers } : {}),
-        ...(callOptions?.timeoutMs === undefined ? {} : { timeoutMs: callOptions.timeoutMs }),
-        response: Schema.Json,
-      }))) as T
-    },
-    post: async <T = unknown>(path: `/${string}`, body?: Json, callOptions?: { readonly headers?: Readonly<Record<string, string>>; readonly timeoutMs?: number }) => {
-      const cap = await resolveOrigin()
-      return (await Effect.runPromise(cap.json({
-        path,
-        method: "POST",
-        ...(body === undefined ? {} : { body }),
-        ...(callOptions?.headers ? { headers: callOptions.headers } : {}),
-        ...(callOptions?.timeoutMs === undefined ? {} : { timeoutMs: callOptions.timeoutMs }),
-        response: Schema.Json,
-      }))) as T
-    },
+    get: <T = unknown>(path: `/${string}`, callOptions?: { readonly headers?: Readonly<Record<string, string>>; readonly timeoutMs?: number }) =>
+      callJson<T>("GET", path, callOptions),
+    post: <T = unknown>(path: `/${string}`, body?: Json, callOptions?: { readonly headers?: Readonly<Record<string, string>>; readonly timeoutMs?: number }) =>
+      callJson<T>("POST", path, callOptions, body),
     json,
   }
 }
@@ -364,7 +363,7 @@ function decodeOutcome<S extends Schema.Top>(
     Success: (outcome) => {
       if (request.sensitive === true) {
         return Schema.decodeUnknownEffect(Schema.RedactedFromValue(request.response, {
-          label: "OpenCode Browser authenticated response",
+          label: "browse authenticated response",
           disallowEncode: true,
         }))(outcome.value).pipe(
           Effect.mapError(() => mutation
@@ -436,7 +435,7 @@ function clientError(reason: ClientError["reason"], error: unknown): ClientError
     })
   }
   return new ClientError({
-    message: error instanceof globalThis.Error ? error.message : "OpenCode Browser request failed",
+    message: error instanceof globalThis.Error ? error.message : "browse request failed",
     reason,
   })
 }

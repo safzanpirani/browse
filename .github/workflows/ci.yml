@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [dev]
   pull_request:
 
 permissions:
@@ -59,6 +60,23 @@ jobs:
       - name: Test (cli)
         run: bun run test
         working-directory: cli
+
+      # The store zip and npm tarball the release workflow would build, with its artifact checks (permission allowlist,
+      # no key, pairing code, source maps or test hooks), so a problem shows up on the PR rather than at release time.
+      - name: Release artifacts check
+        run: bun run release:check
+
+      # The release builds a binary per platform (cli/script/compile.ts); this host's one shows a compile break early.
+      - name: Compile and pack the linux-x64 binary
+        working-directory: cli
+        run: |
+          bun script/compile.ts linux-x64
+          ./dist-bin/browse-linux-x64/bin/browse --version
+          bun script/pack.ts
+
+      # The scripts the release jobs that hold secrets run (.github/release/); shellcheck comes with the runner image.
+      - name: Shellcheck release scripts
+        run: shellcheck -x .github/release/*.sh
 
   browser:
     name: Execute sandbox in headless Chromium (optional)

@@ -1,10 +1,10 @@
 # Chrome Web Store listing
 
-Copy these into the developer dashboard. Upload `release/opencode-browser-<version>.zip` from `bun run package`.
+Copy these into the developer dashboard. The release workflow uploads `opencode-browser-<version>.zip` (see RELEASING.md); `bun run package` builds the same zip locally.
 
 ## Store listing
 
-**Name:** OpenCode Browser
+**Name:** browse
 
 **Summary (132 chars max):**
 Let your OpenCode agents use your browser: open and drive tabs, take screenshots, and hand logins back to you.
@@ -12,14 +12,14 @@ Let your OpenCode agents use your browser: open and drive tabs, take screenshots
 **Category:** Developer Tools
 
 **Description:**
-OpenCode Browser lets OpenCode, the open source AI coding agent running on your computer, use your real browser through its browse tools.
+browse lets OpenCode, the open source AI coding agent running on your computer, use your real browser through its browse tools.
 
 - Agents open their own tabs in the background of your window, grouped at the start of your tab strip and collapsed so they stay out of your way. Prefer a separate window, one shared group or no groups? Choose it on the status page. Idle agent tabs close by themselves after 10 minutes, or the time you set.
 - Want an agent to use a tab you have open? Click the toolbar button on it. Click again to take it back, even while the agent is working.
 - Hand off when it's your turn: logins, 2FA, passkeys, and payments stay with you, then the agent continues.
 - Agents use Playwright, take screenshots, capture network traffic, and record the tab when you ask. Recordings show only the page.
 
-Requires OpenCode on your computer and the OpenCode Browser CLI from https://github.com/anomalyco/browse: clone it and run `bun run setup` once to add the browse tools, then paste the code from `node cli/dist/cli.mjs pair` on the extension's status page. The extension only obeys the relay that knows that code.
+Requires OpenCode on your computer. Install browse once with `curl -fsSL https://opencode.ai/browse/install | bash` (or `npx @opencode/browse install` with Node.js 22.19 or newer): it adds the browse tools to OpenCode and pairs them with this extension (or run `browse pair`, or `npx @opencode/browse pair` after an npx install, and enter the one-time code on the extension's status page). The relay then gives this browser a key of its own, and the extension only obeys the relay that holds it.
 
 Everything stays between your browser and the OpenCode tools on your computer. The extension has no server of its own.
 

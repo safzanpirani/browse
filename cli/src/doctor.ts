@@ -1,10 +1,10 @@
 import { Effect, FileSystem, Path, Schema } from "effect"
-import * as RelayClient from "./relay-client.ts"
-import { relayBuildDrift, relayBuildProblem } from "./relay-lifecycle.ts"
-import type { ExtensionStatus, RelayVersion, SessionSummary, TargetSummary } from "./relay-schema.ts"
-import { extensionProtocolVersion } from "./protocol.ts"
-import { cliCommand, installCommand, STORE_LISTED } from "./paths.ts"
-import * as SessionStore from "./session-store.ts"
+import * as RelayClient from "./relay/client.ts"
+import { relayBuildDrift, relayBuildProblem } from "./relay/lifecycle.ts"
+import type { ExtensionStatus, RelayVersion, SessionSummary, TargetSummary } from "./relay/schema.ts"
+import { extensionProtocolAdvice, extensionProtocolVersion } from "./protocol.ts"
+import { binaryPackage, cacheRoot, cliCommand, compiledBinary, configRoot, dataRoot, devExtension, fromCheckout, installCommand, stateRoot } from "./paths.ts"
+import * as SessionStore from "./session-manager/store.ts"
 import type { UpdateJson } from "./update.ts"
 import { opencodeBrowserBuildId, opencodeBrowserVersion } from "./version.ts"
 
@@ -24,10 +24,12 @@ const PackageMetadata = Schema.Struct({
   bin: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
 })
 
-const ManifestVersion = Schema.Struct({
-  version: Schema.String,
-})
-const bundledExtensionManifestPath = "extension/manifest.json"
+/** The manifest version of the extension built with this CLI version (scripts/version.ts): 1.2.4-dev.42 is 1.2.4.42. */
+function extensionManifestVersion(version: string) {
+  const match = /^(\d+\.\d+\.\d+)(?:-dev\.(\d+)(?:\.\d+)?)?/.exec(version)
+  if (!match) return version
+  return match[2] ? `${match[1]}.${match[2]}` : match[1]!
+}
 
 type PackageInfo = {
   readonly name: string
@@ -55,6 +57,12 @@ export type DoctorCheck = {
 export type DoctorReport = {
   readonly status: DoctorCheckStatus
   readonly endpoint: string
+  readonly paths: {
+    readonly config: string
+    readonly data: string
+    readonly state: string
+    readonly cache: string
+  }
   readonly cli: {
     readonly version: string
     readonly buildId: string
@@ -150,32 +158,33 @@ export const createDoctorReport = Effect.fn("Doctor.createReport")(function* (op
       ),
     )
 
-  const readPackageInfo: Effect.Effect<PackageInfo, Error> = readJsonFile("package.json", PackageMetadata).pipe(
+  // A binary carries no package.json or dist/: it is the package, and the artifact.
+  const compiled = compiledBinary()
+  const readPackageInfo: Effect.Effect<PackageInfo, Error> = compiled
+    ? Effect.succeed({ name: binaryPackage() ?? "@opencode/browse", version: opencodeBrowserVersion, bin: { opencodeBrowser: process.execPath } })
+    : readJsonFile("package.json", PackageMetadata).pipe(
     Effect.map((metadata) => ({
       name: metadata.name,
       version: metadata.version,
       bin: {
-        opencodeBrowser: metadata.bin?.["opencode-browser"] ?? null,
+        opencodeBrowser: metadata.bin?.browse ?? null,
       },
     })),
   )
 
-  const readManifestVersion = (relativePath: string): Effect.Effect<string, Error> =>
-    readJsonFile(relativePath, ManifestVersion).pipe(Effect.map((manifest) => manifest.version))
 
   const fileExists = (relativePath: string): Effect.Effect<boolean> =>
     fs.exists(path.join(options.packageRoot, relativePath)).pipe(
       Effect.orElseSucceed(() => false),
     )
 
-  const [packageResult, bundledManifestVersion, distCliExists, distMcpExists, extensionDistManifestExists, currentResult] = yield* Effect.all([
+  const [packageResult, distCliExists, currentResult] = yield* Effect.all([
     probe(readPackageInfo),
-    probe(readManifestVersion(bundledExtensionManifestPath)),
     fileExists("dist/cli.mjs"),
-    fileExists("dist/cli.mjs"),
-    fileExists(bundledExtensionManifestPath),
     probe(store.read),
   ])
+  // The extension comes from the store (or a checkout's dist/), not this package: compare it with this CLI's version.
+  const expectedExtensionVersion: ProbeResult<string> = packageResult.ok ? { ok: true, value: extensionManifestVersion(packageResult.value.version) } : packageResult
   const relayResult = yield* probe(relay.version)
   const relayBuildMatches = relayResult.ok
     ? relayResult.value.buildId
@@ -194,7 +203,7 @@ export const createDoctorReport = Effect.fn("Doctor.createReport")(function* (op
       { ok: false, error: relayResult.error } satisfies ProbeResult<readonly TargetSummary[]>,
       { ok: false, error: relayResult.error } satisfies ProbeResult<readonly SessionSummary[]>,
     ]
-  const expectedVersion = bundledManifestVersion.ok ? bundledManifestVersion.value : null
+  const expectedVersion = expectedExtensionVersion.ok ? expectedExtensionVersion.value : null
   const extensionVersion = extensionResult.ok ? extensionResult.value.version : null
   const extensionVersionMatches = extensionResult.ok && extensionVersion && expectedVersion ? extensionVersion === expectedVersion : null
   const current = currentResult.ok ? currentResult.value ?? null : null
@@ -212,19 +221,14 @@ export const createDoctorReport = Effect.fn("Doctor.createReport")(function* (op
   const possibleLeakedSessions = sessions.filter((session) => {
     return session.connected && session.id !== current
   })
-  const artifacts: readonly DoctorArtifact[] = [
-    { path: "dist/cli.mjs", exists: distCliExists && distMcpExists },
-    {
-      path: bundledExtensionManifestPath,
-      exists: extensionDistManifestExists,
-      ...(bundledManifestVersion.ok ? { version: bundledManifestVersion.value } : {}),
-    },
-  ]
+  const artifacts: readonly DoctorArtifact[] = compiled
+    ? [{ path: process.execPath, exists: true, version: opencodeBrowserVersion }]
+    : [{ path: "dist/cli.mjs", exists: distCliExists }]
   const checks = buildDoctorChecks({
     packageResult,
     relayResult,
     extensionResult,
-    bundledManifestVersion,
+    expectedExtensionVersion,
     artifacts,
     currentResult,
     staleCurrent,
@@ -238,6 +242,12 @@ export const createDoctorReport = Effect.fn("Doctor.createReport")(function* (op
   const report: DoctorReport = {
     status: summarizeCheckStatus(checks),
     endpoint: relay.endpoint,
+    paths: {
+      config: configRoot(),
+      data: dataRoot(),
+      state: stateRoot(),
+      cache: cacheRoot(),
+    },
     cli: { version: opencodeBrowserVersion, buildId: opencodeBrowserBuildId },
     package: {
       path: path.join(options.packageRoot, "package.json"),
@@ -303,7 +313,7 @@ function buildDoctorChecks(options: {
   readonly packageResult: ProbeResult<PackageInfo>
   readonly relayResult: ProbeResult<RelayVersion>
   readonly extensionResult: ProbeResult<ExtensionStatus>
-  readonly bundledManifestVersion: ProbeResult<string>
+  readonly expectedExtensionVersion: ProbeResult<string>
   readonly artifacts: readonly DoctorArtifact[]
   readonly currentResult: ProbeResult<string | undefined>
   readonly staleCurrent: boolean
@@ -318,7 +328,7 @@ function buildDoctorChecks(options: {
     ? [
       {
         id: "bin-opencode-browser",
-        label: "opencode-browser bin",
+        label: "browse bin",
         status: options.packageResult.value.bin.opencodeBrowser ? "ok" : "fail",
         message: options.packageResult.value.bin.opencodeBrowser ?? "missing from package.json bin",
       },
@@ -355,7 +365,7 @@ function buildDoctorChecks(options: {
     },
     extensionVersionCheck({
       extensionResult: options.extensionResult,
-      bundledManifestVersion: options.bundledManifestVersion,
+      expectedExtensionVersion: options.expectedExtensionVersion,
     }),
     extensionProtocolCheck(options.extensionResult),
     ...(options.extensionResult.ok && options.extensionResult.value.rejectedConnections !== undefined ? [{
@@ -366,7 +376,10 @@ function buildDoctorChecks(options: {
         ? `${options.extensionResult.value.rejectedConnections} connection attempt(s) rejected; the active browser connection was preserved`
         : "none observed on this connection",
     }] : []),
-    ...(options.extensionResult.ok && options.extensionResult.value.pairingFailures !== undefined ? [{
+    ...(options.extensionResult.ok && options.extensionResult.value.pairingState ? [{
+      id: "extension-pairing", label: "extension pairing", status: options.extensionResult.value.connected ? "ok" as const : "warn" as const,
+      message: options.extensionResult.value.pairingState,
+    }] : options.extensionResult.ok && options.extensionResult.value.pairingFailures !== undefined ? [{
       id: "extension-pairing",
       label: "extension pairing",
       status: options.extensionResult.value.pairingFailures > 0 && !options.extensionResult.value.connected ? "warn" as const : "ok" as const,
@@ -439,7 +452,7 @@ const makeDoctorCheck = (id: string, label: string) => (status: DoctorCheckStatu
   message,
 })
 
-export function unhealthyTargetsCheck(options: {
+function unhealthyTargetsCheck(options: {
   readonly targetsResult: ProbeResult<readonly TargetSummary[]>
   readonly unhealthyTargets: readonly TargetSummary[]
 }): DoctorCheck {
@@ -475,7 +488,7 @@ export function relayBuildCheck(options: {
 
 function extensionVersionCheck(options: {
   readonly extensionResult: ProbeResult<ExtensionStatus>
-  readonly bundledManifestVersion: ProbeResult<string>
+  readonly expectedExtensionVersion: ProbeResult<string>
 }): DoctorCheck {
   const check = makeDoctorCheck("extension-version", "extension version")
   if (!options.extensionResult.ok) {
@@ -484,8 +497,8 @@ function extensionVersionCheck(options: {
   if (!options.extensionResult.value.connected) {
     return check("warn", "extension disconnected; cannot compare runtime version")
   }
-  if (!options.bundledManifestVersion.ok) {
-    return check("warn", `could not read ${bundledExtensionManifestPath}: ${options.bundledManifestVersion.error}`)
+  if (!options.expectedExtensionVersion.ok) {
+    return check("warn", `could not read this CLI's version: ${options.expectedExtensionVersion.error}`)
   }
   const runtimeVersion = options.extensionResult.value.version
   if (!runtimeVersion) {
@@ -493,13 +506,13 @@ function extensionVersionCheck(options: {
   }
   return check(
     "ok",
-    runtimeVersion === options.bundledManifestVersion.value
-      ? `matches bundled extension (${options.bundledManifestVersion.value})`
-      : `runtime ${runtimeVersion} differs from bundled ${options.bundledManifestVersion.value}; protocol compatibility determines support`,
+    runtimeVersion === options.expectedExtensionVersion.value
+      ? `matches this CLI (${options.expectedExtensionVersion.value})`
+      : `extension ${runtimeVersion} differs from this CLI's ${options.expectedExtensionVersion.value}; protocol compatibility determines support`,
   )
 }
 
-export function extensionProtocolCheck(extensionResult: ProbeResult<ExtensionStatus>): DoctorCheck {
+function extensionProtocolCheck(extensionResult: ProbeResult<ExtensionStatus>): DoctorCheck {
   const check = makeDoctorCheck("extension-protocol", "extension protocol")
   if (!extensionResult.ok) {
     return check("warn", extensionResult.error)
@@ -534,17 +547,17 @@ function buildDoctorRecommendations(options: {
     ? [relayBuildProblem(options.relayResult.value)].filter((message) => message !== undefined)
     : []
   const extensionRecommendations = options.relayResult.ok && options.extensionResult.ok && !options.extensionResult.value.connected
-    ? options.extensionResult.value.protocolCompatible === false
-      ? ["Update the OpenCode Browser extension or npm package so their extension protocols are compatible."]
-      : [STORE_LISTED
-        ? `Run \`${installCommand()}\`, and install OpenCode Browser from the Chrome Web Store (or load the unpacked extension it copies).`
-        : `Run \`${installCommand()}\` and load the extension it points to (Load unpacked on your browser's extensions page).`]
+    ? options.extensionResult.value.nextStep ? [options.extensionResult.value.nextStep] : options.extensionResult.value.protocolCompatible === false
+      ? [extensionProtocolAdvice(options.extensionResult.value.protocolVersion, { install: installCommand() })]
+      : [fromCheckout() || devExtension()
+        ? `Run \`${installCommand()}\` and load the extension it points to (Load unpacked on your browser's extensions page).`
+        : `Run \`${installCommand()}\`, and install browse from the Chrome Web Store page it opens.`]
     : []
   const artifactRecommendations = options.artifacts.some((artifact) => {
     return !artifact.exists
   }) ? [`Rebuild or reinstall the missing files with \`${installCommand()}\`.`] : []
   const connectionConflictRecommendations = options.extensionResult.ok && (options.extensionResult.value.rejectedConnections ?? 0) > 0
-    ? ["Keep OpenCode Browser enabled in one browser/profile. To switch, disable it in the current browser before connecting the other; new sessions do not change the active browser."]
+    ? ["Keep browse enabled in one browser/profile. To switch, disable it in the current browser before connecting the other; new sessions do not change the active browser."]
     : []
   const staleSessionRecommendations = options.staleCurrent && options.current ? [
     `Current session ${options.current} is stale; run \`${cliCommand("session new")}\` or \`${cliCommand("session use <id>")}\` after the relay is running.`,
@@ -580,9 +593,10 @@ function summarizeCheckStatus(checks: readonly DoctorCheck[]): DoctorCheckStatus
 
 export function formatDoctorReport(report: DoctorReport): string {
   const lines: string[] = [
-    "OpenCode Browser doctor",
+    "browse doctor",
     `Status: ${report.status}`,
     `Endpoint: ${report.endpoint}`,
+    `Paths: config=${report.paths.config} data=${report.paths.data} state=${report.paths.state} cache=${report.paths.cache}`,
     `CLI: ${report.cli.version} (${report.cli.buildId})`,
     `Package: ${report.package.name && report.package.version ? `${report.package.name} ${report.package.version}` : report.package.error ?? "unknown"}`,
     `Relay: ${report.relay.reachable ? `reachable (${report.relay.version ?? "unknown"}, ${report.relay.buildId ?? "unknown build"})` : `unreachable (${report.relay.error ?? "unknown error"})`}`,
@@ -625,7 +639,7 @@ function formatExtensionSummary(report: DoctorReport): string {
   const protocol = report.extension.protocolVersion === null
     ? ""
     : `, protocol ${report.extension.protocolVersion} ${report.extension.protocolCompatible === false ? "incompatible" : "compatible"}`
-  const match = report.extension.versionMatches === null ? "" : report.extension.versionMatches ? ", matches bundled version" : ", differs from bundled version"
+  const match = report.extension.versionMatches === null ? "" : report.extension.versionMatches ? ", matches the CLI's version" : ", differs from the CLI's version"
   return `${report.extension.connected ? "connected" : "disconnected"}${version}${protocol}${match}`
 }
 

@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { relayBuildCheck } from "../src/doctor.ts"
-import type * as RelayClient from "../src/relay-client.ts"
-import { ensureRelay, relayBuildDrift, relayBuildProblem } from "../src/relay-lifecycle.ts"
-import type { RelayVersion } from "../src/relay-schema.ts"
+import type * as RelayClient from "../src/relay/client.ts"
+import { ensureRelay, relayBuildDrift, relayBuildProblem } from "../src/relay/lifecycle.ts"
+import type { RelayVersion } from "../src/relay/schema.ts"
 
 const relayBuild = "2026-10-21T17:00:00.000Z"
 const cliBuild = "2026-10-23T02:00:00.000Z"

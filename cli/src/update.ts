@@ -2,14 +2,19 @@
 //   update          fast-forwards the clone to the remote branch it tracks and reruns setup's steps (bun install,
 //                   build, install). It refuses, saying what to do, when the clone has local changes, has diverged,
 //                   isn't on a tracking branch, or can't reach the remote, and does nothing when it's up to date.
+//                   When the tracked branch is gone from the remote (browse's `main` became `dev`), it follows the
+//                   remote's default branch instead and points the local branch's upstream there.
 //   update check    asks the remote for its branch head (`git ls-remote`, never a fetch), at most every 6 hours,
-//                   cached in the data root. `status`, `doctor`, the MCP server and the extension's status page show
+//                   cached in the cache root. `status`, `doctor`, the MCP server and the extension's status page show
 //                   its notice. It never blocks startup and fails silently. OPENCODE_BROWSER_UPDATE_CHECK=0 turns it off.
-// The published npm package has no clone; `update` prints how to update it with npx instead.
+// An installed binary or npm global install (`browse install`) reruns the installer (auto-update.ts); `update` installs
+// the newest version on its channel now, and the notice shows a newer version in "notify" mode. npx is a no-op.
 import { execFile, spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs"
 import path from "node:path"
-import { checkoutRoot, cliCommand, dataRoot } from "./paths.ts"
+import { autoUpdateStatus, installedRuntime, updateAvailable } from "./update/auto-update.ts"
+import { cacheRoot, checkoutRoot, cliCommand, compiledBinary } from "./paths.ts"
+import { unpackedReloadAdvice } from "./protocol.ts"
 
 /** How long a check result stands before the remote is asked again. */
 export const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
@@ -22,7 +27,7 @@ export type UpdateCheck = {
   readonly checkedAt: number
   /** HEAD when checked: after an update (or any checkout) the result no longer applies. */
   readonly head: string
-  /** The tracked remote branch, e.g. origin/main. */
+  /** The tracked remote branch, e.g. origin/dev (or the remote's default branch, when the tracked one is gone). */
   readonly upstream: string
   /** The remote branch's head; absent when the remote couldn't be asked. */
   readonly latest?: string
@@ -57,15 +62,31 @@ export const gitIn = (repo: string): Git => (args, timeoutMs = 5_000) =>
 
 const short = (sha: string) => sha.slice(0, 7)
 
+/** The remote's default branch (`refs/heads/dev` for browse), from `git ls-remote --symref <remote> HEAD`. */
+async function defaultBranch(remote: string, git: Git) {
+  return parseDefaultBranch(await git(["ls-remote", "--symref", remote, "HEAD"], 10_000))
+}
+
+const parseDefaultBranch = (listed: string | undefined) => /^ref: (refs\/heads\/\S+)\s+HEAD$/m.exec(listed ?? "")?.[1]
+
 /** Asks the remote for the head of the branch HEAD tracks; undefined when there's nothing to compare with. */
 export async function checkForUpdate(repo: string, git: Git = gitIn(repo), now = Date.now()): Promise<UpdateCheck | undefined> {
   const [head, branch] = await Promise.all([git(["rev-parse", "HEAD"]), git(["symbolic-ref", "--short", "-q", "HEAD"])])
   if (!head || !branch) return undefined
   const [remote, merge] = await Promise.all([git(["config", `branch.${branch}.remote`]), git(["config", `branch.${branch}.merge`])])
   if (!remote || !merge || remote === ".") return undefined
-  const upstream = `${remote}/${merge.replace(/^refs\/heads\//, "")}`
+  let upstream = `${remote}/${merge.replace(/^refs\/heads\//, "")}`
+  let listed = await git(["ls-remote", remote, merge], 10_000)
+  // The remote answered but no longer has the branch (main renamed to dev): compare with its default branch.
+  if (listed === "") {
+    const fallback = await defaultBranch(remote, git)
+    if (fallback && fallback !== merge) {
+      upstream = `${remote}/${fallback.replace(/^refs\/heads\//, "")}`
+      listed = await git(["ls-remote", remote, fallback], 10_000)
+    }
+  }
   const base = { repo, checkedAt: now, head, upstream }
-  const latest = (await git(["ls-remote", remote, merge], 10_000))?.split(/\s/)[0]
+  const latest = listed?.split(/\s/)[0]
   if (!latest || !/^[0-9a-f]{40,64}$/.test(latest)) return { ...base, available: false, failed: true }
   if (latest === head) return { ...base, latest, available: false }
   // Known locally (fetched before): it may be behind HEAD (unpushed local commits), and the gap can be counted.
@@ -162,13 +183,33 @@ export function formatUpdateNotice(notice: Pick<UpdateNotice, "summary" | "comma
  */
 export async function updateNotice(options: { readonly repo?: string; readonly dataDir?: string; readonly git?: Git } = {}): Promise<UpdateNotice | undefined> {
   try {
+    if (!options.repo) {
+      const npm = npmUpdateNotice()
+      if (npm !== false) return npm
+    }
     const repo = options.repo ?? checkoutRoot()
     if (!repo || !updateCheckEnabled() || !existsSync(path.join(repo, ".git"))) return undefined
-    const check = await cachedUpdateCheck({ repo, dataDir: options.dataDir ?? dataRoot(), ...(options.git ? { git: options.git } : {}) })
+    const check = await cachedUpdateCheck({ repo, dataDir: options.dataDir ?? cacheRoot(), ...(options.git ? { git: options.git } : {}) })
     return check?.available ? { summary: describeUpdate(check), command: cliCommand("update"), check } : undefined
   } catch {
     return undefined
   }
+}
+
+/**
+ * An installed binary or npm global install's notice, from what the relay's last daily check found: shown when a newer
+ * version waits and auto-update won't install it by itself (notify mode, or its last attempt failed). false when this
+ * isn't such an install.
+ */
+export function npmUpdateNotice(): UpdateNotice | undefined | false {
+  const runtime = installedRuntime()
+  if (!runtime) return false
+  const status = autoUpdateStatus({ runtime })
+  const latest = status.latest
+  if (!latest || !updateAvailable(status) || status.effective === "off") return undefined
+  if (status.effective === "on" && !status.lastError) return undefined
+  const check: UpdateCheck = { repo: "npm", checkedAt: Date.now(), head: runtime.version, upstream: `npm ${status.channel ?? "latest"}`, latest, available: true }
+  return { summary: `browse ${latest} is available (you have ${runtime.version})`, command: cliCommand("update"), check }
 }
 
 /**
@@ -276,7 +317,7 @@ function installArgs(args: readonly string[]) {
   return [...passed, "--no-wait"]
 }
 
-/** `opencode-browser update`: returns the exit code. */
+/** `browse update`: returns the exit code. */
 export function runUpdate(args: readonly string[], deps: UpdateDeps): number {
   const { log } = deps
   const refuse = (problem: string, fix: string) => {
@@ -286,8 +327,8 @@ export function runUpdate(args: readonly string[], deps: UpdateDeps): number {
   }
   const repo = deps.repo
   if (!repo) {
-    log("OpenCode Browser was installed from npm. Update it with:")
-    log("  npx opencode-browser-cli@latest install")
+    log("browse was installed from npm. Update it with:")
+    log("  npx @opencode/browse@latest install")
     log("then restart opencode.")
     return 0
   }
@@ -304,12 +345,12 @@ export function runUpdate(args: readonly string[], deps: UpdateDeps): number {
   const branch = git(["symbolic-ref", "--short", "-q", "HEAD"]).stdout
   const head = git(["rev-parse", "HEAD"]).stdout
   if (!branch)
-    return refuse(`${repo} isn't on a branch (HEAD is detached at ${short(head)}).`, `Check out the branch to follow, e.g. \`git -C ${at} checkout main\`, then run this again.`)
-  const upstream = git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).stdout
+    return refuse(`${repo} isn't on a branch (HEAD is detached at ${short(head)}).`, `Check out the branch to follow, e.g. \`git -C ${at} checkout dev\`, then run this again.`)
+  let upstream = git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).stdout
   const remote = git(["config", `branch.${branch}.remote`]).stdout
-  const merge = git(["config", `branch.${branch}.merge`]).stdout
+  let merge = git(["config", `branch.${branch}.merge`]).stdout
   if (!upstream || !remote || !merge || remote === ".")
-    return refuse(`branch ${branch} doesn't track a remote branch.`, `Set one, e.g. \`git -C ${at} branch --set-upstream-to origin/main\`, then run this again.`)
+    return refuse(`branch ${branch} doesn't track a remote branch.`, `Set one, e.g. \`git -C ${at} branch --set-upstream-to origin/dev\`, then run this again.`)
 
   // Tracked files only, staged or not: untracked ones (the pairing code, builds) never stop a fast-forward.
   const changes = git(["diff", "--name-only", "HEAD"]).stdout
@@ -319,6 +360,19 @@ export function runUpdate(args: readonly string[], deps: UpdateDeps): number {
       `${repo} has uncommitted changes (${files.slice(0, 5).join(", ")}${files.length > 5 ? `, and ${files.length - 5} more` : ""}).`,
       `Commit or stash them (\`git -C ${at} stash\`), then run this again.`,
     )
+  }
+
+  // The tracked branch is gone from a reachable remote (browse's main became dev): follow the remote's default branch,
+  // and track it from now on so later checks and updates ask for it directly.
+  if (git(["ls-remote", "--exit-code", remote, merge], 30_000).status === 2) {
+    const fallback = parseDefaultBranch(git(["ls-remote", "--symref", remote, "HEAD"], 30_000).stdout)
+    if (fallback && fallback !== merge) {
+      const gone = upstream
+      merge = fallback
+      upstream = `${remote}/${fallback.replace(/^refs\/heads\//, "")}`
+      git(["config", `branch.${branch}.merge`, merge])
+      log(`${gone} is gone from the remote; following ${upstream}, its default branch, from now on.`)
+    }
   }
 
   const fetched = git(["fetch", "--quiet", remote, merge], 120_000)
@@ -333,6 +387,7 @@ export function runUpdate(args: readonly string[], deps: UpdateDeps): number {
   if (!latest) return refuse(`couldn't read ${upstream} after fetching.`, `Run \`git -C ${at} pull --ff-only\` to see why.`)
   if (latest === head || git(["merge-base", "--is-ancestor", latest, "HEAD"]).status === 0) {
     log(`✓ Already up to date: ${short(head)} on ${branch} (${upstream}).`)
+    log(`  If your unpacked extension still reports an older protocol: ${unpackedReloadAdvice}`)
     return 0
   }
   if (git(["merge-base", "--is-ancestor", "HEAD", latest]).status !== 0) {
@@ -371,15 +426,23 @@ export function runUpdate(args: readonly string[], deps: UpdateDeps): number {
   return 0
 }
 
-/** `opencode-browser update [--check]`. */
+/** `browse update [--check]`. */
 export async function runUpdateCommand(args: readonly string[]) {
   const log = (line: string) => process.stdout.write(line + "\n")
+  const { runInstalledUpdate } = await import("./update/runtime-update.ts")
+  if (await runInstalledUpdate(args)) return
+  // An executable that `install` hasn't set up (one downloaded and run in place) has nothing to update.
+  if (compiledBinary()) {
+    log(`This browse isn't installed. Run \`${cliCommand("install")}\` to set it up; it updates itself from then on.`)
+    process.exitCode = 1
+    return
+  }
   if (args.includes("--check")) {
     const repo = checkoutRoot()
-    if (!repo) return log("Installed from npm: run `npx opencode-browser-cli@latest install` to update.")
+    if (!repo) return log("Installed from npm: run `npx @opencode/browse@latest install` to update.")
     // Ask the remote now, whatever the cache says.
     const check = await checkForUpdate(repo)
-    if (check) writeCache(path.join(dataRoot(), CACHE_FILE), check)
+    if (check) writeCache(path.join(cacheRoot(), CACHE_FILE), check)
     if (!check) return log("Can't check: this clone isn't on a branch that tracks a remote.")
     if (check.failed) return log(`Can't check: ${check.upstream} couldn't be reached.`)
     return log(check.available ? formatUpdateNotice({ summary: describeUpdate(check), command: cliCommand("update") }) : `✓ Up to date with ${check.upstream}.`)

@@ -1,59 +1,22 @@
 import { beforeEach, describe, expect, test } from "bun:test"
-import { pairingProof, randomNonce } from "../../src/background/pairing"
 import { installChrome, settle, type StubEvent } from "../chrome-stub"
+import { installFakeRelaySocket } from "../relay-stub"
 
-// The status page's Grouping setting (agent-relay.ts group, agent-groups.ts): one group per session (the default), one
-// shared "Agents · N" group for every agent, or none; with popups, handoffs, the toolbar's kill switch (the relay
+// The status page's Grouping setting (agent-relay.ts group, agent-groups.ts): one shared "Agents · N" group for every
+// agent (the default), one group per session, or none; with popups, handoffs, the toolbar's kill switch (the relay
 // detaching a tab) and both window modes. Also the relay-side settings the extension sends (cursor, human input) and
 // the environment overrides the relay reports back, and the relay's settings tool reading and writing them
 // (settings.get / settings.set). Run by ../isolated.test.ts in a process of its own.
 
 const stub = installChrome()
 ;(globalThis as { __OPENCODE_BROWSER_BUILD__?: string }).__OPENCODE_BROWSER_BUILD__ = "test"
-const CODE = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+/** This browser's token for the relay, as a code exchange left it. */
+const TOKEN = "test-token-0123456789abcdefghijklmnopqrstuv"
 const PORT = 19908
 const MARKER = "\u2063"
-type Message = { id?: number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: unknown }
+const socket = installFakeRelaySocket({ port: PORT, token: TOKEN })
 
-/** The relay's side of the link: answers the pairing handshake, records what the extension sends. */
-class FakeRelaySocket {
-  static readonly CONNECTING = 0
-  static readonly OPEN = 1
-  static readonly CLOSING = 2
-  static readonly CLOSED = 3
-  static current: FakeRelaySocket | undefined
-  readonly received: Message[] = []
-  readyState = FakeRelaySocket.CONNECTING
-  onopen: ((event: unknown) => void) | null = null
-  onmessage: ((event: { data: string }) => void) | null = null
-  onclose: ((event: unknown) => void) | null = null
-  constructor(readonly url: string) {
-    FakeRelaySocket.current = this
-    setTimeout(() => {
-      this.readyState = FakeRelaySocket.OPEN
-      this.onopen?.({})
-    }, 0)
-  }
-  send(data: string) {
-    const message = JSON.parse(data) as Message
-    this.received.push(message)
-    if (message.method === "hello") void this.challenge(String((message.params?.pairing as { nonce: string }).nonce))
-  }
-  private async challenge(extensionNonce: string) {
-    const nonce = randomNonce()
-    this.deliver({ method: "auth.challenge", params: { nonce, proof: await pairingProof(CODE, "relay", PORT, nonce, extensionNonce) } })
-  }
-  deliver(message: Message) {
-    this.onmessage?.({ data: JSON.stringify(message) })
-  }
-  close() {}
-}
-
-globalThis.fetch = (async (input: string | URL) =>
-  String(input).endsWith("/relay-pairing.json") ? Response.json({ code: CODE }) : new Response("not found", { status: 404 })) as typeof fetch
-;(globalThis as { WebSocket: unknown }).WebSocket = FakeRelaySocket
-
-await stub.chrome.storage.local.set({ agentRelayPort: PORT })
+await stub.chrome.storage.local.set({ agentRelayPort: PORT, agentRelayTokens: { [`127.0.0.1:${PORT}`]: TOKEN } })
 const { createAgentRelay } = await import("../../src/background/agent-relay")
 const { TabCleanup } = await import("../../src/background/tab-cleanup")
 const relay = createAgentRelay({ changed: () => {}, badgesChanged: () => {} })
@@ -63,7 +26,6 @@ async function until(check: () => boolean | Promise<boolean>) {
   expect(await check()).toBe(true)
 }
 const event = (path: string) => path.split(".").reduce<any>((value, key) => value[key], stub.chrome) as StubEvent
-const socket = () => FakeRelaySocket.current!
 let nextCommand = 1
 async function command(method: string, params: Record<string, unknown>) {
   const id = nextCommand++
@@ -108,23 +70,85 @@ beforeEach(async () => {
 
 await until(() => relay.state().status === "connected")
 
-describe("grouping: one group per session (default)", () => {
+describe("grouping: one group per session", () => {
+  beforeEach(() => stub.chrome.storage.local.set({ agentTabsGrouping: "session" }))
   test("each session gets its own collapsed group named after it", async () => {
     const { user, userTab } = await userWindow()
     const first = await agentTab("github")
     const second = await agentTab("linear")
     const again = await agentTab("github")
+    const auto = await agentTab("oc-ses_123abc")
     expect(first.groupId).not.toBe(second.groupId)
     expect(again.groupId).toBe(first.groupId)
     expect(group(first.groupId)).toMatchObject({ windowId: user.id, title: `github${MARKER}`, collapsed: true })
     expect(group(second.groupId)).toMatchObject({ windowId: user.id, title: `linear${MARKER}`, collapsed: true })
+    expect(group(auto.groupId)).toMatchObject({ windowId: user.id, title: `Agent · example.com${MARKER}`, collapsed: true })
     expect(tab(userTab).active).toBe(true)
+  })
+
+  test("a separate popup window joins the session without creating or replacing its tab group", async () => {
+    const { user } = await userWindow()
+    const opener = await agentTab("reports")
+    const window = await stub.chrome.windows.create({ type: "popup", url: "https://popup.example/", focused: true })
+    const tabId = window.tabs[0]!.id
+    event("webNavigation.onCreatedNavigationTarget").emit({ sourceTabId: opener.tabId, tabId })
+    await until(() => opened().length === 1)
+    // Root attachment asks the extension to group the popup just like any other new session page.
+    await command("debugger.attach", { tabId })
+    expect(await command("tabs.group", { tabId, sessionId: "reports" })).toEqual({ groupId: -1 })
+    expect(tab(tabId).groupId).toBe(-1)
+    const next = await stub.chrome.tabs.create({ windowId: user.id, url: "about:blank", active: false })
+    expect(await command("tabs.group", { tabId: next.id, sessionId: "reports" })).toEqual({ groupId: opener.groupId })
+    expect(stub.state.groups.size).toBe(1)
+  })
+
+  test("ping calls chrome.runtime.getPlatformInfo to keep the MV3 service worker awake without logging noise", async () => {
+    let platformCalls = 0
+    const orig = stub.chrome.runtime.getPlatformInfo
+    stub.chrome.runtime.getPlatformInfo = async () => {
+      platformCalls += 1
+      return orig()
+    }
+    try {
+      expect(await command("ping", {})).toEqual({})
+      expect(platformCalls).toBe(1)
+      expect(await relay.diagnostics()).not.toContain("method=ping")
+    } finally {
+      stub.chrome.runtime.getPlatformInfo = orig
+    }
   })
 })
 
-describe("grouping: one shared group for all agents", () => {
+describe("grouping across a service worker restart", () => {
+  beforeEach(() => stub.chrome.storage.local.set({ agentTabsGrouping: "session" }))
+  test("a session whose group the worker forgot keeps using the group its tab is in, and remembers it", async () => {
+    const { user } = await userWindow()
+    // A tab already in a session group, as after a restart: the relay re-announces it, then groups it.
+    const tabId = ((await command("tabs.create", { url: "https://example.com/", active: false })) as { tabId: number }).tabId
+    const kept = await stub.chrome.tabs.group({ tabIds: [tabId] })
+    await stub.chrome.tabGroups.update(kept, { title: `restarted${MARKER}` })
+    await command("debugger.attach", { tabId })
+    expect(((await command("tabs.group", { tabId, sessionId: "restarted" })) as { groupId: number }).groupId).toBe(kept)
+    // The session's next tab joins it instead of making a second group.
+    const next = await agentTab("restarted")
+    expect(next.groupId).toBe(kept)
+    expect(group(kept)).toMatchObject({ windowId: user.id, title: `restarted${MARKER}` })
+    expect(((await stub.chrome.storage.local.get("agentSessionGroups")).agentSessionGroups as Record<string, number>).restarted).toBe(kept)
+  })
+
+  test("an agent tab stays tracked for idle cleanup while its agent keeps sending commands", async () => {
+    await userWindow()
+    const { tabId } = await agentTab("busy")
+    // Every CDP command touches the tab; the tracked list still reaches storage at once.
+    await until(async () => {
+      TabCleanup.touch(tabId)
+      return String(tabId) in (((await stub.chrome.storage.local.get("tabCleanup")).tabCleanup ?? {}) as Record<string, unknown>)
+    })
+  })
+})
+
+describe("grouping: one shared group for all agents (default)", () => {
   test("two sessions share one collapsed group that counts its tabs", async () => {
-    await stub.chrome.storage.local.set({ agentTabsGrouping: "shared" })
     const { user, userTab } = await userWindow()
     const first = await agentTab("github")
     const second = await agentTab("linear")
@@ -181,6 +205,7 @@ describe("grouping: one shared group for all agents", () => {
   })
 
   test("switching modes leaves existing tabs in their groups; new tabs follow the new mode", async () => {
+    await stub.chrome.storage.local.set({ agentTabsGrouping: "session" })
     await userWindow()
     const before = await agentTab("github")
     await stub.chrome.storage.local.set({ agentTabsGrouping: "shared" })
@@ -238,6 +263,7 @@ describe("grouping: none", () => {
   })
 
   test("a tab still in a session group from before keeps it", async () => {
+    await stub.chrome.storage.local.set({ agentTabsGrouping: "session" })
     await userWindow()
     const before = await agentTab("github")
     await stub.chrome.storage.local.set({ agentTabsGrouping: "none" })
@@ -268,8 +294,7 @@ describe("relay settings", () => {
     await command("relay.settings", { overrides: { humanInput: "off" } })
     expect(relay.state().overrides).toEqual({ humanInput: "off" })
     const first = socket()
-    first.readyState = FakeRelaySocket.CLOSED
-    first.onclose?.({ code: 1006, reason: "", wasClean: false })
+    first.drop()
     expect(relay.state().overrides).toBeUndefined()
     relay.reconnect()
     await until(() => socket() !== first && relay.state().status === "connected")
@@ -287,7 +312,7 @@ describe("the relay's settings tool", () => {
 
   test("settings.get reads every setting, defaults for what was never set", async () => {
     expect(await command("settings.get", {})).toEqual({
-      settings: { window: "current", grouping: "session", idleMinutes: 10, cursor: "off", humanInput: "on", handoffNotifications: "recording" },
+      settings: { window: "current", grouping: "shared", idleMinutes: 10, cursor: "off", humanInput: "on", handoffNotifications: "recording" },
     })
   })
 
@@ -315,6 +340,6 @@ describe("the relay's settings tool", () => {
       expect(socket().received.find((message) => message.id === id)!.error).toBeDefined()
     }
     expect(pageSaw).toEqual([])
-    expect((await command("settings.get", {})).settings).toMatchObject({ grouping: "session" })
+    expect((await command("settings.get", {})).settings).toMatchObject({ grouping: "shared" })
   })
 })
