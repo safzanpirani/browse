@@ -184,9 +184,9 @@ ${table}
   \`--profile\`.
 - To add a profile: load browse there (the same unpacked \`dist/\` folder, or the store build), run \`${NAME} pair\`,
   enter the code on its Options page, and set its **Name for agents**.
-- From another machine (ampere): the relay's HTTP API and CDP answer on 127.0.0.1 only. Browsers on other computers can
-  pair with a relay (\`${NAME} set hostname 0.0.0.0\`, \`${NAME} install --remote\`), but agents can't call one remotely,
-  and one browser connects to one relay.
+- From another machine (ampere): the relay's HTTP API and CDP answer on 127.0.0.1 only, so ampere reaches this relay
+  through one ssh tunnel on the same port (skill \`browse-remote\`, \`mac-relays.sh up\`). One browser connects to one
+  relay, so every profile pairs with this Mac's relay.
 
 ### Find the tab first
 
