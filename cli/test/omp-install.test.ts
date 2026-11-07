@@ -119,7 +119,8 @@ describe("skill", () => {
     const cliDir = path.join(import.meta.dir, "..", "src", "cli")
     const cli = fs.readdirSync(cliDir).map((file) => fs.readFileSync(path.join(cliDir, file), "utf8")).join("\n")
     const main = fs.readFileSync(path.join(import.meta.dir, "..", "src", "main.ts"), "utf8")
-    const commands = skill.split("\n").filter((line) => /^browse [a-z]/.test(line))
+    // Command lines in code blocks; prose also starts sentences with "browse".
+    const commands = skill.split(/^```.*$/m).filter((_, index) => index % 2 === 1).flatMap((block) => block.split("\n")).filter((line) => /^browse [a-z]/.test(line))
     expect(commands.length).toBeGreaterThan(20)
     for (const line of commands) {
       const words = line.replace(/\s+#.*$/, "").split(/\s+/)

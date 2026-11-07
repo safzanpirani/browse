@@ -248,7 +248,7 @@ describe("tool output schemas", () => {
     const setting = { value: "shared", effective: "shared", allowed: ["shared", "window"], description: "Grouping" }
     const settings = Object.fromEntries(agentSettingKeys.map((key) => [key, setting]))
     const relay = {
-      settingsGet: Effect.succeed({
+      settingsGet: () => Effect.succeed({
         settings: { ...settings, autoUpdate: { ...setting, allowed: ["on", "notify", "off"] } },
         note: "read",
       }),
