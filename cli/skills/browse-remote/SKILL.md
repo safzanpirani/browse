@@ -31,7 +31,8 @@ session journals stay on the Mac.
 
 ## What `browse` is here
 
-`~/.local/bin/browse` runs `~/apps/browse/cli/dist/cli.mjs` with ampere's node and always sets:
+`~/.local/bin/browse` first runs `mac-relays.sh check`, which refuses (and sends no token) unless 127.0.0.1:19988 is
+the ssh tunnel `up` started, then runs `~/apps/browse/cli/dist/cli.mjs` with ampere's node and always sets:
 
 - `OPENCODE_BROWSER_AUTOSTART=false`: with the tunnel down, a call fails ("Automatic relay startup is disabled")
   instead of starting a local relay that holds 19988 and later breaks the tunnel.
@@ -53,10 +54,10 @@ and `stop-mac` below run the relay ones there).
 when the dependencies changed, then points the `~/apps/browse/cli` symlink at it; it also copies the relay token from
 the Mac's `~/.local/share/browse/relay-token` and rewrites the launcher and this skill. It installs the Mac's
 `~/.agents/skills/browse` here too, with a note on this host; a browse skill here that `sync` didn't write is left
-alone. One sync runs at a time (`~/apps/browse/.sync.lock`). Run it after every rebuild or install on the Mac; the
-first sync after this script changed runs the old copy, so run it twice then.
+alone. One sync runs at a time (`~/apps/browse/.sync.lock`). Run it after every rebuild or install on the Mac.
 
-First time on a new host (the skill isn't there yet):
+When this script changed, the first `sync` runs the old copy. Bootstrap from the Mac's checkout instead, as on a new
+host (an install from the per-profile layout needs this once: its script reads the token from the old data folder):
 
 ```bash
 ssh mac 'cat ~/Development/projects/browse/cli/skills/browse-remote/scripts/mac-relays.sh' > /tmp/mac-relays.sh
@@ -78,7 +79,8 @@ in its place.
 ## Failure modes
 
 - **HTTP 401**: `~/.opencode-browser-mac/relay-token` is missing or stale (the Mac's was regenerated). Run `sync`.
-- **`Automatic relay startup is disabled`** or `ECONNREFUSED`: the tunnel is down. Run `up`.
+- **`isn't the Mac tunnel`** (from the launcher), **`Automatic relay startup is disabled`** or `ECONNREFUSED`: the
+  tunnel is down. Run `up`.
 - **ssh tunnel dies at once**: ampere multiplexes `mac`, so `up` passes `ControlPath=none` and binds `127.0.0.1`.
   Cancel a stray multiplexed forward with `ssh -O cancel -L 127.0.0.1:19988:127.0.0.1:19988 mac`.
 - **`No current window`**: Chrome on the Mac has no window. Ask Safzan to open one.

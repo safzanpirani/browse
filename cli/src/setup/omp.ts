@@ -180,8 +180,8 @@ ${table}
   don't persist between calls. Without it a new session uses the default browser (the first that connected).
 - A session stays in its browser. \`--profile\` on a session from another browser fails with "Session … belongs to
   browser …": start a new session instead.
-- A tab id (\`--tab-id\`, \`--target-url\` on a session) already belongs to one browser, so \`session adopt\` needs no
-  \`--profile\`.
+- \`session adopt --tab-id\` into a new session needs the tab's \`--profile\` (\`${NAME} find\` prints the full command);
+  without it the new session belongs to the default browser and a tab from another browser is refused.
 - To add a profile: load browse there (the same unpacked \`dist/\` folder, or the store build), run \`${NAME} pair\`,
   enter the code on its Options page, and set its **Name for agents**.
 - From another machine (ampere): the relay's HTTP API and CDP answer on 127.0.0.1 only, so ampere reaches this relay

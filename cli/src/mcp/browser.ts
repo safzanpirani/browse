@@ -1,4 +1,5 @@
 import { Effect } from "effect"
+import { selectedBrowser } from "../browser-profile.ts"
 import { autoUpdateStatus } from "../update/auto-update.ts"
 import { getObject } from "../relay/helpers.ts"
 import * as RelayLifecycle from "../relay/lifecycle.ts"
@@ -93,7 +94,7 @@ registerMcpTools({
       handle: (input) => {
         const set = getObject(input)?.set
         if (set === undefined) {
-          return ctx.relay.settingsGet().pipe(Effect.map((result) => ({ ...result, settings: agentSettings(result.settings) })))
+          return ctx.relay.settingsGet(selectedBrowser()).pipe(Effect.map((result) => ({ ...result, settings: agentSettings(result.settings) })))
         }
         const changes = getObject(set)
         if (!changes) {
@@ -104,7 +105,7 @@ registerMcpTools({
             "autoUpdate can't be read or changed from MCP. The user can change it with `browse settings set autoUpdate=...` or the extension's options page; `status` reports the current value.",
           ))
         }
-        return ctx.relay.settingsSet(changes).pipe(Effect.map((result) => ({ ...result, settings: agentSettings(result.settings) })))
+        return ctx.relay.settingsSet(changes, selectedBrowser()).pipe(Effect.map((result) => ({ ...result, settings: agentSettings(result.settings) })))
       },
     },
   ],

@@ -57,8 +57,8 @@ authenticated browser state rather than reproducing a login in a fresh page.
 One relay drives every paired browser (each Chrome profile with browse counts as
 one). `status` lists them by id; a new session opens its tabs in the default
 browser unless you name one (MCP: `browser` on `session_new` or `execute`; CLI:
-`--profile <id>`), and a session stays in its browser. A tab id from `status`
-already belongs to one browser, so adopting it needs no browser.
+`--profile <id>`), and a session stays in its browser. Adopting another
+browser's tab into a new session needs that browser named too.
 
 ## Inspect, act, verify
 

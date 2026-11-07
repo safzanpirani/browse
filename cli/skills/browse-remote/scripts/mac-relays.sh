@@ -9,6 +9,7 @@
 #   mac-relays.sh start-mac   # start (or restart) the relay on the Mac with the Mac's browse
 #   mac-relays.sh stop-mac    # stop the Mac's relay (drained; tabs stay)
 #   mac-relays.sh down
+#   mac-relays.sh check       # quiet unless 127.0.0.1:<port> isn't this script's tunnel (the launcher's guard)
 #
 # The relay token is sent only to the tunnel this script started and confirmed (the ssh client's own socket).
 # Overrides: BROWSE_MAC_HOST (mac), BROWSE_PORT (19988, the relay port on both hosts), BROWSE_MAC_LAUNCHER (the Mac's
@@ -103,9 +104,10 @@ stop() {
 # fails the pipeline.)
 listens() { [[ $(ss -Hltnp "sport = :$1" 2>/dev/null) == *"pid=$2,"* ]]; }
 
-# curl with the relay token as a header read from stdin, so it never shows in argv.
+# curl with the relay token as a header read from stdin, so it never shows in argv. `-q` (first) skips ~/.curlrc and
+# --noproxy keeps proxy variables from routing the token anywhere but the tunnel.
 authed_curl() {
-  printf 'header = "Authorization: Bearer %s"\n' "$(<"$home/relay-token")" | curl -s -K - "$@"
+  printf 'header = "Authorization: Bearer %s"\n' "$(<"$home/relay-token")" | curl -q --noproxy '*' -s -K - "$@"
 }
 
 case "${1:-status}" in
@@ -189,6 +191,8 @@ export OPENCODE_BROWSER_PORT=$port
 export OPENCODE_BROWSER_UPDATE_CHECK=0
 # Commands the CLI prints (next steps, hints) start with this name.
 export OPENCODE_BROWSER_COMMAND=browse
+# The CLI sends the relay token on every call, so it runs only while 127.0.0.1:$port is this script's own tunnel.
+BROWSE_PORT=$port $(shq "$skill/scripts/mac-relays.sh") check || exit 1
 exec $(shq "$(command -v node)") $(shq "$live/dist/cli.mjs") "\$@"
 EOF
       chmod 755 "$launcher.tmp" && mv "$launcher.tmp" "$launcher" || die "cannot install $launcher"
@@ -246,6 +250,11 @@ EOF
     stop
     echo "mac relay tunnel closed"
     ;;
+  check)
+    # Quiet unless it fails: the launcher's guard before any call that carries the token.
+    pid="$(owned)" && listens "$port" "$pid" \
+      || die "browse: 127.0.0.1:$port isn't the Mac tunnel; run \`$skill/scripts/mac-relays.sh up\` (no token sent)"
+    ;;
   status)
     pid="$(owned)" && echo "ssh tunnel: pid $pid (127.0.0.1:$port → $mac:$port)" || { echo "ssh tunnel: not running"; exit 0; }
     [[ -s $home/relay-token ]] || die "no relay token at $home/relay-token; run \`$0 sync\`"
@@ -262,5 +271,5 @@ EOF
     # `relay stop` drains the relay that answers on the port with this install's token; it never kills another process.
     on_mac "OPENCODE_BROWSER_PORT=$port $mac_launcher relay stop" 2>&1 || die "stop-mac failed"
     ;;
-  *) echo "usage: mac-relays.sh sync | up | down | status | start-mac | stop-mac" >&2; exit 2 ;;
+  *) echo "usage: mac-relays.sh sync | up | down | status | check | start-mac | stop-mac" >&2; exit 2 ;;
 esac

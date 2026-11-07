@@ -134,10 +134,10 @@ function nextStep(browser: FoundBrowser, tab: FoundTab, query: string, taken: Se
   const tabName = tab.tabId === undefined ? "this tab" : `tab ${tab.tabId}`
   if (tab.session) {
     const session = `--session ${quoted(tab.session)}`
-    if (tab.sessionDefault) return { next: cliCommand(`execute ${session} 'return page.url()'`) }
-    if (unique) return { next: cliCommand(`execute ${session} --target-url ${quoted(tab.url)} 'return page.url()'`) }
+    if (tab.sessionDefault) return { next: cliCommand(`${prefix} execute ${session} 'return page.url()'`) }
+    if (unique) return { next: cliCommand(`${prefix} execute ${session} --target-url ${quoted(tab.url)} 'return page.url()'`) }
     return {
-      next: cliCommand(`execute ${session} 'return context.pages().map((p) => p.url())'`),
+      next: cliCommand(`${prefix} execute ${session} 'return context.pages().map((p) => p.url())'`),
       note: `${tabName} isn't session ${tab.session}'s default page, and another attached tab contains its URL, so no selector names it alone: --session drives the default page (or opens one). Pick it from context.pages().`,
     }
   }

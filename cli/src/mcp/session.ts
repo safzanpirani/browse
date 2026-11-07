@@ -204,11 +204,14 @@ registerMcpTools({
         Effect.gen(function* () {
           const args = yield* Effect.try(() => parseAdoptArguments(input))
           const sessionId = args.session ?? ctx.currentSession.id
+          // A session this call creates belongs to the MCP server's browser (`browse --profile <p> mcp`).
+          const browser = args.session ? undefined : selectedBrowser()
           const result = yield* ctx.relay.sessionAdopt({
             sessionId,
             createIfMissing: !args.session,
             ...(args.targetSelection ? { targetSelection: args.targetSelection } : {}),
             ...(args.tabId === undefined ? {} : { tabId: args.tabId }),
+            ...(browser ? { browser } : {}),
           })
           ctx.establishCurrentSession(sessionId)
           return result
