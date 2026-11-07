@@ -12,8 +12,10 @@ the driving API (sessions, execute, adoption, handoffs, the browser table); this
 
 ## Quick start
 
-The tunnel normally runs as the systemd user service `browse-mac-tunnel` (`mac-relays.sh service install`), which
-brings it back after a reboot or a dropped connection within about 10 s. Check it before driving:
+The tunnel normally runs as the systemd user service `browse-mac-tunnel` (`mac-relays.sh service install`; needs
+`socat`). A socat listener holds 127.0.0.1:19988 for the whole run and an ssh client behind it forwards to the Mac,
+reconnecting 5 s after a drop, so no other program can take the port in the gap; while ssh is down the launcher
+refuses to run. The service also comes back after a reboot. Check it before driving:
 
 ```bash
 ~/.agents/skills/browse-remote/scripts/mac-relays.sh status   # tunnel process, then the relay's /extension/status
@@ -93,5 +95,5 @@ in its place.
 - **`status` starts with `Setup: not installed`**: expected here, nothing is installed on ampere but the CLI copy.
   Don't run `install`.
 
-Log and pid: `~/.opencode-browser-mac/mac-relays/` (`ssh.log` for a manual `up`, `ssh.pid` for both); the service logs
-to the journal.
+Log and pids: `~/.opencode-browser-mac/mac-relays/` (`run.pid`, `listener.pid`, `ssh.pid`, the forwarded
+`relay.sock`, and `ssh.log` for a manual `up`); the service logs to the journal.

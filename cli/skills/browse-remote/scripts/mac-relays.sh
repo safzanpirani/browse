@@ -79,22 +79,28 @@ start_time() {
   read -ra fields <<<"${stat##*) }"
   [[ ${fields[0]} != Z ]] && printf '%s' "${fields[19]}"
 }
-# Records the ssh process this script started as "<pid> <start time> <port>" in $state/ssh.pid.
+# The tunnel is three processes, each recorded as "<pid> <start time> <port>" in $state/<name>.pid:
+#   run       this script's `run` loop (the systemd service's main process, or a manual `up`'s background job)
+#   listener  socat on 127.0.0.1:<port>, held for the whole run, forwarding each connection to $sock
+#   ssh       the current ssh client, which forwards $sock to the Mac's 127.0.0.1:<port>; `run` restarts it
+# The listener never closes while ssh reconnects, so no other program can take the port in that gap and receive the
+# relay token. A connection made while ssh is down reaches no relay and is closed.
+sock="$state/relay.sock"
 record() {
   local started
-  started="$(start_time "$1")" || return 1
-  printf '%s %s %s\n' "$1" "$started" "$port" > "$state/ssh.pid"
+  started="$(start_time "$2")" || return 1
+  printf '%s %s %s\n' "$2" "$started" "$port" > "$state/$1.pid"
 }
-# Prints the recorded pid while it is still that process, tunnelling this port; fails (and signals nothing) otherwise.
+# Prints <name>'s recorded pid while it is still that process for this port; fails (and signals nothing) otherwise.
 owned() {
   local pid started recorded_port
-  [[ -s $state/ssh.pid ]] && read -r pid started recorded_port < "$state/ssh.pid" || return 1
+  [[ -s $state/$1.pid ]] && read -r pid started recorded_port < "$state/$1.pid" || return 1
   [[ -n $started && $recorded_port == "$port" && $(start_time "$pid") == "$started" ]] && printf '%s' "$pid"
 }
-# Stops every process this script recorded: the tunnel (ssh.pid, any port) and the per-profile layout's proxy.
+# Stops every process this script recorded (any port), the per-profile layout's proxy included.
 stop() {
   local f pid started
-  for f in ssh proxy; do
+  for f in run listener ssh proxy; do
     if [[ -s $state/$f.pid ]] && read -r pid started _ < "$state/$f.pid" \
       && [[ -n $started && $(start_time "$pid") == "$started" ]]; then
       kill "$pid"
@@ -107,6 +113,12 @@ stop() {
 # Whether <pid> holds the listening socket on 127.0.0.1:<port>. (Not `ss | grep -q`: with pipefail, grep's early exit
 # fails the pipeline.)
 listens() { [[ $(ss -Hltnp "sport = :$1" 2>/dev/null) == *"pid=$2,"* ]]; }
+# The launcher's guard: the port is our listener's own socket, and an ssh client of this run is alive and has
+# authenticated (it creates $sock only then).
+tunnel_ok() {
+  local pid
+  pid="$(owned listener)" && listens "$port" "$pid" && owned ssh >/dev/null && [[ -S $sock ]]
+}
 
 # curl with the relay token as a header read from stdin, so it never shows in argv. `-q` (first) skips ~/.curlrc and
 # --noproxy keeps proxy variables from routing the token anywhere but the tunnel.
@@ -114,23 +126,27 @@ authed_curl() {
   printf 'header = "Authorization: Bearer %s"\n' "$(<"$home/relay-token")" | curl -q --noproxy '*' -s -K - "$@"
 }
 
-# The tunnel's ssh options. 127.0.0.1 in the -L spec (not here): the default also tries ::1, which ampere lacks, and
-# ExitOnForwardFailure then aborts. ControlPath=none: a multiplexed client hands its forward to the shared master and
-# exits, so `down` could not close it.
-ssh_opts=(-N -o ControlPath=none -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
+# The tunnel's ssh options. ControlPath=none: a multiplexed client hands its forward to the shared master and exits, so
+# `down` could not close it. BatchMode: neither the service nor a background `up` can answer a prompt.
+ssh_opts=(-N -o BatchMode=yes -o ControlPath=none -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
 
-# Waits until 127.0.0.1:<port> is the recorded ssh client's own socket; another program holding it never passes. ssh to
-# the Mac has taken 12-45 s to authenticate when the Mac is busy, hence the long deadline. <log command> prints the
-# tunnel's log on failure. Under systemd a dead attempt is retried, so only the deadline fails there.
+# Waits until tunnel_ok; ssh to the Mac has taken 12-45 s to authenticate when the Mac is busy, hence the long deadline.
+# <log command> prints the tunnel's log on failure. Under systemd a dead attempt is retried, so only the deadline fails.
 confirm() {
-  local deadline=$((SECONDS + 120)) pid
-  until pid="$(owned)" && listens "$port" "$pid"; do
-    if [[ ! -e $unit ]] && ! owned >/dev/null; then
-      echo "ssh tunnel failed:" >&2; eval "$1" >&2; stop; exit 1
+  local deadline=$((SECONDS + 120))
+  until tunnel_ok; do
+    if [[ ! -e $unit ]] && ! owned run >/dev/null; then
+      echo "tunnel failed:" >&2; eval "$1" >&2; stop; exit 1
     fi
     (( SECONDS < deadline )) || { echo "tunnel not confirmed within 120 s:" >&2; eval "$1" >&2; [[ -e $unit ]] || stop; exit 1; }
     sleep 0.2
   done
+}
+# A service installed for another port or host would make `up` silently restart that one instead.
+unit_matches() {
+  grep -qxF "Environment=BROWSE_PORT=$port BROWSE_MAC_HOST=$mac" "$unit" \
+    || die "$unit_name was installed for another port or host; run \`$0 service install\` with these settings"
 }
 
 case "${1:-status}" in
@@ -261,28 +277,55 @@ EOF
     ;;
   up)
     if [[ -e $unit ]]; then
+      unit_matches
       systemctl --user restart "$unit_name" || die "cannot restart $unit_name"
       confirm "journalctl --user -u $unit_name -n 20 --no-pager"
     else
       stop
-      nohup ssh "${ssh_opts[@]}" -L "127.0.0.1:$port:127.0.0.1:$port" "$mac" >"$state/ssh.log" 2>&1 &
-      record $! || die "ssh exited at once: $(cat "$state/ssh.log")"
+      nohup bash "$0" run >"$state/ssh.log" 2>&1 &
       confirm "cat $state/ssh.log"
     fi
-    "$0" status
+    bash "$0" status
     ;;
   run)
-    # systemd's ExecStart: record this process, then become the ssh client, so `owned` sees the same pid and start
-    # time and the launcher's guard accepts the tunnel. BatchMode: a service can't answer a prompt.
+    # The service's ExecStart (and a manual `up`'s background job): hold the port with socat for the whole run and
+    # keep an ssh client forwarding $sock to the Mac, reconnecting 5 s after it drops.
+    command -v socat >/dev/null || die "socat is not on PATH"
     stop
-    record $$ || die "cannot record the tunnel pid"
-    exec ssh -o BatchMode=yes "${ssh_opts[@]}" -L "127.0.0.1:$port:127.0.0.1:$port" "$mac"
+    record run $$ || die "cannot record the run pid"
+    rm -f "$sock"
+    children=()
+    trap 'kill "${children[@]}" 2>/dev/null; rm -f "$sock"' EXIT
+    trap 'exit 0' TERM INT
+    socat "TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" "UNIX-CONNECT:$sock" &
+    listener=$!
+    children+=("$listener")
+    record listener "$listener" || die "socat exited at once (another program holds 127.0.0.1:$port?)"
+    for _ in {1..25}; do
+      listens "$port" "$listener" && break
+      kill -0 "$listener" 2>/dev/null || die "socat cannot listen on 127.0.0.1:$port (another program holds it?)"
+      sleep 0.2
+    done
+    listens "$port" "$listener" || die "socat did not bind 127.0.0.1:$port"
+    while kill -0 "$listener" 2>/dev/null; do
+      # A killed ssh can leave its socket behind; removing it means $sock exists only once this ssh has authenticated.
+      rm -f "$sock"
+      ssh "${ssh_opts[@]}" -L "$sock:127.0.0.1:$port" "$mac" &
+      children+=("$!")
+      record ssh "$!"
+      wait "$!"
+      echo "ssh exited ($?); reconnecting in 5 s" >&2
+      sleep 5
+    done
+    die "the listener exited"
     ;;
   service)
     case "${2:-}" in
       install)
         command -v systemctl >/dev/null || die "systemctl is not on PATH"
+        command -v socat >/dev/null || die "socat is not on PATH"
         [[ -x $skill/scripts/mac-relays.sh ]] || die "$skill/scripts/mac-relays.sh is missing; run \`$0 sync\` first"
+        [[ -e $unit ]] && { systemctl --user stop "$unit_name" || die "cannot stop $unit_name"; }
         stop
         mkdir -p "$(dirname "$unit")" || die "cannot create $(dirname "$unit")"
         cat > "$unit.tmp" <<EOF || die "cannot write $unit.tmp"
@@ -304,11 +347,11 @@ EOF
           || die "cannot enable $unit_name"
         confirm "journalctl --user -u $unit_name -n 20 --no-pager"
         echo "✓ $unit_name enabled"
-        "$0" status
+        bash "$0" status
         ;;
       remove)
         if [[ -e $unit ]]; then
-          systemctl --user disable --now "$unit_name"
+          systemctl --user disable --now "$unit_name" || die "cannot stop and disable $unit_name; left it installed"
           rm -f "$unit" && systemctl --user daemon-reload
         fi
         stop
@@ -318,19 +361,22 @@ EOF
     esac
     ;;
   down)
-    if [[ -e $unit ]]; then systemctl --user stop "$unit_name"; fi
+    # A supervised tunnel is stopped through systemd only: killing it directly would just make systemd restart it.
+    if [[ -e $unit ]]; then
+      systemctl --user stop "$unit_name" || die "cannot stop $unit_name; the tunnel may still be up"
+    fi
     stop
-    echo "mac relay tunnel closed"
+    echo "mac relay tunnel closed$([[ -e $unit ]] && echo " (the service starts it again at the next boot or \`up\`)")"
     ;;
   check)
     # Quiet unless it fails: the launcher's guard before any call that carries the token.
-    pid="$(owned)" && listens "$port" "$pid" \
-      || die "browse: 127.0.0.1:$port isn't the Mac tunnel; run \`$skill/scripts/mac-relays.sh up\` (no token sent)"
+    tunnel_ok || die "browse: 127.0.0.1:$port isn't the Mac tunnel; run \`$skill/scripts/mac-relays.sh up\` (no token sent)"
     ;;
   status)
-    pid="$(owned)" && echo "ssh tunnel: pid $pid (127.0.0.1:$port → $mac:$port)" || { echo "ssh tunnel: not running"; exit 0; }
+    run_pid="$(owned run)" || { echo "tunnel: not running"; exit 0; }
+    echo "tunnel: run $run_pid, listener $(owned listener || echo none) on 127.0.0.1:$port, ssh $(owned ssh || echo 'none (reconnecting)') → $mac:$port"
     [[ -s $home/relay-token ]] || die "no relay token at $home/relay-token; run \`$0 sync\`"
-    listens "$port" "$pid" || die "127.0.0.1:$port isn't this tunnel's socket; run \`$0 up\` (no token sent)"
+    tunnel_ok || die "127.0.0.1:$port isn't this tunnel's listener, or ssh is down; no token sent"
     out="$(authed_curl -m 4 -w '\n%{http_code}' "http://127.0.0.1:$port/extension/status")"
     body="${out%$'\n'*}"
     printf 'relay %s: HTTP %s %s\n' "$port" "${out##*$'\n'}" "${body:0:400}"
