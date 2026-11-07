@@ -58,7 +58,7 @@ registerMcpTools({
             ...(allowedOrigins ? { allowedOrigins } : {}),
             ...(browser ? { browser } : {}),
           })
-          ctx.establishCurrentSession(session.id)
+          ctx.establishCurrentSession(session.id, session.browser)
           return { session }
         }),
     },
@@ -122,8 +122,8 @@ registerMcpTools({
       handle: (input) =>
         Effect.gen(function* () {
           const id = yield* Effect.try(() => requiredStringField(input, "id"))
-          yield* ensureSessionExists(ctx.relay, id)
-          ctx.establishCurrentSession(id)
+          const session = yield* ensureSessionExists(ctx.relay, id)
+          ctx.establishCurrentSession(id, session.browser)
           return { currentSession: ctx.currentSession.id }
         }),
     },
@@ -166,6 +166,7 @@ registerMcpTools({
           if (ctx.currentSession.id === id) {
             ctx.currentSession.id = `mcp-${crypto.randomUUID().slice(0, 8)}`
             ctx.currentSession.established = false
+            ctx.currentSession.browser = undefined
           }
           return { ...result, currentSession: ctx.currentSession.id }
         }),
@@ -204,9 +205,9 @@ registerMcpTools({
         Effect.gen(function* () {
           const args = yield* Effect.try(() => parseAdoptArguments(input))
           const sessionId = args.session ?? ctx.currentSession.id
-          // A session this call creates belongs to the MCP server's browser (`browse --profile <p> mcp`); an
-          // established one keeps its own.
-          const browser = args.session || ctx.currentSession.established ? undefined : selectedBrowser()
+          // The implicit session stays in the browser the relay last reported it in; one this server creates (or
+          // recreates after the relay dropped it) gets the server's browser (`browse --profile <p> mcp`).
+          const browser = args.session ? undefined : ctx.currentSession.browser ?? selectedBrowser()
           const result = yield* ctx.relay.sessionAdopt({
             sessionId,
             createIfMissing: !args.session,
@@ -214,7 +215,7 @@ registerMcpTools({
             ...(args.tabId === undefined ? {} : { tabId: args.tabId }),
             ...(browser ? { browser } : {}),
           })
-          ctx.establishCurrentSession(sessionId)
+          ctx.establishCurrentSession(sessionId, result.session.browser)
           return result
         }),
     },

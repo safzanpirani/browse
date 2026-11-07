@@ -53,9 +53,9 @@ registerMcpTools({
         Effect.gen(function* () {
           const args = yield* Effect.try(() => parseExecuteArguments(input))
           const sessionId = args.session ?? ctx.currentSession.id
-          // `browse --profile <browser> mcp` (OPENCODE_BROWSER_PROFILE) is the browser of the session this server
-          // creates; an established session keeps its own browser unless the caller names one.
-          const browser = args.browser ?? (args.session || ctx.currentSession.established ? undefined : selectedBrowser())
+          // The implicit session stays in the browser the relay last reported it in; one this server creates (or
+          // recreates after the relay dropped it) gets the server's browser (`browse --profile <p> mcp`).
+          const browser = args.browser ?? (args.session ? undefined : ctx.currentSession.browser ?? selectedBrowser())
           const connected = RelayLifecycle.ensureExtensionConnected({ relay: ctx.relay, sessionId, waitForReconnect: true })
           yield* connected
           const run = ctx.relay.execute({
@@ -73,7 +73,7 @@ registerMcpTools({
             () => connected.pipe(Effect.andThen(run)),
           ))
           const recreated = !args.session && ctx.currentSession.established && result.session.created === true
-          ctx.establishCurrentSession(sessionId)
+          ctx.establishCurrentSession(sessionId, result.session.browser)
           return {
             ...result,
             ...(recreated

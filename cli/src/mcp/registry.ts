@@ -29,7 +29,8 @@ export type McpToolContext = {
   readonly update: () => UpdateNotice | undefined
   readonly browserProperty: { readonly type: "string"; readonly description: string }
   readonly resolveSessionId: (input: unknown, field?: string) => string
-  readonly establishCurrentSession: (id: string) => void
+  /** Makes `id` the current session; `browser` is the browser the relay reported it in, when the call returned one. */
+  readonly establishCurrentSession: (id: string, browser?: string) => void
 }
 
 type RegisteredMcpGroup = {
@@ -70,9 +71,10 @@ export function createMcpToolContext(options: {
     optionalStringField(input, field) ??
     (field === "id" ? optionalStringField(input, "session") : undefined) ??
     options.currentSession.id
-  const establishCurrentSession = (id: string) => {
+  const establishCurrentSession = (id: string, browser?: string) => {
     options.currentSession.id = id
     options.currentSession.established = true
+    options.currentSession.browser = browser
   }
   return {
     relay: options.relay,

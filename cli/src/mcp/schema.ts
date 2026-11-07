@@ -20,7 +20,8 @@ import {
 import { settingKeys, type SettingKey } from "../relay/user-settings.ts"
 import type { UpdateNotice } from "../update.ts"
 
-export type CurrentSession = { id: string; established: boolean }
+/** The MCP server's implicit session; `browser` is the browser the relay last reported it in, when known. */
+export type CurrentSession = { id: string; established: boolean; browser?: string | undefined }
 
 export type ExecuteArguments = {
   readonly code: string
@@ -285,14 +286,14 @@ export function executeToolResult(value: unknown): McpSchema.CallToolResult {
   })
 }
 
+/** The session's summary; fails when the relay has no such session. */
 export const ensureSessionExists = Effect.fnUntraced(function* (relay: RelayClient.Interface, id: string) {
   const sessions = yield* relay.sessions
-  const exists = sessions.some((session) => {
-    return session.id === id
-  })
-  if (!exists) {
+  const session = sessions.find((candidate) => candidate.id === id)
+  if (!session) {
     return yield* Effect.fail(new Error(`Session not found: ${id}`))
   }
+  return session
 })
 
 export function parseExecuteArguments(input: unknown): ExecuteArguments {
