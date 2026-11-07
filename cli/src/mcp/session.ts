@@ -143,7 +143,7 @@ registerMcpTools({
         Effect.gen(function* () {
           const id = ctx.resolveSessionId(input, "id")
           const reset = yield* ctx.relay.sessionReset(id)
-          ctx.establishCurrentSession(id)
+          ctx.establishCurrentSession(id, reset.session.browser)
           return reset
         }),
     },
