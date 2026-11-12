@@ -24,9 +24,12 @@ const PackageMetadata = Schema.Struct({
   bin: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
 })
 
-/** The manifest version of the extension built with this CLI version (scripts/version.ts): 1.2.4-dev.42 is 1.2.4.42. */
-function extensionManifestVersion(version: string) {
-  const match = /^(\d+\.\d+\.\d+)(?:-dev\.(\d+)(?:\.\d+)?)?/.exec(version)
+/**
+ * The manifest version of the extension built with this CLI version (scripts/version.ts): 1.2.4-dev.42 is 1.2.4.42,
+ * and the omp fork's 0.0.16-omp.1 is 0.0.16.1.
+ */
+export function extensionManifestVersion(version: string) {
+  const match = /^(\d+\.\d+\.\d+)(?:-(?:dev|omp)\.(\d+)(?:\.\d+)?)?/.exec(version)
   if (!match) return version
   return match[2] ? `${match[1]}.${match[2]}` : match[1]!
 }

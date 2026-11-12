@@ -17,6 +17,7 @@ import { manifestVersionFields, parseReleaseVersion } from "./version.ts"
 
 const root = path.resolve(import.meta.dir, "..")
 const release = path.join(root, "release")
+const OMP_VERSION = /^\d+\.\d+\.\d+-omp\.[1-9]\d{0,4}$/
 const json = async (file: string) => JSON.parse(await readFile(path.join(root, file), "utf8")) as Record<string, unknown>
 
 /** Everything that must agree before a release: the versions, the tag, and the changelog entry. */
@@ -24,7 +25,8 @@ export async function versionProblems(options: { tag?: string; requireChangelog?
   const cli = (await json("cli/package.json")).version as string
   const problems: string[] = []
   try {
-    parseReleaseVersion(cli)
+    // The omp fork's version (0.0.16-omp.1) is never published; it only has to agree across the three files.
+    if (!OMP_VERSION.test(cli)) parseReleaseVersion(cli)
   } catch (error) {
     problems.push(`cli/package.json: ${(error as Error).message}`)
   }
@@ -55,7 +57,7 @@ if (import.meta.main) {
   if (values["versions-only"]) process.exit(0)
   // Stable npm installs get the extension only from the store item, so a package that doesn't know it can't install one.
   // CI refuses a stable release without it. Dev installs load the dev zip unpacked, so dev builds don't need it.
-  const dev = parseReleaseVersion(version).channel === "dev"
+  const dev = !OMP_VERSION.test(version) && parseReleaseVersion(version).channel === "dev"
   if (values.tag && !dev && !process.env.OPENCODE_BROWSER_STORE_ID?.trim()) {
     const message = "OPENCODE_BROWSER_STORE_ID (the CWS_ITEM_ID repository variable) is not set; this package won't know its store item, so npm installs of it can't get the extension"
     if (process.env.GITHUB_ACTIONS) fail([message])

@@ -197,6 +197,11 @@ an omp section, to `~/.agents/skills/browse/SKILL.md`. Add `--mcp` to also put a
 overwrites a file it didn't write, later installs and `update` rewrite the same files, `status` reports them, and
 `uninstall` removes them (`uninstall --client omp` removes only those).
 
+This fork versions itself `<upstream version>-omp.<n>` (now `0.0.16-omp.1`). Chrome needs a dotted-integer manifest
+version, so the extension says `0.0.16.1` with `version_name` `0.0.16-omp.1`; `doctor` counts the two as matching. A
+checkout install only updates through `update` (git), and the version checks never rank an upstream npm or store
+release above the fork's version.
+
 ### Several browser profiles
 
 One relay drives every browser that paired with it, and each Chrome profile with browse is a browser of its own. Load

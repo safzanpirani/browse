@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import { relayBuildCheck } from "../src/doctor.ts"
+import { extensionManifestVersion, relayBuildCheck } from "../src/doctor.ts"
 import type * as RelayClient from "../src/relay/client.ts"
 import { ensureRelay, relayBuildDrift, relayBuildProblem } from "../src/relay/lifecycle.ts"
 import type { RelayVersion } from "../src/relay/schema.ts"
@@ -42,5 +42,13 @@ describe("relay client protocol", () => {
       .toMatchObject({ status: "warn", message: `runtime ${relayBuild} is incompatible with CLI ${cliBuild}` })
     expect(relayBuildCheck({ cliBuildId: relayBuild, relayResult: { ok: true, value } }))
       .toMatchObject({ status: "ok", message: `matches CLI build (${relayBuild})` })
+  })
+})
+
+describe("doctor's extension version", () => {
+  test("maps a CLI version to the manifest version its extension build carries", () => {
+    expect(extensionManifestVersion("0.0.16")).toBe("0.0.16")
+    expect(extensionManifestVersion("0.2.1-dev.57")).toBe("0.2.1.57")
+    expect(extensionManifestVersion("0.0.16-omp.1")).toBe("0.0.16.1")
   })
 })

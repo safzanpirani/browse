@@ -13,6 +13,7 @@ import {
   readState,
   runInstaller,
   setStoredMode,
+  updateAvailable,
   updateState,
   type Runtime,
 } from "../src/update/auto-update.ts"
@@ -83,6 +84,11 @@ describe("channels and versions", () => {
     expect(compareVersions("0.2.1-beta.9", "0.2.0")).toBe(1)
     expect(compareVersions("0.2.1-dev.9", "0.2.1-beta.1")).toBe(-1)
     expect(compareVersions("0.2.1-beta.1", "0.2.1")).toBe(-1)
+  })
+
+  test("the omp fork's version is never behind the upstream release it carries", () => {
+    expect(compareVersions("0.0.16", "0.0.16-omp.1")).toBe(0)
+    expect(updateAvailable({ install: "npm", latest: "0.0.16", version: "0.0.16-omp.1" })).toBe(false)
   })
 })
 
