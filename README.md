@@ -200,7 +200,8 @@ overwrites a file it didn't write, later installs and `update` rewrite the same 
 This fork versions itself `<upstream version>-omp.<n>` (now `0.0.16-omp.1`). Chrome needs a dotted-integer manifest
 version, so the extension says `0.0.16.1` with `version_name` `0.0.16-omp.1`; `doctor` counts the two as matching. A
 checkout install only updates through `update` (git), and the version checks never rank an upstream npm or store
-release above the fork's version.
+release above the fork's version. The fork's extension icon has an orange border and window pane, so it can't be
+mistaken for the store build's black-and-white one.
 
 ### Several browser profiles
 
