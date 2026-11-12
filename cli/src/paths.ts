@@ -19,8 +19,28 @@ const xdgRoot = (variable: string, fallback: string, home: string) => {
   return path.join(configured && path.isAbsolute(configured) ? configured : path.join(home, fallback), "browse")
 }
 
+/** The config folder without the OPENCODE_BROWSER_HOME override: where an everyday install keeps its settings. */
+function defaultConfigRoot(home = os.homedir()): string {
+  return xdgRoot("XDG_CONFIG_HOME", ".config", home)
+}
+
+/** Browse's XDG folders without the OPENCODE_BROWSER_HOME override: an everyday install still writes them. */
+export function defaultRoots(home = os.homedir()): {
+  readonly config: string
+  readonly data: string
+  readonly state: string
+  readonly cache: string
+} {
+  return {
+    config: defaultConfigRoot(home),
+    data: xdgRoot("XDG_DATA_HOME", ".local/share", home),
+    state: xdgRoot("XDG_STATE_HOME", ".local/state", home),
+    cache: xdgRoot("XDG_CACHE_HOME", ".cache", home),
+  }
+}
+
 export function configRoot(home = os.homedir()): string {
-  return override(home) ?? xdgRoot("XDG_CONFIG_HOME", ".config", home)
+  return override(home) ?? defaultConfigRoot(home)
 }
 
 export function dataRoot(home = os.homedir()): string {
@@ -35,15 +55,26 @@ export function cacheRoot(home = os.homedir()): string {
   return override(home) ?? xdgRoot("XDG_CACHE_HOME", ".cache", home)
 }
 
-/** The installer's folder: $XDG_BIN_HOME when set, else ~/.local/bin (the same on Windows under %USERPROFILE%). */
-export function binRoot(home = os.homedir()): string {
-  if (override(home)) return path.join(override(home)!, "bin")
+/** The installers' folder: $XDG_BIN_HOME when absolute, else ~/.local/bin (the same on Windows under %USERPROFILE%). */
+function installerBinRoot(home = os.homedir()): string {
   const configured = home === os.homedir() ? process.env.XDG_BIN_HOME : undefined
   return configured && path.isAbsolute(configured) ? configured : path.join(home, ".local", "bin")
 }
 
-/** Where the install script puts the executable. */
+/** The executable's folder: $OPENCODE_BROWSER_HOME/bin when that override is set, else the installers' folder. */
+export function binRoot(home = os.homedir()): string {
+  if (override(home)) return path.join(override(home)!, "bin")
+  return installerBinRoot(home)
+}
+
+/** The executable agents run: $OPENCODE_BROWSER_HOME/bin when set, else the installers' folder. */
 export const installedBinaryPath = (home = os.homedir()) => path.join(binRoot(home), binaryName())
+
+/** The executable the installers wrote, independent of where OPENCODE_BROWSER_HOME points the CLI. */
+export const installerBinaryPath = (home = os.homedir()) => path.join(installerBinRoot(home), binaryName())
+
+/** An everyday install's settings, independent of where OPENCODE_BROWSER_HOME points the CLI. */
+export const defaultSettingsPath = (home = os.homedir()) => path.join(defaultConfigRoot(home), "settings.json")
 
 /** This package's root: cli/ in a checkout (src/paths.ts, or the dist/cli.mjs bundle), else the installed package. */
 const packageRoot = () => path.dirname(path.dirname(fileURLToPath(import.meta.url)))
@@ -72,6 +103,85 @@ export const scriptEntry = (entry: string) => /\.[cm]?[jt]s$/.test(entry)
 
 /** The command that runs the CLI at `entry`: `<node> <entry>` for a script, the executable itself otherwise. */
 export const entryCommand = (entry: string, node = process.execPath): string[] => (scriptEntry(entry) ? [node, entry] : [entry])
+
+/** What Node can't start on Windows without a shell: a bare command name, or a .cmd/.bat shim. */
+const windowsShellShim = (entry: string, pathModule: typeof path.win32) =>
+  /\.(cmd|bat)$/i.test(entry) ||
+  (pathModule.extname(entry) === "" && !pathModule.isAbsolute(entry) && !/[\\/]/.test(entry))
+
+/** A path under npm's npx cache, which npx may replace or evict. */
+const npxEntry = (entry: string) => /(^|\/)_npx\//.test(entry.replaceAll("\\", "/"))
+
+export type EntrySpawnOptions = {
+  readonly platform?: NodeJS.Platform
+  /** The CLI this process runs (runningEntry by default). */
+  readonly running?: string
+  /** Whether this process is a compiled executable (compiledBinary by default). */
+  readonly compiled?: boolean
+  /** Whether this process runs from a source checkout (fromCheckout by default). */
+  readonly checkout?: boolean
+  /** Windows path rules; tests inject path.win32. */
+  readonly pathModule?: typeof path.win32
+  /** Where PATH comes from; tests inject a fake environment. */
+  readonly env?: NodeJS.ProcessEnv
+  /** The filesystem check; tests inject a fake. */
+  readonly existsSync?: (file: string) => boolean
+}
+
+/**
+ * The installed browse CLI a Windows shim entry runs, found with filesystem checks only. For a bare name (or a bare
+ * .cmd/.bat) walk PATH in order; for an explicit .cmd/.bat path use its folder. npm's global prefix puts its shims and
+ * node_modules side by side, so the bundle is <folder>\node_modules\@opencode\browse\dist\cli.mjs.
+ */
+export function resolveWindowsShim(
+  entry: string,
+  node = process.execPath,
+  options: Pick<EntrySpawnOptions, "pathModule" | "env" | "existsSync"> = {},
+): string[] | undefined {
+  const pathModule = options.pathModule ?? path.win32
+  const exists = options.existsSync ?? fs.existsSync
+  if (!windowsShellShim(entry, pathModule)) return undefined
+  const shimmed = /\.(cmd|bat)$/i.test(entry)
+  const withFolder = shimmed && (pathModule.isAbsolute(entry) || /[\\/]/.test(entry))
+  const directories = withFolder
+    ? [pathModule.dirname(entry)]
+    : (options.env ?? process.env).PATH?.split(";")
+        .map((directory) => directory.trim().replace(/^"(.*)"$/, "$1"))
+        .filter(Boolean) ?? []
+  for (const directory of directories) {
+    if (!shimmed) {
+      const executable = pathModule.join(directory, `${entry}.exe`)
+      if (exists(executable)) return [executable]
+    }
+    const shim = withFolder ? entry : pathModule.join(directory, shimmed ? entry : `${entry}.cmd`)
+    if (!exists(shim)) continue
+    const script = pathModule.join(directory, "node_modules", "@opencode", "browse", "dist", "cli.mjs")
+    if (exists(script)) return [node, script]
+  }
+  return undefined
+}
+
+/**
+ * The command this process starts to run the CLI again at `entry`. A Windows npm install records itself as a bare
+ * `browse` shim, which child_process can't start without a shell: resolve the installed CLI through PATH first. If
+ * nothing installed resolves, use this process's script unless it is an npx copy or a source checkout; a compiled
+ * binary never falls back to itself. Other platforms keep the old behavior.
+ */
+export function entrySpawnCommand(
+  entry: string,
+  node = process.execPath,
+  options: EntrySpawnOptions = {},
+): string[] {
+  if (scriptEntry(entry)) return [node, entry]
+  const pathModule = options.pathModule ?? path.win32
+  if ((options.platform ?? process.platform) !== "win32" || !windowsShellShim(entry, pathModule)) return [entry]
+  const resolved = resolveWindowsShim(entry, node, options)
+  if (resolved) return resolved
+  const running = options.running ?? runningEntry()
+  const compiled = options.compiled ?? compiledBinary()
+  const checkout = options.checkout ?? fromCheckout()
+  return !compiled && !checkout && scriptEntry(running) && !npxEntry(running) ? [node, running] : [entry]
+}
 
 /** The executable a binary install put on PATH, when it is there. */
 export function installedBinary(): string | undefined {

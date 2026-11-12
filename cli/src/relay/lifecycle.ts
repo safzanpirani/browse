@@ -6,7 +6,9 @@ import process from "node:process"
 import { fileURLToPath } from "node:url"
 import { browserUnresponsive, extensionProtocolAdvice, extensionReconnectAlarmPeriodMs } from "../protocol.ts"
 import * as RelayClient from "./client.ts"
+import { relayLog } from "./log.ts"
 import { relayClientProtocolVersion, RelayShutdownRequest, type ExtensionStatus, type RelayVersion } from "./schema.ts"
+import { launchWindowsRelay, quoteWindowsArgument } from "./windows-launch.ts"
 import { compareVersions, installedRuntime, installedVersion } from "../update/auto-update.ts"
 import { cliCommand, compiledBinary, installCommand, scriptEntry } from "../paths.ts"
 import { opencodeBrowserBuildId } from "../version.ts"
@@ -419,12 +421,19 @@ export function startManagedRelay(
         throw new Error("Cannot locate the browse CLI entrypoint")
       }
       const launch = managedRelayLaunch(entrypoint, executable, execArgv)
-      const { OPENCODE_BROWSER_RESTART_REQUEST_ID: _inheritedRestartRequestId, ...env } = relayEnvironment(process.env)
+      // relayEnvironment keeps every OPENCODE_BROWSER_ name, whatever its casing, so strip the inherited restart id
+      // case-insensitively here (the option below is then the only one).
+      const env = Object.fromEntries(
+        Object.entries(relayEnvironment(process.env)).filter(([name]) => name.toUpperCase() !== "OPENCODE_BROWSER_RESTART_REQUEST_ID"),
+      )
       const childEnv = { ...env, OPENCODE_BROWSER_MANAGED_RELAY: "1", ...(options.restartRequestId ? { OPENCODE_BROWSER_RESTART_REQUEST_ID: options.restartRequestId } : {}) }
       if (process.platform === "win32") {
-        // A detached spawn can still inherit extra pipe handles from cmd / PowerShell 5.1. ShellExecute starts a
-        // separate hidden console without those handles. Start-Process takes one Windows command line, not argv.
-        const args = launch.args.map(s => `"${s.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`).join(" ")
+        // Under Bun, kernel32 CreateProcessW starts the relay in its own invisible console without inheriting this
+        // process's handles (windows-launch.ts). Otherwise, and when that fails: a detached spawn can still inherit
+        // extra pipe handles from cmd / PowerShell 5.1, so ShellExecute starts a separate hidden console without them.
+        // Start-Process takes one Windows command line, not argv.
+        if (launchWindowsRelay(launch, childEnv, (reason) => relayLog("relay.launch.fallback", { executable: launch.executable, reason }))) return
+        const args = launch.args.map(quoteWindowsArgument).join(" ")
         execFileSync(path.join(process.env.SystemRoot!, "System32/WindowsPowerShell/v1.0/powershell.exe"),
           ["-NoProfile", "-NonInteractive", "-Command", "Start-Process -ErrorAction Stop -WindowStyle Hidden -FilePath $env:BROWSE_EXE -ArgumentList $env:BROWSE_ARGS"],
           { env: { ...childEnv, BROWSE_EXE: launch.executable, BROWSE_ARGS: args }, windowsHide: true, stdio: "ignore" })
@@ -442,9 +451,12 @@ export function startManagedRelay(
 }
 
 // The relay runs agent code and child commands; it gets only what it needs to run, never the MCP client's API keys.
+// Every XDG variable paths.ts reads must be here, or the relay resolves its files under a different root than the CLI
+// that started it (a pairing code written under a custom state root would never reach the relay).
 const relayEnvironmentNames = new Set([
   "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP", "LANG", "LANGUAGE", "TZ",
-  "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DISPLAY", "WAYLAND_DISPLAY",
+  "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_BIN_HOME", "XDG_RUNTIME_DIR",
+  "DISPLAY", "WAYLAND_DISPLAY",
   // Networking for secrets_run children (and the relay's own requests): proxies and extra CA certificates. Names
   // are compared uppercased, so http_proxy and friends pass too.
   "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",

@@ -260,7 +260,40 @@ describe("relay", () => {
     expect(file.error?.message).toContain("blocked Page.navigate to a file: URL")
     const internal = await cdpCall(socket, 8, "Target.createTarget", { url: "chrome://settings" })
     expect(internal.error?.message).toContain("blocked Target.createTarget")
-    expect(extension.commands.some((command) => command.params?.method === "Page.navigate" || (command.method === "tabs.create" && String(command.params?.url).startsWith("chrome:")))).toBe(false)
+    expect(extension.commands.some((command) => command.method === "tabs.create" && String(command.params?.url).startsWith("chrome:"))).toBe(false)
+    expect(extension.commands.some((command) => command.params?.method === "Page.navigate" && String((command.params?.params as { url?: string } | undefined)?.url).startsWith("chrome:"))).toBe(false)
+    socket.close()
+    extension.close()
+  }, 20_000)
+
+  test("clearing device metrics runs twice on the tab, never on a child frame session", async () => {
+    const tabId = 42
+    const targetInfo = { targetId: "TARGET-42", type: "page", title: "Example", url: "https://example.com/", attached: true, browserContextId: "CTX" }
+    const frameInfo = { targetId: "FRAME-42", type: "iframe", title: "", url: "https://example.com/frame", attached: true, browserContextId: "CTX" }
+    const extension = new FakeExtension(home, port)
+      .on("tabs.create", () => ({ tabId }))
+      .on("Target.getTargetInfo", () => ({ targetInfo }))
+    expect(await extension.pair()).toBe(true)
+    const socket = await connectCdp(`ws://127.0.0.1:${port}/devtools/browser/test`, { authorization: `Bearer ${token}` })
+    if (!(socket instanceof WebSocket)) throw new Error(`CDP connection refused: ${socket}`)
+    const events = collect(socket)
+    expect((await cdpCall(socket, 1, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true })).error).toBeUndefined()
+    expect((await cdpCall(socket, 2, "Target.createTarget", { url: "https://example.com/" })).result?.targetId).toBe("TARGET-42")
+    // A child frame Chrome attached inside the tab: a clear addressed to it must still reach the tab.
+    extension.emit("debugger.event", {
+      tabId,
+      method: "Target.attachedToTarget",
+      params: { sessionId: "frame-42", targetInfo: frameInfo, waitingForDebugger: false },
+    })
+    expect(await until(() => events.some((event) => event.method === "Target.attachedToTarget" && event.params?.sessionId === "frame-42"))).toBe(true)
+    const clears = () => extension.commands.filter((command) => command.method === "debugger.sendCommand" && command.params?.method === "Emulation.clearDeviceMetricsOverride")
+    const cleared = await cdpCall(socket, 3, "Emulation.clearDeviceMetricsOverride", {}, "frame-42")
+    expect(cleared.error).toBeUndefined()
+    expect(await until(() => clears().length === 2)).toBe(true)
+    expect(clears().map((command) => ({ tabId: command.params?.tabId, sessionId: command.params?.sessionId }))).toEqual([
+      { tabId, sessionId: undefined },
+      { tabId, sessionId: undefined },
+    ])
     socket.close()
     extension.close()
   }, 20_000)
@@ -373,6 +406,7 @@ describe("relay", () => {
     expect(navigated.result).toEqual({ frameId: "TARGET-71", loaderId: "BLANK-1" })
     const sent = extension.commands.filter((command) => command.params?.tabId === 71 && (command.params?.method === "Page.navigate" || command.params?.method === "Page.setDocumentContent"))
     expect(sent.map((command) => [command.params?.method, command.params?.params])).toEqual([
+      ["Page.navigate", { url: "https://example.com/" }],
       ["Page.navigate", { url: "about:blank", frameId: "TARGET-71" }],
       ["Page.setDocumentContent", { frameId: "TARGET-71", html: "<h1>hi</h1>" }],
     ])
@@ -463,6 +497,67 @@ describe("relay", () => {
     third.close()
   }, 30_000)
 
+  test("the browser's debugging bar dismissal stops the script, keeps agent tabs grouped and warns the next execute", async () => {
+    const info = (tabId: number) => ({ targetId: `TARGET-${tabId}`, type: "page", title: "Example", url: "https://example.com/", attached: true, browserContextId: "CTX" })
+    const userTab = 240
+    let next = 230
+    const extension = new FakeExtension(home, port)
+      .on("tabs.create", () => ({ tabId: ++next }))
+      .on("Target.getTargetInfo", (command) => ({ targetInfo: info(Number(command.params?.tabId)) }))
+      .on("Page.getFrameTree", (command) => {
+        const targetId = `TARGET-${Number(command.params?.tabId)}`
+        return { frameTree: { frame: { id: targetId, loaderId: "L", url: "https://example.com/", domainAndRegistry: "", securityOrigin: "https://example.com", mimeType: "text/html", secureContextType: "Secure", crossOriginIsolatedContextType: "NotIsolated", gatedAPIFeatures: [] } } }
+      })
+    // A tab the user attached with the toolbar: the relay must still ungroup it for an older extension.
+    expect(await extension.pair({ attachedTabs: [userTab] })).toBe(true)
+    expect(await until(() => extension.commands.some((command) => command.method === "debugger.sendCommand" && command.params?.method === "Page.enable" && command.params?.tabId === userTab), 10_000)).toBe(true)
+    const post = (route: string, body: unknown) => fetch(`${base}${route}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    })
+    type Result = { isError: boolean; text: string; warnings: string[] }
+    const execute = async (sessionId: string, code: string) =>
+      await (await post("/cli/execute", { sessionId, code, createIfMissing: true })).json() as Result
+    const ungroups = (tabId: number) => extension.commands.filter((command) => command.method === "tabs.ungroup" && command.params?.tabId === tabId).length
+    try {
+      // A script that never settles: the user clicks the bar's button while it runs. Chromium detaches every tab,
+      // the agent's and the user's, so the relay hears both.
+      const runningSession = "debugging-bar-running"
+      const running = execute(runningSession, "await new Promise(() => {})")
+      expect(await until(() => extension.commands.some((command) => command.method === "pageStatus.set" && (command.params?.status as { state?: string } | undefined)?.state === "running"), 10_000)).toBe(true)
+      // Let the session page finish opening so user code is the thing that runs when the user cancels.
+      await Bun.sleep(200)
+      const runningTab = next
+      const userUngroups = ungroups(userTab)
+      extension.emit("debugger.detached", { tabId: runningTab, reason: "canceled_by_user" })
+      extension.emit("debugger.detached", { tabId: userTab, reason: "canceled_by_user" })
+      const stopped = await running
+      expect(stopped.isError).toBe(true)
+      expect(stopped.text).toContain("dismissed the browser's debugging bar")
+      expect(stopped.text).toContain("disconnects browse from every tab")
+
+      // An agent-opened tab keeps its group (an ungroup here would close it in the extension); a tab the user lent
+      // is still ungrouped.
+      expect(ungroups(runningTab)).toBe(0)
+      expect(await until(() => ungroups(userTab) > userUngroups)).toBe(true)
+
+      // The next execute in a session whose page was released that way says so and opens a new page.
+      const idleSession = "debugging-bar-idle"
+      expect((await execute(idleSession, "return 1")).isError).toBe(false)
+      const idleTab = next
+      extension.emit("debugger.detached", { tabId: idleTab, reason: "canceled_by_user" })
+      expect(await until(() => extension.commands.some((command) => command.method === "pageStatus.clear" && command.params?.tabId === idleTab))).toBe(true)
+      expect(ungroups(idleTab)).toBe(0)
+      const nextRun = await execute(idleSession, "return 1")
+      expect(nextRun.warnings.join("\n")).toContain("dismissed the browser's debugging bar")
+      expect(nextRun.warnings.join("\n")).toContain("tabs an agent opened stay open")
+      expect(nextRun.warnings.join("\n")).not.toContain("The session default page was closed")
+    } finally {
+      extension.close()
+    }
+  }, 30_000)
+
   test("a tab the extension re-attached after Chrome dropped the debugger (a PDF opening) is set up again", async () => {
     const targetInfo = { targetId: "TARGET-75", type: "page", title: "Doc", url: "https://example.com/doc.pdf", attached: true, browserContextId: "CTX" }
     const extension = new FakeExtension(home, port)
@@ -540,32 +635,45 @@ describe("relay", () => {
     extension.close()
   }, 20_000)
 
-  test("a screenshot of a hidden tab that doesn't answer is released by a small capture, not left to time out", async () => {
-    const targetInfo = { targetId: "TARGET-79", type: "page", title: "Example", url: "https://example.com/", attached: true, browserContextId: "CTX" }
-    // Like Chrome on a background tab: a capture waits until the next capture request reaches the tab.
-    let release: (() => void) | undefined
+  for (const [index, shotCase] of ([
+    { name: "png", params: { format: "png" } },
+    { name: "jpeg with a clip", params: { format: "jpeg", quality: 80, clip: { x: 0, y: 0, width: 300, height: 200, scale: 1 } } },
+    { name: "full page", params: { format: "png", captureBeyondViewport: true, clip: { x: 0, y: 0, width: 1280, height: 4000, scale: 1 } } },
+  ] as { name: string; params: Record<string, unknown> }[]).entries()) test(`a screenshot of a hidden tab that doesn't answer is released by a nudge at the same size (${shotCase.name})`, async () => {
+    const tabId = 79 + index
+    const targetInfo = { targetId: `TARGET-${tabId}`, type: "page", title: "Example", url: "https://example.com/", attached: true, browserContextId: "CTX" }
+    // Like Chrome on a background tab: a capture waits until another capture reaches the tab. Chromium answers every
+    // pending capture with the surface's bitmap tiled out to its own size, so the image depends on the completing
+    // capture's clip (the thing that sets the surface size).
     const captures: Record<string, unknown>[] = []
+    let pending: ((image: string) => void) | undefined
+    const imageFor = (clip: unknown) => JSON.stringify(clip ?? "viewport")
     const extension = new FakeExtension(home, port)
-      .on("tabs.create", () => ({ tabId: 79 }))
+      .on("tabs.create", () => ({ tabId }))
       .on("Target.getTargetInfo", () => ({ targetInfo }))
       .on("Page.captureScreenshot", (command) => {
-        captures.push(command.params?.params as Record<string, unknown>)
-        const previous = release
-        release = undefined
-        previous?.()
-        if (captures.length > 1) return { data: "nudge" }
-        return new Promise((resolve) => { release = () => resolve({ data: "full" }) })
+        const params = command.params?.params as Record<string, unknown>
+        captures.push(params)
+        const release = pending
+        pending = undefined
+        release?.(imageFor(params.clip))
+        return new Promise((resolve) => { pending = (image) => resolve({ data: image }) })
       })
     expect(await extension.pair()).toBe(true)
-    const socket = await connectCdp(`ws://127.0.0.1:${port}/devtools/browser/test?opencodeBrowserSessionId=shot`, { authorization: `Bearer ${token}` })
+    const socket = await connectCdp(`ws://127.0.0.1:${port}/devtools/browser/test?opencodeBrowserSessionId=shot-${index}`, { authorization: `Bearer ${token}` })
     if (!(socket instanceof WebSocket)) throw new Error("CDP connection refused")
     await cdpCall(socket, 1, "Target.createTarget", { url: "https://example.com/" })
-    const sessionId = String((await cdpCall(socket, 2, "Target.attachToTarget", { targetId: "TARGET-79", flatten: true })).result?.sessionId)
+    const sessionId = String((await cdpCall(socket, 2, "Target.attachToTarget", { targetId: `TARGET-${tabId}`, flatten: true })).result?.sessionId)
     const started = Date.now()
-    const shot = await cdpCall(socket, 3, "Page.captureScreenshot", { format: "png" }, sessionId)
-    expect(shot.result).toEqual({ data: "full" })
+    const shot = await cdpCall(socket, 3, "Page.captureScreenshot", shotCase.params, sessionId)
     expect(Date.now() - started).toBeLessThan(3_000)
-    expect(captures[1]).toMatchObject({ clip: { width: 1, height: 1 } })
+    expect(captures[0]).toEqual(shotCase.params)
+    // The nudge keeps the original's clip, so the surface stays the size the client asked for and the pending capture
+    // gets that bitmap rather than a blank one. It is a cheap JPEG, and drops the full-page preference with a clip.
+    const nudge: Record<string, unknown> = { ...shotCase.params, format: "jpeg", quality: 1 }
+    if (shotCase.params.clip !== undefined) delete nudge.captureBeyondViewport
+    expect(captures[1]).toEqual(nudge)
+    expect(shot.result).toEqual({ data: imageFor(shotCase.params.clip) })
     socket.close()
     extension.close()
   }, 20_000)
@@ -602,6 +710,10 @@ describe("process faults", () => {
     expect(isBenignClosedSessionRejection(fault("Protocol error (Network.setCacheDisabled): Internal server error, session closed."))).toBe(true)
     expect(isBenignClosedSessionRejection(fault("Protocol error (Network.setCacheDisabled): Extension disconnected"))).toBe(true)
     expect(isBenignClosedSessionRejection(fault("Protocol error (Network.setCacheDisabled): Unknown CDP session bc-tab-12 for Network.setCacheDisabled"))).toBe(true)
+    // Chrome's answer when the tab closed under an unawaited command, which patchright reports as a Protocol error.
+    const noTab = "Protocol error (Network.setCacheDisabled): No tab with given id 858742605."
+    expect(isBenignClosedSessionRejection(fault(noTab))).toBe(true)
+    expect(isBenignClosedSessionRejection(fault("Protocol error (Target.attachToTarget): No target with given id found"))).toBe(true)
     expect(isBenignClosedSessionRejection(fault("Protocol error (Runtime.evaluate): Cannot find context with specified id"))).toBe(false)
     const message = "Protocol error (Network.setCacheDisabled): session closed"
     const relayError = new Error(message)
@@ -611,6 +723,7 @@ describe("process faults", () => {
       const anonymous = Object.assign(new Error(message), { type, method: "Network.setCacheDisabled", logs: undefined })
       expect(isBenignClosedSessionRejection(anonymous)).toBe(true)
       expect(shouldSuppressRelayProcessFault(anonymous)).toBe(true)
+      expect(isBenignClosedSessionRejection(Object.assign(new Error(noTab), { type, method: "Network.setCacheDisabled", logs: undefined }))).toBe(true)
     }
     expect(shouldSuppressRelayProcessFault(Object.assign(relayError, { method: "Network.setCacheDisabled", logs: undefined, type: "other" }))).toBe(false)
   })

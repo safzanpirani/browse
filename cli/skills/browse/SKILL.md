@@ -21,8 +21,16 @@ it is needed, so do not start `browse serve` first.
 
 ## Sessions
 
-MCP keeps one implicit process session; omit `session` for the normal path, or
-call `session_new` and pass an explicit id when one MCP process needs several.
+Over MCP, each agent has its own current session when the client names the
+agent (OpenCode does), so omit `session` for the normal path; another named
+agent's bare calls don't land on your page. `status` reports
+`sharedSession: true` when the client doesn't name agents, and then every
+agent on that server shares one current session: if several agents (such as
+subagents) use it, each should `session_new` its own and pass `session` on
+every call. `session_new`, `session_use`, `session_reset`, and `execute` or
+`session_adopt` with a `session`, make it your current session. Pass an
+explicit `session` id to work in several sessions, or to share one with
+another agent on purpose.
 
 CLI sessions are named, and a named session keeps its default page across short
 commands and relay restarts:
@@ -54,11 +62,19 @@ MCP: `session_adopt` with `tabId` or `targetUrl`. Prefer adoption for
 authenticated browser state rather than reproducing a login in a fresh page.
 `targetUrl` and `targetIndex` select existing pages; they never navigate.
 
-One relay drives every paired browser (each Chrome profile with browse counts as
-one). `status` lists them by id; a new session opens its tabs in the default
-browser unless you name one (MCP: `browser` on `session_new` or `execute`; CLI:
-`--profile <id>`), and a session stays in its browser. Adopting another
-browser's tab into a new session needs that browser named too.
+One relay can have several browsers connected at once (each Chrome profile with
+browse counts as one), each with an id like `chrome-macbook`. New sessions use
+the default browser, the first connected and ready, unless `session_new` or the
+first `execute` that creates it gets `browser: "<id>"`. `status` lists the
+connected browsers (`browse status --json` on the CLI). A session stays in its
+browser, so start a new one to use another.
+
+The `browse` CLI picks a browser with `--profile <id>` on any command (or
+`session new <name> --browser "<id or name>"` for one session); without either,
+CLI sessions use the default browser. `session_adopt` has no `browser`; to adopt
+a tab in another browser, create the session with `browse --profile <id> session
+new <name>` (or `session_new` with `browser`) first, then `session_adopt` in that
+session.
 
 ## Inspect, act, verify
 
@@ -100,13 +116,32 @@ result carries a warning saying so.
 Useful inspection helpers:
 
 - `snapshot()` is the compact read-before-act default. It prioritizes semantic
-  groups, alerts, lists, tables, headings, links, and controls; text input values
-  are omitted. `snapshot({ find: /checkout/i, context: 2 })` searches it, and
+  groups, alerts, lists, tables, headings, links, and controls. It and
+  `ariaSnapshot()` hide the values of editable fields and of password,
+  one-time-code and card fields (`autocomplete` `cc-number`, `cc-csc`,
+  `cc-exp*`); other readonly fields show their value, so a generated address or
+  code is readable. A field the page locks after you type into it counts as
+  readonly. Visible iframes appear as `iframe` lines with their own documents
+  nested under them, same-origin and cross-origin alike, up to 8 frames three
+  levels deep; iframe elements under 20px in both directions are skipped. So a
+  dialog whose form lives in a payment iframe is readable without
+  `page.frames()`; pass `snapshot({ frames: false })` to leave iframe content
+  out. `snapshot({ find: /checkout/i, context: 2 })` searches it, and
   `snapshot({ diff: true })` or `{ delta: true }` reports changes.
-- `ref("e12")` resolves a control from the latest snapshot. Refs fail closed
-  after navigation or incompatible DOM drift; compatible refs keep their ids.
+- `ref("e12")` resolves a control from the latest snapshot, including controls
+  inside an iframe: those refs resolve in that frame and fail closed when the
+  frame navigates. Refs fail closed after navigation or incompatible DOM drift;
+  compatible refs keep their ids. An action on a ref whose control was renamed,
+  removed or re-rendered fails within a few seconds and says what changed; call
+  `snapshot()` again. `snapshot({ within: page.frameLocator(...) })` captures a
+  frame and its refs resolve there.
 - `ariaSnapshot(target?, { timeout })` returns Playwright's detailed YAML tree
-  when the compact snapshot omits needed structure.
+  when the compact snapshot omits needed structure. The tree keeps Playwright's
+  anonymous `- iframe` lines, and each iframe's document follows it as a
+  labelled block in document order (`- iframe "name" [src=host]:`, with nested
+  frames as further labelled blocks). It applies the same value hiding in
+  every frame; a frame it cannot read becomes a note, and if it cannot confirm
+  that redaction was removed the call fails rather than return values.
 - `screenshotWithLabels({ page?, path? })` adds visual labels when layout
   matters and registers its labels for `ref()`.
 - `screenshotDiff({ baseline, path?, threshold?, fullPage? })` compares a saved
@@ -196,9 +231,9 @@ adds a loud warning, so set one first.
 Execute code can use `page`, `context`, `browser`, persistent `state`, the
 `files` helper, compute-only Node modules through `modules` (plus `path`, `url`,
 `util`, `crypto`, `buffer`, `zlib`, `events`, `stream`), and the browse helpers
-above. Timers, `URL`, `TextEncoder`, `Buffer`, `structuredClone` and
-`crypto.randomUUID()` are available. `execute` returns the value of `return`; a
-single expression returns automatically. Use `--file` for longer scripts:
+above. Timers, `URL`, `TextEncoder`, `Buffer` and `crypto.randomUUID()` are
+available. `execute` returns the value of `return`; a single expression returns
+automatically. Use `--file` for longer scripts:
 
 ```bash
 browse execute --session github --file ./perform-flow.js
@@ -209,6 +244,18 @@ values between calls on `state`. A single run without an `await` is stopped afte
 about 2 seconds; split heavy loops with
 `await new Promise(r => setTimeout(r, 0))` or do the work in the page.
 
+`execute`'s `timeoutMs` (MCP) / `--timeout-ms` (CLI) is the whole-script
+deadline, 60 seconds by default and paused during `handoff()`; `0` disables it.
+When you set it (or the relay sets `OPENCODE_BROWSER_EXECUTE_TIMEOUT_MS`),
+Playwright actions and navigations get the same budget, at least 30 seconds;
+without either they keep Playwright's 30-second default.
+
+Await promises: a rejection with no handler never stops the relay. A running call
+gets the error; a later one resets the realm and warns on the next call (a
+one-shot `--rm` session is already gone). Full Node mode has no realm to reset.
+`await files.write(...)` and `await page.goto(...)` put the error in the call
+that caused it.
+
 It runs in a restricted JavaScript realm, not a sandbox. It shares the relay's
 process, so it is not a security boundary: treat code as running as you. There
 is no `process`, `require`, `import()`, `eval`, `fs`, `os`,
@@ -216,13 +263,22 @@ is no `process`, `require`, `import()`, `eval`, `fs`, `os`,
 `page.request`, `context.request` and `browser.browserType()` are unavailable.
 Files go through `files` and Playwright file options, which accept absolute paths
 inside the execute file roots (the temp directory, `/tmp`, and directories in
-`OPENCODE_BROWSER_FILE_ROOTS`):
+`OPENCODE_BROWSER_FILE_ROOTS`); raw CDP commands that name local files are
+checked the same way. Every existing folder and file between the root and the
+target must be owned by you and not group/world writable, and a file or folder
+directly in a shared root like `/tmp` is refused; `files.path(name)`, which
+points into `files.dir`, is the easy way:
 
 ```js
 const saved = await files.write("report.csv", csvText)
 const bytes = await files.read(saved) // Buffer; files.read(p, "utf8") for text
 await page.screenshot({ path: files.path("page.png") })
 ```
+
+Setting `Browser.setDownloadBehavior` (or `Page.setDownloadBehavior`) replaces
+Playwright's own download handling, so keep its folder inside the file roots.
+After that, `page.on("download")` and `download.saveAs()` stop working for the
+context.
 
 Use `page.evaluate` for `window`, `document`, storage and same-origin `fetch`
 with page cookies. It runs in an isolated world whose `fetch` skips the page's
@@ -232,6 +288,21 @@ service worker; pass `false` as its fourth argument
 Cookie access is limited to the hosts of the session's pages, and
 `page.bringToFront()` is refused because it raises the user's window; use
 `handoff()` when the user needs to act.
+
+Clipboard calls in a frame need that frame focused: in the same `frame.evaluate`,
+call `window.focus()` before `navigator.clipboard` (or click in the frame first).
+A cross-origin iframe also needs `allow="clipboard-write"` (or `clipboard-read`)
+from its parent; without it Chrome refuses the call and nothing in the frame can
+fix that, so write from the top page or read the value from the DOM instead.
+Clipboard reads usually ask the user for permission, so use `handoff()` or avoid
+them. Permission grants are refused (`context.grantPermissions()`,
+`context.clearPermissions()`, `Browser.grantPermissions`, `Browser.setPermission`,
+`Browser.resetPermissions`), so don't try them.
+
+`page.setViewportSize({ width, height })` emulates a viewport inside the user's
+window: the tab is letterboxed while it is set, and browse clears the override
+when the script ends (within a couple of seconds), so the tab returns to the
+window's size. Don't rely on the size carrying over to the next `execute`.
 
 The page's console messages and uncaught errors are off by default because
 capturing them lets the page detect a debugger. Turn them on for one page when
@@ -256,13 +327,28 @@ return { tools, result }
 
 ## Safety
 
-For inspect-only work, use a read-only session. Read-only rejects `Input.*`, so
-it cannot click or type through Playwright:
+For inspect-only work, use a read-only session. It cannot open a page of its
+own, so adopt a tab the user has already lent you before executing; a bare
+`execute` with no page fails when it tries to open its default page:
 
 ```bash
 browse session new inspect-prod --read-only
-browse execute --session inspect-prod 'await page.goto("https://example.com"); return page.title()'
+browse session adopt --session inspect-prod --tab-id 123   # tab= in browse status
+browse execute --session inspect-prod 'return await snapshot()'
 ```
+
+MCP: `session_new` with `readOnly: true`, then `session_adopt` with `tabId`
+(it uses the current, read-only session), `targetUrl` or `targetIndex`.
+`targetUrl` matches an attached page; adoption never navigates.
+
+Read-only is a CDP allowlist: snapshots, screenshots, page information, cookie
+reads for the session's pages, `page.evaluate` and event subscriptions are
+allowed. Everything else is refused, including `Input.*` (no click, type or
+hover through Playwright), `Page.navigate` (`page.goto`), new pages
+(`Target.createTarget`), closing tabs (`Target.closeTarget`) and cookie writes
+(`Network.setCookie`, `Storage.setCookies`). Use a writable session to open
+pages or interact. Read-only guards CDP, not page script: `page.evaluate` can
+still change the page, so use it to read, not to work around these refusals.
 
 For destructive UI work, use a two-phase **read, confirm, verify** flow: read
 candidates and return exact stable identifiers, get user approval for those
@@ -272,8 +358,8 @@ Never globally auto-accept native dialogs.
 
 browse refuses navigations to `file:`, `chrome:`, `chrome-extension:`,
 `devtools:` and `view-source:` URLs, and blocks CDP commands that would destroy
-shared browser state, including browser close and cookie/cache clearing. Never
-work around those guardrails.
+shared browser state, including browser close, cookie/cache clearing, and
+granting or changing site permissions. Never work around those guardrails.
 
 Every execute is journaled under `<state root>/sessions/<id>/journal.jsonl`
 (`~/.local/state/browse` on macOS and Linux). Never place credentials
@@ -333,15 +419,21 @@ viewport, state and interaction path actually tested.
 ## Tabs and settings
 
 Tabs agents open close by themselves after about 10 minutes without use (the
-user can choose 30 or 60 minutes, or never). When a task is done, tidy up right
-away:
+user can choose 30 or 60 minutes, or never). When a task is done, reset or
+delete your own session:
 
 ```bash
-browse tabs cleanup --idle-minutes 0   # MCP: tabs_cleanup { idleMinutes: 0 }
+browse session reset <name>    # MCP: session_reset
+browse session delete <name>   # MCP: session_delete
 ```
 
-Reset or delete session-owned pages when no follow-up work is expected. Keep a
-session only when you will continue with it.
+`tabs_cleanup` with `idleMinutes: 0` closes your own sessions' idle tabs at
+once; other agents' tabs close only after the user's idle setting. When the
+client doesn't name agents, "your own" is every session any agent on that
+server made current, so don't use `idleMinutes: 0` unless the user asks. The
+CLI's `browse tabs cleanup --idle-minutes 0` has no agent to scope to and
+closes every agent tab, so only run it when the user asks. Keep a session only
+when you will continue with it.
 
 Use the `settings` tool (CLI: `browse settings get` / `settings set key=value …`)
 only when the user asks to change how browse behaves: where tabs open (`window`),
@@ -382,8 +474,10 @@ Common diagnoses:
   page. Running setup again does not reload older workers.
 - `Target not found`: attach the intended tab, then select or adopt it by a
   unique URL substring or explicit index.
-- All targets disappeared: dismissing Chromium's debugging banner detaches every
-  tab. Ask the user to click the toolbar button on it again.
+- Dismissing Chromium's debugging bar (Cancel in Chrome, OK in some browsers)
+  detaches every tab: browse no longer controls them. Tabs an agent opened stay
+  open and close when idle; ask the user to lend the tab again with the toolbar
+  button, or continue in a new tab. `execute` says when this happened.
 - Repeated execution-context errors: run one short follow-up so browse can
   health-check the page. A live page is reconnected and re-resolved once; a
   crashed or `chrome-error://` relay-owned page is recreated. It never replaces

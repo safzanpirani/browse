@@ -2,6 +2,8 @@ import { Effect } from "effect"
 import type { BrowserContext, Frame, Page } from "patchright-core"
 import { applyExplicitMediaFeatures } from "./guards.ts"
 import {
+  debuggingBarDismissedWarning,
+  defaultActionTimeoutMs,
   defaultPageClosedWarning,
   defaultPageCrashedWarning,
   defaultPageReattachedWarning,
@@ -60,10 +62,17 @@ export abstract class DefaultPageHost {
   protected pendingTargetRebind: "replaced" | "repaired" | undefined
   protected lastKnownNonBlankUrl: string | undefined
   protected recreatedFromClosedUrl: string | undefined
+  /** The user released the default page from the browser's debugging bar: say so when the next page is created. */
+  protected pageReleasedByDebuggingBar = false
   /** Media features the agent set with page.emulateMedia; the relay drops Patchright's defaults otherwise. */
   protected readonly explicitMediaFeatures = new Map<string, string>()
   protected explicitMedia: string | undefined
   protected pendingWarnings: string[] = []
+  /** Playwright's default per-action timeout: raised for a call that asked for a longer execute. */
+  protected actionTimeoutMs = defaultActionTimeoutMs
+  private readonly actionTimeoutPages = new Set<Page>()
+  /** A page that replaced a closed one: its 2.5s guard owns the timeout until it navigates. */
+  private actionTimeoutGuardedPage: Page | undefined
   protected boundPageListeners: {
     readonly page: Page
     readonly close: () => void
@@ -86,6 +95,27 @@ export abstract class DefaultPageHost {
 
   protected addWarningOnce(warning: string | undefined): void {
     if (warning && !this.pendingWarnings.includes(warning)) this.pendingWarnings.push(warning)
+  }
+
+  /** Give a page this call's action budget, remembering it so the restore covers every page the call touched. */
+  protected applyActionTimeout(page: Page): void {
+    this.actionTimeoutPages.add(page)
+    if (page === this.actionTimeoutGuardedPage) return
+    page.setDefaultTimeout?.(this.actionTimeoutMs)
+  }
+
+  /** Back to the steady-state action timeout on every page this session raised, but not over a live 2.5s guard. */
+  protected restoreActionTimeout(): void {
+    this.actionTimeoutMs = defaultActionTimeoutMs
+    for (const page of this.actionTimeoutPages) {
+      if (page !== this.actionTimeoutGuardedPage) page.setDefaultTimeout?.(this.actionTimeoutMs)
+    }
+    this.actionTimeoutPages.clear()
+  }
+
+  /** The page's guard is gone: a navigation or `goto` decides its timeout from now on. */
+  private releaseActionTimeoutGuard(page: Page): void {
+    if (this.actionTimeoutGuardedPage === page) this.actionTimeoutGuardedPage = undefined
   }
 
   /** Forget the bound page; a target id is re-resolved exactly on the next execute. */
@@ -130,15 +160,17 @@ export abstract class DefaultPageHost {
     return true
   }
 
-  markTargetDetached(targetId: string): boolean {
+  markTargetDetached(targetId: string, options: { readonly releasedByUser?: boolean } = {}): boolean {
     if (this.defaultPageTargetId !== targetId) {
       return false
     }
-    if (this.lastKnownNonBlankUrl) {
-      this.recreatedFromClosedUrl = this.lastKnownNonBlankUrl
-    }
+    const releasedByUser = options.releasedByUser === true
+    // A released page was not closed: don't let a later locator failure say the previous page "was closed".
+    if (releasedByUser) this.recreatedFromClosedUrl = undefined
+    else if (this.lastKnownNonBlankUrl) this.recreatedFromClosedUrl = this.lastKnownNonBlankUrl
+    this.pageReleasedByDebuggingBar = releasedByUser
     this.unbindDefaultPage(undefined)
-    this.addWarningOnce(defaultPageClosedWarning)
+    this.addWarningOnce(releasedByUser ? debuggingBarDismissedWarning : defaultPageClosedWarning)
     return true
   }
 
@@ -174,6 +206,7 @@ export abstract class DefaultPageHost {
   protected bindDefaultPage(page: Page, targetId: string | undefined, ownsPage: boolean, notify: boolean): void {
     this.clearPageListeners()
     this.page = page
+    this.applyActionTimeout(page)
     if (targetId === undefined || targetId !== this.defaultPageTargetId) {
       this.pageCrashed = false
       this.pageProtectedUi = false
@@ -181,6 +214,8 @@ export abstract class DefaultPageHost {
     this.defaultPageTargetId = targetId
     this.ownsPage = ownsPage
     this.pendingTargetRebind = undefined
+    // A rebind (adoption, replacement, the next execute) is not the page the user released, so drop any stale notice.
+    this.pageReleasedByDebuggingBar = false
     this.recordNonBlankUrl(safePageUrl(page))
     const close = () => {
       if (this.page !== page) return
@@ -198,7 +233,8 @@ export abstract class DefaultPageHost {
       if (this.page === page && frame === page.mainFrame()) {
         this.pageCrashed = false
         this.recordNonBlankUrl(frame.url())
-        page.setDefaultTimeout?.(30_000)
+        this.releaseActionTimeoutGuard(page)
+        page.setDefaultTimeout?.(this.actionTimeoutMs)
         if (this.explicitMediaFeatures.size > 0) {
           void applyExplicitMediaFeatures(page, this.explicitMedia, this.explicitMediaFeatures)
         }
@@ -288,13 +324,21 @@ export abstract class DefaultPageHost {
       })
       this.pendingWarnings.push(defaultPageClosedWarning)
     }
+    // The warning was queued when the user released the tab; a stopped script may have drained it, so say it again
+    // here rather than let the next execute silently open a new page.
+    if (this.pageReleasedByDebuggingBar) {
+      this.pageReleasedByDebuggingBar = false
+      this.addWarningOnce(debuggingBarDismissedWarning)
+    }
     const page = await context.newPage()
     const targetId = await resolvePageTargetId(page)
     this.bindDefaultPage(page, targetId, true, true)
     if (this.recreatedFromClosedUrl) {
+      this.actionTimeoutGuardedPage = page
       installClosedPageReplacementGuard(page, () => {
         this.recreatedFromClosedUrl = undefined
-      })
+        this.releaseActionTimeoutGuard(page)
+      }, () => this.actionTimeoutMs)
     }
     return page
   }

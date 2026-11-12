@@ -219,7 +219,7 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
 
   mkdirSync(path.dirname(files.settings), { recursive: true, mode: 0o700 })
   mkdirSync(files.dir, { recursive: true, mode: 0o700 })
-  const { entry, version } = await installRuntime()
+  const { entry, version, spawnEntry } = await installRuntime()
   log(`✓ browse ${version} installed${fromSource ? " (from source)" : ""}`)
   if (omp) {
     if (!scriptEntry(entry))
@@ -275,7 +275,7 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
     const label = agentLabels[agent.name]
     if (!selected.includes(agent.name)) {
       if (!plan.picker && agent.installed && !flags.requested.length)
-        log(`To add ${label} too: ${cliCommand(`install --agent ${agent.name}`)}`)
+        log(`To add ${label}${selected.length ? " too" : ""}: ${cliCommand(`install --agent ${agent.name}`)}`)
       continue
     }
     if (agent.name === "opencode") {
@@ -326,16 +326,16 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
       )
     }
   }
-  for (const line of restartOutdatedRelay(entry) ?? []) log(line)
+  for (const line of restartOutdatedRelay(spawnEntry) ?? []) log(line)
   const legacy = selected.includes("opencode") ? legacyBrowserControl() : []
   if (legacy.length)
     log(
       `! Also configured: ${legacy.map((name) => `"${name}"`).join(", ")}, ${legacy.length === 1 ? "an older browser MCP server" : "older browser MCP servers"} that browse replaces. Remove ${legacy.length === 1 ? "it" : "them"} from ${configFile()} to avoid two sets of browser tools.`,
     )
-  if (args.includes("--remote")) return installRemote(entry, tty)
+  if (args.includes("--remote")) return installRemote(spawnEntry, tty)
 
   await syncDev()
-  const initial = await settledExtensionStatus(entry)
+  const initial = await settledExtensionStatus(spawnEntry)
   const connected = initial?.connected ? initial : undefined
   const pairedOffline = initial?.pairingState === "paired-offline"
   // The relay saw this browser try to connect without a token (or refuse one): it's installed, not missing.
@@ -371,7 +371,7 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
     const matches = scanned.flatMap((d) => d.enabled).filter((m) => STORE_IDS.includes(m.id))
     if (!matches.length || !matches.every(oldStoreBuild)) return true
     writeFileSync(oldStoreMarker(), "2\n")
-    ensureRelay(entry)
+    ensureRelay(spawnEntry)
     log(
       `! Found browse ${matches[0]!.version} in ${matches[0]!.browser.name}. ${extensionProtocolAdvice(2, { install: cliCommand("install") }, "store")}`,
     )
@@ -395,7 +395,7 @@ async function installSteps(args: string[], tty: boolean, caller: AgentName | un
     env,
   })
   if (connected || found === "off" || pairedOffline) return
-  ensureRelay(entry)
+  ensureRelay(spawnEntry)
   let code: string | undefined
   const pairingCode = () =>
     code && pendingPairingCodeKeys().includes(pairingCodeKey(code)) ? code : (code = mintPairingCode())

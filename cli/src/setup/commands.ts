@@ -17,13 +17,14 @@ import {
   writeExtensionPairing,
 } from "../relay/browser-pairing.ts"
 import { syncDevExtension } from "./dev-extension.ts"
-import { cliCommand, compiledBinary, devExtensionFolder, entryCommand, installedBinaryPath, installCommand, runningEntry } from "../paths.ts"
+import { cliCommand, compiledBinary, defaultSettingsPath, devExtensionFolder, entrySpawnCommand, installedBinaryPath, installerBinaryPath, installCommand, runningEntry } from "../paths.ts"
 import { runCommand } from "../update/auto-update.ts"
 import { unpackedExtensionId } from "../protocol.ts"
 import { parseHostname, readRelayConfig, writeRelayConfig } from "../relay/config.ts"
 import { relayAuthorization } from "../relay/secrets.ts"
+import { defaultSiteSecretsDir } from "../auth/site-secrets.ts"
 import { opencodeBrowserBuildId } from "../version.ts"
-import { removeBinaryInstall } from "./binary.ts"
+import { isInstallerBinary, removeBinaryInstall, samePath } from "./binary.ts"
 import { revealFolder } from "./browsers.ts"
 import {
   checkoutExtensionDirs,
@@ -68,7 +69,7 @@ const relayHeaders = (): Record<string, string> => {
 }
 
 export function ensureRelay(entry: string) {
-  const [file, ...prefix] = entryCommand(entry)
+  const [file, ...prefix] = entrySpawnCommand(entry)
   const started = spawnSync(file!, [...prefix, "session", "list", "--json"], {
     encoding: "utf8",
     timeout: 30_000,
@@ -297,7 +298,7 @@ export async function set(args: string[]) {
     () => false,
   )
   if (running) {
-    const [file, ...prefix] = entryCommand(runningEntry())
+    const [file, ...prefix] = entrySpawnCommand(runningEntry())
     const restarted = spawnSync(file!, [...prefix, "relay", "restart"], { stdio: "inherit" })
     if (restarted.status !== 0)
       log(`! The relay is still running with the old hostname. Run \`${cliCommand("relay restart --force")}\` to apply it.`)
@@ -311,7 +312,7 @@ export async function set(args: string[]) {
   log(
     "In the browser on the other computer, open browse's options (right-click its toolbar button, then Options),",
   )
-  log("and under Connection enter:")
+  log("and under advanced enter:")
   log(`  Relay         ${tailscale ?? "this computer's address"}`)
   log(
     `  Pairing code  ${formatPairingCode(mintPairingCode())}  (works once, within ${pairingCodeTtlMs / 60_000} minutes; \`${cliCommand("pair")}\` prints another)`,
@@ -319,12 +320,19 @@ export async function set(args: string[]) {
   log("The connection isn't encrypted by browse: use it over Tailscale or a LAN you trust, not the open internet.")
 }
 
-/** Stored secret profiles are the one thing uninstall deletes that can't be recaptured without the user. */
+/** Stored secret profiles and site secrets are what uninstall deletes that can't be recaptured without the user. */
 async function confirmSecretRemoval(args: string[]) {
   const secrets = path.join(files.dir, "secrets")
-  const profiles = existsSync(secrets) ? readdirSync(secrets).filter((name) => name.endsWith(".json")) : []
-  if (profiles.length === 0 || args.includes("--yes") || args.includes("-y")) return
-  const notice = `Uninstalling deletes ${profiles.length} stored secret profile${profiles.length === 1 ? "" : "s"} in ${secrets}.`
+  const siteSecrets = defaultSiteSecretsDir()
+  const count = (directory: string) =>
+    existsSync(directory) ? readdirSync(directory).filter((name) => name.endsWith(".json")).length : 0
+  const profiles = count(secrets)
+  const sites = count(siteSecrets)
+  if ((profiles === 0 && sites === 0) || args.includes("--yes") || args.includes("-y")) return
+  const notice = `Uninstalling deletes ${[
+    ...(profiles > 0 ? [`${profiles} stored secret profile${profiles === 1 ? "" : "s"} in ${secrets}`] : []),
+    ...(sites > 0 ? [`${sites} site secret${sites === 1 ? "" : "s"} in ${siteSecrets}`] : []),
+  ].join(" and ")}.`
   if (!process.stdin.isTTY) fail(`${notice} Re-run with --yes to confirm.`)
   const prompt = createInterface({ input: process.stdin, output: process.stdout })
   const answer = await prompt.question(`${notice} Continue? [y/N] `).finally(() => prompt.close())
@@ -404,6 +412,25 @@ export async function uninstall(args: string[]) {
     }
   }
   const binary = installedBinaryPath()
+  if (compiledBinary()) {
+    const installer = installerBinaryPath()
+    if (installer !== binary && existsSync(installer) && !samePath(installer, binary)) {
+      if (!existsSync(defaultSettingsPath()) && isInstallerBinary(installer, binary)) {
+        try {
+          rmSync(installer, { force: true })
+          log(`✓ Removed ${installer}`)
+        } catch {
+          log(`! Couldn't remove ${installer} while it's running; delete it after uninstall exits.`)
+        }
+      } else {
+        log(`! Left ${installer}; delete it if you no longer use browse there.`)
+      }
+    }
+  }
+  if (existsSync(binary)) {
+    const left = removeBinaryInstall(binary)
+    log(left ? `! Couldn't remove ${left}. After uninstall exits, close any browse agents using the file(s) and delete them.` : `✓ Removed ${binary}`)
+  }
   for (const directory of [paths.data, paths.config, paths.state, paths.cache]) {
     try {
       rmSync(directory, { recursive: true, force: true })
@@ -412,10 +439,6 @@ export async function uninstall(args: string[]) {
       if (process.platform !== "win32" || !["EBUSY", "EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error
       log(`! Couldn't remove all of ${directory}; close running browse agents and remove the remaining files.`)
     }
-  }
-  if (existsSync(binary)) {
-    const left = removeBinaryInstall(binary)
-    log(left ? `! Couldn't remove ${left}. After uninstall exits, close any browse agents using the file(s) and delete them.` : `✓ Removed ${binary}`)
   }
   if (!compiledBinary() && !fromSource) {
     const npm = await runCommand("npm", ["uninstall", "-g", "@opencode/browse"], { timeoutMs: 120_000 })

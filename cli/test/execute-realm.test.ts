@@ -3,7 +3,12 @@ import { spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { assertExecuteFilePath, checkHostCall, createExecuteFiles, ExecuteRealm } from "../src/execute-realm.ts"
+import { assertExecuteFilePath, checkHostCall, createExecuteFiles, ExecuteRealm, handleExecuteRealmRejection } from "../src/execute-realm.ts"
+import { isInside, isInstallSibling, prepareExecuteFileOutputs } from "../src/execute-realm/file-roots.ts"
+import { cacheRoot, configRoot, dataRoot, installedBinaryPath, installerBinaryPath, stateRoot } from "../src/paths.ts"
+import { handleRelayProcessFault } from "../src/relay/process-guard.ts"
+import { legacyDataRoot } from "../src/setup/legacy.ts"
+import { nodeRealmRunner, values, type NodeOutcome } from "./support/node-realm.ts"
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "browse-realm-"))
 const home = path.join(scratch, "home")
@@ -25,52 +30,63 @@ function run(body: string, host: Record<string, unknown> = {}) {
   return new ExecuteRealm().run({ source: `(async (host) => { ${body} })`, filename: "test.js", args: [host] })
 }
 
-type NodeOutcome = { readonly value?: unknown; readonly error?: string; readonly elapsedMs?: number; readonly maxStallMs?: number }
+const runInNode = nodeRealmRunner(home)
 
-// The relay runs execute code under Node, whose vm differs from Bun's: escape attempts run there too.
-function runInNode(bodies: readonly string[], setup = "", env: Record<string, string> = {}): NodeOutcome[] {
+/** Runs realm bodies in a Bun child with the relay's execute guard (Bun has no promiseHooks). */
+function runInBun(bodies: readonly string[]): NodeOutcome[] {
   const script = `
-    const { ExecuteRealm, sandboxModules, createExecuteFiles, handleExecuteRealmRejection, handleExecuteRealmException } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/execute-realm.ts"))})
-    // The relay's process guard, reduced to the execute part.
-    process.on('unhandledRejection', (reason, promise) => { if (!handleExecuteRealmRejection(promise)) throw reason })
-    process.on('uncaughtException', (error) => { if (!handleExecuteRealmException(error)) { console.error(error); process.exit(70) } })
-    const host = { fn: () => 1, object: { nested: true }, error: () => { throw new Error("host") } }
-    ${setup}
+    const { ExecuteRealm, handleExecuteRealmRejection } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/execute-realm.ts"))})
+    // The relay's execute guard: attributed rejections stop only their realm; unattributed ones are the generic
+    // fallback (logged and counted, never rethrown).
+    process.on('unhandledRejection', (reason, promise) => { handleExecuteRealmRejection(promise, reason) })
+    process.on('uncaughtException', (error) => { console.error(error); process.exit(70) })
     const results = []
-    for (const body of JSON.parse(process.argv[1])) {
+    for (const body of ${JSON.stringify(bodies)}) {
       const realm = new ExecuteRealm()
-      // How long the relay's event loop (other sessions, the HTTP API) went without a turn.
-      let last = performance.now(), maxStallMs = 0
-      const probe = setInterval(() => { const now = performance.now(); maxStallMs = Math.max(maxStallMs, now - last); last = now }, 5)
-      const started = performance.now()
       try {
-        realm.proxyAsObject(host)
-        if (host.files) realm.proxyAsObject(host.files)
-        if (host.modules) realm.proxyAsObject(host.modules)
-        const value = await realm.run({ source: "(async (host) => { " + body + " })", filename: "test.js", args: [host] })
-        const elapsedMs = performance.now() - started
-        await new Promise(resolve => setTimeout(resolve, 20)) // let the probe see the last stall
-        results.push({ value, elapsedMs, maxStallMs })
+        const value = await realm.run({ source: "(async () => { " + body + " })", filename: "test.js", args: [] })
+        await new Promise(resolve => setTimeout(resolve, 50))
+        results.push({ value, stopped: realm.stopped?.message })
       } catch (error) {
-        const elapsedMs = performance.now() - started
-        await new Promise(resolve => setTimeout(resolve, 20))
-        results.push({ error: String(error?.message ?? error), elapsedMs, maxStallMs })
+        await new Promise(resolve => setTimeout(resolve, 50))
+        results.push({ error: String(error?.message ?? error), stopped: realm.stopped?.message })
       } finally {
-        clearInterval(probe)
         realm.dispose()
-        host.emitConsole?.()
-        host.page?.removeAllListeners?.()
       }
     }
     console.log(JSON.stringify(results))
   `
-  const child = spawnSync("node", ["--input-type=module", "--no-warnings", "-e", script, JSON.stringify(bodies)], { encoding: "utf8", timeout: 30_000, env: { ...process.env, OPENCODE_BROWSER_HOME: home, ...env } })
-  if (child.status !== 0) throw new Error(`node failed: ${child.stderr}`)
+  const child = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 30_000, env: { ...process.env, OPENCODE_BROWSER_HOME: home } })
+  if (child.status !== 0) throw new Error(`bun failed: ${child.stderr}`)
   return JSON.parse(child.stdout.trim().split("\n").at(-1) ?? "[]") as NodeOutcome[]
 }
 
-/** Outcomes without timing, for exact comparisons. */
-const values = (outcomes: readonly NodeOutcome[]) => outcomes.map(({ value, error }) => (error === undefined ? { value } : { error }))
+/** Runs full-Node execute code in a child with the relay's process guard, as OPENCODE_BROWSER_ALLOW_NODE=1 does. */
+function runFullNodeExecute(code: string): { readonly value?: unknown; readonly warnings?: readonly string[] } {
+  const script = `
+    const { runUserCode } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/execute/code-runner.ts"))})
+    const { createExecuteFiles, handleExecuteRealmRejection } = await import(${JSON.stringify(path.join(import.meta.dir, "../src/execute-realm.ts"))})
+    // Unattributed rejections are the process guard's generic fallback here, not a child-process failure.
+    process.on('unhandledRejection', (reason, promise) => { handleExecuteRealmRejection(promise, reason) })
+    process.on('uncaughtException', (error) => { console.error(error); process.exit(71) })
+    const warnings = []
+    const page = {
+      on() { return page }, off() { return page },
+      mainFrame() { return { url: () => "about:blank" } },
+      url() { return "about:blank" }, isClosed() { return false },
+    }
+    const result = await runUserCode({
+      code: ${JSON.stringify(code)},
+      globals: { page, files: createExecuteFiles(), handoffTracker: { count: 0 }, modules: {} },
+      onUnhandledRejection: (warning) => warnings.push(warning),
+    })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    console.log(JSON.stringify({ value: result.result, warnings }))
+  `
+  const child = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 15_000, env: { ...process.env, OPENCODE_BROWSER_HOME: home } })
+  if (child.status !== 0) throw new Error(`execute child failed: ${child.stderr}`)
+  return JSON.parse(child.stdout.trim().split("\n").at(-1) ?? "{}")
+}
 
 describe("ExecuteRealm", () => {
   test("runs code and returns plain data", async () => {
@@ -257,7 +273,8 @@ describe("Node escape corpus", () => {
       "return import('node:fs')",
     ], playwrightShapes)
     outcomes.forEach((outcome, index) => expect(outcome.error, `escape ${index}: ${JSON.stringify(outcome)}`).toBeDefined())
-    expect(runInNode(["return [typeof Atomics,typeof SharedArrayBuffer,typeof WeakRef,typeof FinalizationRegistry]"])[0]?.value).toEqual(Array(4).fill("undefined"))
+    // structuredClone stays out: a host one would clone the hidden `_` members behind a proxy into sandbox data.
+    expect(runInNode(["return [typeof Atomics,typeof SharedArrayBuffer,typeof WeakRef,typeof FinalizationRegistry,typeof structuredClone]"])[0]?.value).toEqual(Array(5).fill("undefined"))
   })
 
   // N18: every way execute JavaScript gets the CPU is bounded by one slice, so a runaway loop
@@ -362,6 +379,73 @@ describe("Node escape corpus", () => {
     expect(outcomes[6]?.value).toBe(42)
   })
 
+  test("an un-awaited helper rejection stops only its realm, is reported, and the call still returns", () => {
+    const [outcome] = runInNode([
+      `host.files.write("/tmp/some-file", "x"); return { ok: true }`,
+    ], playwrightShapes)
+    expect(outcome?.value).toEqual({ ok: true })
+    expect(outcome?.stopped).toMatch(/Unhandled execute rejection: files\.write: use a private subdirectory/)
+    // The call already returned, so this arrives through the sandbox's warning queue, not as its error.
+    expect(outcome?.warnings?.join("\n")).toContain("files.write: use a private subdirectory")
+  })
+
+  test("a hostile rejection value is never described on the host", () => {
+    const [throwing, looping] = runInNode([
+      `Promise.reject({ toString() { throw new Error("boom") } }); return 1`,
+      `Promise.reject({ toString() { for(;;){} } }); return 1`,
+    ])
+    for (const outcome of [throwing, looping]) {
+      expect(outcome?.value).toBe(1)
+      expect(outcome?.stopped).toMatch(/Unhandled execute rejection: reason not shown/)
+    }
+  }, 30_000)
+
+  test.skipIf(!process.versions.bun)("a hostile rejection value is never described on the host under Bun", () => {
+    const outcomes = runInBun([
+      `Promise.reject({ toString() { throw new Error("boom") } }); return 1`,
+      `Promise.reject({ toString() { for(;;){} } }); return 1`,
+    ])
+    for (const outcome of outcomes) {
+      expect(outcome?.value).toBe(1)
+      expect(outcome?.stopped).toMatch(/Unhandled execute rejection: reason not shown/)
+    }
+  }, 30_000)
+
+  test("full Node execute under Bun returns its value and leaves a late rejection to the generic guard", () => {
+    const outcome = runFullNodeExecute(`files.write("/tmp/some-file", "x"); return { ok: true }`)
+    expect(outcome.value).toEqual({ ok: true })
+    // Bun has no promiseHooks, so full-Node execute gets no per-call warning; the process guard still contains it.
+    expect(outcome.warnings ?? []).toEqual([])
+  })
+
+  test.skipIf(!process.versions.bun)("a stopped realm does not claim an untagged late promise under Bun", async () => {
+    const realm = new ExecuteRealm()
+    expect(await realm.run({ source: "(async () => 1)", filename: "test.js", args: [] })).toBe(1)
+    // `execute --rm` disposes the realm; a promise that is not a realm Promise must not be blamed on it.
+    realm.dispose(new Error("Session deleted after execute --rm"))
+    const late = Promise.reject(new Error("late host promise"))
+    void late.catch(() => {}) // attribution is what this test checks; don't raise a real unhandled event here
+    expect(handleExecuteRealmRejection(late, new Error("late host promise"))).toBe(false)
+  })
+
+  test("a hostile unattributed rejection is logged without running its toString", () => {
+    let called = false
+    const reason = { toString() { called = true; throw new Error("boom") } }
+    const rethrown: unknown[] = []
+    expect(() => handleRelayProcessFault("unhandledRejection", reason, {}, { rethrow: (cause) => { rethrown.push(cause); throw cause } })).not.toThrow()
+    expect(called).toBe(false)
+    expect(rethrown).toEqual([])
+  })
+
+  test("a rejection with no execute owner is logged and counted, not rethrown", () => {
+    const rethrown: unknown[] = []
+    const rethrow = (cause: unknown): never => { rethrown.push(cause); throw cause }
+    expect(() => handleRelayProcessFault("unhandledRejection", new Error("detached relay-side promise"), {}, { rethrow })).not.toThrow()
+    expect(rethrown).toEqual([])
+    // A synchronous programming fault in the relay still stops it.
+    expect(() => handleRelayProcessFault("uncaughtException", new Error("relay bug"), {}, { rethrow })).toThrow("relay bug")
+  })
+
   test("the files helper stays inside its roots through symlinks from sandbox code", () => {
     const outcomes = runInNode([
       "return await host.files.read('link-etc/hosts')",
@@ -382,6 +466,26 @@ describe("Node escape corpus", () => {
     expect(outcomes[6]?.value).toBe("fine")
   })
 })
+
+/** A browser whose tracing only stores the path, like Playwright's browser tracing. */
+class FakeTraceBrowser {
+  trace: string | undefined
+  failStart = false
+  stopCount = 0
+  async startTracing(_page: unknown, options: { path?: string } = {}) {
+    // Playwright stores the path before awaiting, even when the call then rejects.
+    this.trace = options.path
+    if (this.failStart) throw new Error("start failed")
+  }
+  async stopTracing() {
+    this.stopCount += 1
+    if (!this.trace) return Buffer.alloc(0)
+    fs.mkdirSync(path.dirname(this.trace), { recursive: true })
+    fs.writeFileSync(this.trace, "trace")
+    this.trace = undefined
+    return Buffer.alloc(0)
+  }
+}
 
 describe("execute file access", () => {
   test("files writes and reads inside its directory", async () => {
@@ -404,10 +508,156 @@ describe("execute file access", () => {
     expect(() => assertExecuteFilePath(path.join(link, "hosts"), "files.read")).toThrow(/outside the execute file roots/)
   })
 
-  test("refuses browse's own data directory even inside a temp root", async () => {
+  test("refuses browse's own folders even inside a temp root", async () => {
     const files = createExecuteFiles()
     fs.writeFileSync(path.join(home, "relay-token"), "secret")
-    await expect(files.read(path.join(home, "relay-token"))).rejects.toThrow(/data directory/)
+    await expect(files.read(path.join(home, "relay-token"))).rejects.toThrow(/browse's own files/)
+  })
+
+  test("refuses every browse root, the installed binary and its install siblings", () => {
+    const xdg = fs.mkdtempSync(path.join(os.tmpdir(), "browse-realm-xdg-"))
+    const variables = {
+      XDG_CONFIG_HOME: path.join(xdg, "config"),
+      XDG_DATA_HOME: path.join(xdg, "data"),
+      XDG_STATE_HOME: path.join(xdg, "state"),
+      XDG_CACHE_HOME: path.join(xdg, "cache"),
+      XDG_BIN_HOME: path.join(xdg, "bin"),
+    } satisfies NodeJS.ProcessEnv
+    const names = Object.keys(variables) as Array<keyof typeof variables>
+    const saved = new Map(names.map((name) => [name, process.env[name]]))
+    const savedBrowseHome = process.env.OPENCODE_BROWSER_HOME
+    // paths.ts honours XDG variables against the default home; drop OPENCODE_BROWSER_HOME so each root is separate.
+    delete process.env.OPENCODE_BROWSER_HOME
+    Object.assign(process.env, variables)
+    try {
+      for (const root of [configRoot(), dataRoot(), stateRoot(), cacheRoot()]) {
+        const file = path.join(root, "secret.json")
+        fs.mkdirSync(root, { recursive: true })
+        fs.writeFileSync(file, "secret")
+        expect(() => assertExecuteFilePath(file, "files.read")).toThrow(/inside browse's own files/)
+      }
+
+      const binary = installedBinaryPath()
+      fs.mkdirSync(path.dirname(binary), { recursive: true })
+      fs.writeFileSync(binary, "binary", { mode: 0o755 })
+      for (const denied of [
+        binary, `${binary}.new`, `${binary}.${process.pid}.new`, `${binary}.old-0123abcd`, `${binary}.migrate-${process.pid}`,
+        `${binary}.new/payload`, `${binary}.old-1/x`,
+      ]) {
+        expect(() => assertExecuteFilePath(denied, "files.write")).toThrow(/inside browse's own files/)
+      }
+      // A child literally named `..bypass` is inside the root, not a way out of it.
+      expect(() => assertExecuteFilePath(path.join(stateRoot(), "..bypass"), "files.write")).toThrow(/inside browse's own files/)
+
+      // Staging lands beside the resolved install folder even when the bin folder and the binary are both symlinks.
+      const realBin = path.join(xdg, "real-bin")
+      fs.mkdirSync(realBin, { recursive: true })
+      fs.rmSync(variables.XDG_BIN_HOME, { recursive: true, force: true })
+      fs.symlinkSync(realBin, variables.XDG_BIN_HOME)
+      fs.writeFileSync(path.join(realBin, "browse-target"), "binary", { mode: 0o755 })
+      fs.symlinkSync(path.join(realBin, "browse-target"), path.join(realBin, "browse"))
+      for (const staging of [path.join(variables.XDG_BIN_HOME, "browse.new"), path.join(realBin, "browse.new")]) {
+        expect(() => assertExecuteFilePath(staging, "files.write")).toThrow(/inside browse's own files/)
+      }
+
+      // Migration copies these roots into the live ones on the next run, so execute code must not stage files there.
+      const legacyData = path.join(variables.XDG_DATA_HOME, "opencode-browser")
+      fs.mkdirSync(legacyData, { recursive: true })
+      const legacyFile = path.join(legacyData, "relay-token")
+      fs.writeFileSync(legacyFile, "secret")
+      expect(() => assertExecuteFilePath(legacyFile, "files.read")).toThrow(/inside browse's own files/)
+      expect(() => assertExecuteFilePath(path.join(os.homedir(), ".browse", "bin", "browse"), "files.read"))
+        .toThrow(/inside browse's own files/)
+
+      const unrelated = path.join(xdg, "unrelated.txt")
+      fs.writeFileSync(unrelated, "fine")
+      expect(assertExecuteFilePath(unrelated, "files.read")).toBe(fs.realpathSync(unrelated))
+      const sibling = path.join(realBin, "other-tool")
+      fs.writeFileSync(sibling, "fine")
+      expect(assertExecuteFilePath(sibling, "files.read")).toBe(fs.realpathSync(sibling))
+    } finally {
+      for (const name of names) {
+        const value = saved.get(name)
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+      if (savedBrowseHome === undefined) delete process.env.OPENCODE_BROWSER_HOME
+      else process.env.OPENCODE_BROWSER_HOME = savedBrowseHome
+      fs.rmSync(xdg, { recursive: true, force: true })
+    }
+  })
+
+  test("refuses the everyday folders and installer binary while OPENCODE_BROWSER_HOME points elsewhere", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "browse-realm-override-"))
+    const variables = {
+      OPENCODE_BROWSER_HOME: path.join(root, "home"),
+      XDG_CONFIG_HOME: path.join(root, "config"),
+      XDG_DATA_HOME: path.join(root, "data"),
+      XDG_STATE_HOME: path.join(root, "state"),
+      XDG_CACHE_HOME: path.join(root, "cache"),
+      XDG_BIN_HOME: path.join(root, "bin"),
+    } satisfies NodeJS.ProcessEnv
+    const names = Object.keys(variables) as Array<keyof typeof variables>
+    const saved = new Map(names.map((name) => [name, process.env[name]]))
+    Object.assign(process.env, variables)
+    try {
+      // The override's own folders stay denied.
+      const overrideFile = path.join(variables.OPENCODE_BROWSER_HOME, "pairing-codes.json")
+      fs.mkdirSync(variables.OPENCODE_BROWSER_HOME, { recursive: true })
+      fs.writeFileSync(overrideFile, "{}")
+      expect(() => assertExecuteFilePath(overrideFile, "files.read")).toThrow(/inside browse's own files/)
+
+      // So do the everyday XDG folders the override hides from paths.ts.
+      const state = path.join(variables.XDG_STATE_HOME, "browse", "pairing-codes.json")
+      fs.mkdirSync(path.dirname(state), { recursive: true })
+      fs.writeFileSync(state, "{}")
+      expect(() => assertExecuteFilePath(state, "files.read")).toThrow(/inside browse's own files/)
+
+      // The installer still writes its binary at the installer path, not under the override.
+      const installer = installerBinaryPath()
+      expect(installer).toBe(path.join(variables.XDG_BIN_HOME, path.basename(installer)))
+      fs.mkdirSync(path.dirname(installer), { recursive: true })
+      fs.writeFileSync(installer, "binary", { mode: 0o755 })
+      expect(() => assertExecuteFilePath(installer, "files.write")).toThrow(/inside browse's own files/)
+      expect(() => assertExecuteFilePath(`${installer}.new/payload`, "files.write")).toThrow(/inside browse's own files/)
+    } finally {
+      for (const name of names) {
+        const value = saved.get(name)
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("legacyDataRoot ignores an empty or relative XDG_DATA_HOME", () => {
+    const saved = process.env.XDG_DATA_HOME
+    try {
+      for (const value of ["", "relative/data"]) {
+        process.env.XDG_DATA_HOME = value
+        expect(legacyDataRoot()).toBe(path.join(os.homedir(), ".local", "share", "opencode-browser"))
+      }
+      const absolute = path.join(scratch, "xdg-data")
+      process.env.XDG_DATA_HOME = absolute
+      expect(legacyDataRoot()).toBe(path.join(absolute, "opencode-browser"))
+    } finally {
+      if (saved === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = saved
+    }
+  })
+
+  test("browse-owned checks ignore case where the platform's filesystem does", () => {
+    for (const platform of ["darwin", "win32"] as const) {
+      expect(isInside("/tmp/xdg/BROWSE/config.json", "/tmp/xdg/browse", platform), platform).toBe(true)
+      expect(isInside("/TMP/xdg/browse/config.json", "/tmp/xdg/browse", platform), platform).toBe(true)
+      for (const sibling of ["/bin/BROWSE.NEW", "/bin/browse.NEW", "/bin/Browse.Old-1", "/BIN/browse.new", "/bin/browse.MIGRATE-9"]) {
+        expect(isInstallSibling(sibling, "/bin/browse", platform), `${platform} ${sibling}`).toBe(true)
+      }
+    }
+    // Linux keeps paths case-sensitive, so these are different files and stay allowed.
+    expect(isInside("/tmp/xdg/BROWSE/config.json", "/tmp/xdg/browse", "linux")).toBe(false)
+    expect(isInstallSibling("/bin/BROWSE.NEW", "/bin/browse", "linux")).toBe(false)
+    expect(isInstallSibling("/bin/browse.NEW", "/bin/browse", "linux")).toBe(false)
   })
 
   test("private helper directory and descriptor checks reject symlinks and hard links", async () => {
@@ -437,5 +687,291 @@ describe("execute file access", () => {
     expect(() => checkHostCall(bringToFront, {}, [])).toThrow(/bringToFront\(\) is blocked/)
     expect(() => checkHostCall(send, {}, ["Page.bringToFront"])).toThrow(/bringToFront\(\) is blocked/)
     expect(() => checkHostCall(send, {}, ["Page.navigate", { url: "https://example.com" }])).not.toThrow()
+  })
+
+  test.skipIf(process.platform === "win32")("Playwright file outputs are owner-only under a permissive umask", async () => {
+    const files = createExecuteFiles()
+    const output = path.join(files.dir, "shots", "nested", "page.png")
+    const page = {
+      // Like Playwright: recursive mkdir and writeFile, both filtered by the process umask.
+      async screenshot(options: { path?: string }) {
+        if (!options.path) return "buffer"
+        fs.mkdirSync(path.dirname(options.path), { recursive: true })
+        fs.writeFileSync(options.path, "png")
+        return "saved"
+      },
+    }
+    const previous = process.umask(0o002)
+    try {
+      const result = await run(`
+        const saved = await host.page.screenshot({ path: host.files.path("shots/nested/page.png") });
+        const output = host.files.path("shots/nested/page.png");
+        return [saved, output, await host.files.read(output, "utf8")];
+      `, { page, files })
+      expect(result).toEqual(["saved", output, "png"])
+    } finally {
+      process.umask(previous)
+    }
+    expect(fs.statSync(path.join(files.dir, "shots")).mode & 0o777).toBe(0o700)
+    expect(fs.statSync(path.join(files.dir, "shots", "nested")).mode & 0o777).toBe(0o700)
+    expect(fs.statSync(output).mode & 0o777).toBe(0o600)
+    fs.rmSync(path.join(files.dir, "shots"), { recursive: true, force: true })
+  })
+
+  test.skipIf(process.platform === "win32")("a group/world writable output folder is named in the error next to the remedy", async () => {
+    const files = createExecuteFiles()
+    const shared = path.join(files.dir, "shared-shots")
+    try {
+      fs.mkdirSync(shared)
+      fs.chmodSync(shared, 0o775)
+      const page = {
+        async screenshot(options: { path?: string }) {
+          fs.writeFileSync(options.path!, "png")
+        },
+      }
+      const error = await run(`await host.page.screenshot({ path: host.files.dir + "/shared-shots/page.png" }); return null;`, { page, files })
+        .then(() => undefined, (failure: Error) => failure)
+      expect(error?.message).toMatch(/file paths must use owned directories and files without group\/world write access/)
+      expect(error?.message).toContain(fs.realpathSync(shared))
+      expect(error?.message).toContain("files.path")
+      expect(fs.existsSync(path.join(shared, "page.png"))).toBe(false)
+    } finally {
+      fs.rmSync(shared, { recursive: true, force: true })
+    }
+  })
+
+  test("checkHostCall collects outputs without touching the filesystem", async () => {
+    const files = createExecuteFiles()
+    const dir = path.join(files.dir, "unprepared")
+    try {
+      function screenshot() {}
+      function start() {}
+      function stop() {}
+      const output = path.join(dir, "nested", "page.png")
+      expect(checkHostCall(screenshot, {}, [{ path: output }]).outputs).toHaveLength(1)
+      // Only top-level options count: a nested path is still checked, but it is not Playwright's output.
+      expect(checkHostCall(screenshot, {}, [{ widget: { path: path.join(dir, "other.png") } }]).outputs).toHaveLength(0)
+      // start/startChunk name intermediate folders; stop writes a path (tracing) or outputPath (network).
+      expect(checkHostCall(start, {}, [{ path: output }]).outputs).toHaveLength(0)
+      expect(checkHostCall(stop, {}, [{ path: output }]).outputs).toHaveLength(1)
+      expect(checkHostCall(stop, {}, [{ outputPath: output }]).outputs).toHaveLength(1)
+      expect(fs.existsSync(dir)).toBe(false)
+      // Construct traps check but never prepare, even under a name Playwright writes files for.
+      class Capture {
+        readonly path: string | undefined
+        constructor(options: { path?: string }) {
+          this.path = options.path
+        }
+      }
+      Object.defineProperty(Capture, "name", { value: "screenshot" })
+      const captured = await run(`const capture = new host.screenshot({ path: host.files.path("unprepared/nested/page.png") }); return capture.path;`, { screenshot: Capture, files })
+      expect(captured).toBe(output)
+      expect(fs.existsSync(dir)).toBe(false)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("an existing output file keeps its mode", async () => {
+    const files = createExecuteFiles()
+    const output = path.join(files.dir, "existing.png")
+    try {
+      fs.writeFileSync(output, "old", { mode: 0o640 })
+      fs.chmodSync(output, 0o640)
+      const page = {
+        async screenshot(options: { path?: string }) {
+          fs.writeFileSync(options.path!, "new")
+        },
+      }
+      await run(`await host.page.screenshot({ path: host.files.path("existing.png") }); return null;`, { page, files })
+      expect(fs.statSync(output).mode & 0o777).toBe(0o640)
+    } finally {
+      fs.rmSync(output, { force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("a failed output call still secures the file it created", async () => {
+    const files = createExecuteFiles()
+    const output = path.join(files.dir, "failed.png")
+    const previous = process.umask(0o002)
+    try {
+      const page = {
+        async screenshot(options: { path?: string }) {
+          fs.writeFileSync(options.path!, "partial")
+          throw new Error("capture failed")
+        },
+      }
+      await expect(run(`await host.page.screenshot({ path: host.files.path("failed.png") }); return null;`, { page, files }))
+        .rejects.toThrow("capture failed")
+      expect(fs.statSync(output).mode & 0o777).toBe(0o600)
+    } finally {
+      process.umask(previous)
+      fs.rmSync(output, { force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("a symlink at the output path is not chmodded", async () => {
+    const files = createExecuteFiles()
+    const outside = path.join(files.dir, "outside.txt")
+    const output = path.join(files.dir, "linked.png")
+    try {
+      fs.writeFileSync(outside, "secret", { mode: 0o644 })
+      fs.chmodSync(outside, 0o644)
+      const page = {
+        async screenshot(options: { path?: string }) {
+          fs.symlinkSync(outside, options.path!)
+        },
+      }
+      await run(`await host.page.screenshot({ path: host.files.path("linked.png") }); return null;`, { page, files })
+      expect(fs.lstatSync(output).isSymbolicLink()).toBe(true)
+      expect(fs.statSync(outside).mode & 0o777).toBe(0o644)
+    } finally {
+      fs.rmSync(output, { force: true })
+      fs.rmSync(outside, { force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("an output through a symlinked folder is refused and creates nothing", () => {
+    const files = createExecuteFiles()
+    const outside = path.join(files.dir, "outside-folder")
+    const link = path.join(files.dir, "linked-folder")
+    try {
+      fs.mkdirSync(outside)
+      fs.symlinkSync(outside, link)
+      const output = path.join(link, "nested", "page.png")
+      expect(() => prepareExecuteFileOutputs({ outputs: [{ path: output }] })).toThrow(/symlink|owned directories/)
+      expect(fs.existsSync(path.join(outside, "nested"))).toBe(false)
+    } finally {
+      fs.rmSync(link, { force: true })
+      fs.rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("an output below a symlinked ancestor is refused even with an existing child", () => {
+    const files = createExecuteFiles()
+    const outside = path.join(files.dir, "outside-parent")
+    const link = path.join(files.dir, "linked-parent")
+    try {
+      fs.mkdirSync(path.join(outside, "existing-child"), { recursive: true })
+      fs.symlinkSync(outside, link)
+      // The old walk stopped at the existing child and missed the symlink above it.
+      const output = path.join(link, "existing-child", "nested", "page.png")
+      expect(() => prepareExecuteFileOutputs({ outputs: [{ path: output }] })).toThrow(/symlink|owned directories/)
+      expect(fs.existsSync(path.join(outside, "existing-child", "nested"))).toBe(false)
+    } finally {
+      fs.rmSync(link, { force: true })
+      fs.rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("file-output methods get private folders, input paths are left alone", () => {
+    const files = createExecuteFiles()
+    const methods = [
+      ["screenshot", "path"], ["pdf", "path"], ["storageState", "path"], ["stopChunk", "path"],
+      ["screenshotWithLabels", "path"], ["screenshotDiff", "path"], ["stop", "outputPath"],
+    ] as const
+    try {
+      for (const [method, key] of methods) {
+        const output = path.join(files.dir, `${method}-output`, "file")
+        const fn = ({ [method]: () => {} } as Record<string, () => void>)[method]!
+        prepareExecuteFileOutputs(checkHostCall(fn, {}, [{ [key]: output }]))
+        expect(fs.statSync(path.dirname(output)).mode & 0o777, method).toBe(0o700)
+      }
+      // download.saveAs(path) and video.saveAs(path) take the file as their first argument.
+      const saved = path.join(files.dir, "saveAs-output", "file")
+      prepareExecuteFileOutputs(checkHostCall(function saveAs() {}, {}, [saved]))
+      expect(fs.statSync(path.dirname(saved)).mode & 0o777).toBe(0o700)
+      // addScriptTag reads its path; Playwright's own mkdir is not involved, so nothing is created for it.
+      const input = path.join(files.dir, "input", "file.js")
+      expect(() => checkHostCall(function addScriptTag() {}, {}, [{ path: input }])).not.toThrow()
+      expect(fs.existsSync(path.dirname(input))).toBe(false)
+    } finally {
+      for (const [method] of methods) fs.rmSync(path.join(files.dir, `${method}-output`), { recursive: true, force: true })
+      fs.rmSync(path.join(files.dir, "saveAs-output"), { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("tracing memory follows startTracing and stopTracing outcomes", async () => {
+    const files = createExecuteFiles()
+    const browser = new FakeTraceBrowser()
+    const output = path.join(files.dir, "traces", "trace.json")
+    const stale = path.join(files.dir, "stale-trace", "trace.json")
+    const rejected = path.join(files.dir, "rejected-trace", "trace.json")
+    const cleared = path.join(files.dir, "cleared-trace", "trace.json")
+    const previous = process.umask(0o002)
+    try {
+      await run(`await host.browser.startTracing(null, { path: host.files.path("traces/trace.json") }); return null;`, { browser, files })
+      expect(fs.existsSync(path.dirname(output))).toBe(false)
+      await run(`await host.browser.stopTracing(); return null;`, { browser })
+      expect(fs.statSync(path.dirname(output)).mode & 0o777).toBe(0o700)
+      expect(fs.statSync(output).mode & 0o777).toBe(0o600)
+      // A resolved stop forgets the path, so a later stop prepares nothing.
+      expect(checkHostCall(function stopTracing() {}, browser, []).outputs).toHaveLength(0)
+      // A remembered path that fails the guard keeps refusing and never reaches the browser.
+      prepareExecuteFileOutputs(checkHostCall(function startTracing() {}, browser, [null, { path: stale }]))
+      fs.mkdirSync(path.dirname(stale), { recursive: true })
+      fs.chmodSync(path.dirname(stale), 0o777)
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        await expect(run(`await host.browser.stopTracing(); return null;`, { browser })).rejects.toThrow(/group\/world write/)
+      }
+      expect(browser.stopCount).toBe(1)
+      // Playwright stores a rejected startTracing's path too, and the memory follows it.
+      browser.failStart = true
+      await expect(run(`await host.browser.startTracing(null, { path: host.files.path("rejected-trace/trace.json") }); return null;`, { browser, files }))
+        .rejects.toThrow("start failed")
+      await run(`await host.browser.stopTracing(); return null;`, { browser })
+      expect(fs.statSync(path.dirname(rejected)).mode & 0o777).toBe(0o700)
+      expect(fs.statSync(rejected).mode & 0o777).toBe(0o600)
+      // A pathless startTracing clears what the previous one remembered.
+      browser.failStart = false
+      await run(`await host.browser.startTracing(null, { path: host.files.path("cleared-trace/trace.json") }); return null;`, { browser, files })
+      await run(`await host.browser.startTracing(null); return null;`, { browser })
+      await run(`await host.browser.stopTracing(); return null;`, { browser })
+      expect(fs.existsSync(path.dirname(cleared))).toBe(false)
+    } finally {
+      process.umask(previous)
+      for (const dir of ["traces", "stale-trace", "rejected-trace", "cleared-trace"]) fs.rmSync(path.join(files.dir, dir), { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("tracing.stop is secured under a permissive umask", async () => {
+    const files = createExecuteFiles()
+    const output = path.join(files.dir, "trace-stop", "trace.zip")
+    const previous = process.umask(0o002)
+    try {
+      const tracing = {
+        // Like localUtils.zip: writes the archive with the process umask and no mkdir.
+        async stop(options: { path?: string } = {}) {
+          if (!options.path) return
+          fs.writeFileSync(options.path, "zip")
+        },
+      }
+      await run(`await host.tracing.stop({ path: host.files.path("trace-stop/trace.zip") }); return null;`, { tracing, files })
+      expect(fs.statSync(path.dirname(output)).mode & 0o777).toBe(0o700)
+      expect(fs.statSync(output).mode & 0o777).toBe(0o600)
+    } finally {
+      process.umask(previous)
+      fs.rmSync(path.join(files.dir, "trace-stop"), { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(process.platform === "win32")("download.saveAs secures the file it copies", async () => {
+    const files = createExecuteFiles()
+    const output = path.join(files.dir, "saves", "file.bin")
+    const previous = process.umask(0o002)
+    try {
+      const download = {
+        async saveAs(target: string) {
+          fs.mkdirSync(path.dirname(target), { recursive: true })
+          fs.writeFileSync(target, "data")
+        },
+      }
+      await run(`await host.download.saveAs(host.files.path("saves/file.bin")); return null;`, { download, files })
+      expect(fs.statSync(path.dirname(output)).mode & 0o777).toBe(0o700)
+      expect(fs.statSync(output).mode & 0o777).toBe(0o600)
+    } finally {
+      process.umask(previous)
+      fs.rmSync(path.join(files.dir, "saves"), { recursive: true, force: true })
+    }
   })
 })

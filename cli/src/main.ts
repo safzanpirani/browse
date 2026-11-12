@@ -6,24 +6,37 @@
 //   find (find.ts): which browser has a site attached, without starting the relay.
 // `browse mcp` runs the MCP server over stdio (as does the bundle invoked as `opencode-browser-mcp`).
 // `--profile <browser>` on any command picks the paired browser new sessions use (browser-profile.ts).
-import fs from "node:fs"
-import os from "node:os"
 import path from "node:path"
 import { applyProfileSelection } from "./browser-profile.ts"
+import { legacyRootsLeft, legacyRuntime, legacyRuntimeActive, settleLegacyHome } from "./setup/legacy.ts"
 
 applyProfileSelection()
 const embeddedVersion = globalThis.__OPENCODE_BROWSER_VERSION__
 const setupCommands = new Set(["install", "uninstall", "extension", "pair", "set"])
 const command = process.argv[2]
+const args = process.argv.slice(3)
 const invokedAs = path.basename(process.argv[1] ?? "")
+// Setup commands and update run before the Effect CLI parses arguments (below), so they would act on --help instead of
+// printing it. This mirrors the help check in cli.ts's quiet-JSON handling, but stops at `--`: everything after it belongs
+// to another program (browse secrets run prod -- mytool --help), so it is not a help request for browse.
+const separator = args.indexOf("--")
+const options = separator === -1 ? args : args.slice(0, separator)
+const askedForHelp = command === "--help" || command === "-h" || options.some((arg) => arg === "--help" || arg === "-h")
+/** Help for a command that never reaches the Effect CLI: print the top-level help instead. */
+const preCliHelp = askedForHelp && (command === "update" || (command !== undefined && setupCommands.has(command)))
+
+// The old self-managed runtime (setup/legacy.ts): a relay started from this install takes it over once it owns the port
+// (setup/legacy-runtime.ts). Every other process shares its folder while it's active, and stops treating that folder as
+// OPENCODE_BROWSER_HOME once it's taken over.
+const oldRuntime = legacyRuntime()
+const takingOver = command === "serve" && !askedForHelp && legacyRuntimeActive(oldRuntime) &&
+  (await import("./setup/legacy-runtime.ts").then((module) => module.prepareLegacyTakeover(oldRuntime)).catch(() => false))
+if (!takingOver) settleLegacyHome(process.env, oldRuntime)
 
 // Earlier layouts (~/.browse, and the old opencode-browser data root) move to the XDG folders on the first run.
 // opencode briefly shows the update, and no other command pays for the import.
-const legacyDataRoot = process.platform === "win32"
-  ? path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "opencode-browser")
-  : path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share"), "opencode-browser")
-if (command !== "--version" && command !== "-v" && !process.env.OPENCODE_BROWSER_HOME &&
-  [path.join(os.homedir(), ".browse"), legacyDataRoot].some((root) => fs.existsSync(root))) {
+// A takeover migrates once its relay owns the port.
+if (command !== "--version" && command !== "-v" && !askedForHelp && !takingOver && !process.env.OPENCODE_BROWSER_HOME && legacyRootsLeft()) {
   try {
     const { migrateLegacy } = await import("./setup/migrate.ts")
     migrateLegacy()
@@ -41,23 +54,48 @@ if (command === "--version" || command === "-v") {
   await runBinaryMcp(process.argv.slice(3))
 } else if (invokedAs === "opencode-browser-mcp" || (command === "mcp" && process.argv.length === 3)) {
   const { NodeRuntime } = await import("@effect/platform-node")
+  const { defaultTeardown } = await import("effect/Runtime")
   const { runMcpServer } = await import("./mcp.ts")
-  runMcpServer.pipe(NodeRuntime.runMain)
+  // An MCP client shuts a stdio server down by closing its stdin. A 2026-07-28 client's open `subscriptions/listen`
+  // keeps the RPC server from ending on its own, so mcp.ts interrupts it once stdin closes and the tool calls still
+  // running have answered. The default teardown reads an interrupt-only exit as 130, SIGINT's code; that EOF is a clean
+  // shutdown here, so exit 0 instead. A real SIGINT or SIGTERM still exits 130. `process.exit` doesn't wait for a
+  // background update check's git calls that would otherwise hold the event loop open.
+  let stdinGone = false
+  const onStdinGone = () => {
+    stdinGone = true
+  }
+  process.stdin.once("end", onStdinGone)
+  process.stdin.once("close", onStdinGone)
+  process.stdin.once("error", onStdinGone)
+  let signalled = false
+  const onSignal = () => {
+    signalled = true
+  }
+  process.once("SIGINT", onSignal)
+  process.once("SIGTERM", onSignal)
+  runMcpServer.pipe(NodeRuntime.runMain({
+    teardown: (exit, onExit) =>
+      defaultTeardown(exit, (code) => {
+        if (stdinGone && !signalled && code === 130) return process.exit(0)
+        onExit(code)
+      }),
+  }))
 } else if (command === "self-update" || command === "runtime-switch") {
   // The relay's auto-update children (auto-update.ts); not for people.
   const { runSelfUpdate, runRuntimeSwitch } = await import("./update/runtime-update.ts")
   await (command === "self-update" ? runSelfUpdate : runRuntimeSwitch)(process.argv.slice(3))
-} else if (command === "update") {
+} else if (command === "update" && !askedForHelp) {
   const { runUpdateCommand } = await import("./update.ts")
   await runUpdateCommand(process.argv.slice(3))
 } else if (command === "find") {
   const { runFindCommand } = await import("./find.ts")
   await runFindCommand(process.argv.slice(3))
-} else if (command && setupCommands.has(command)) {
+} else if (command && setupCommands.has(command) && !askedForHelp) {
   const { runSetup } = await import("./setup.ts")
   await runSetup(command, process.argv.slice(3))
 } else {
-  if (!command || command === "--help" || command === "-h") {
+  if (preCliHelp || !command || command === "--help" || command === "-h") {
     process.stdout.write(`SETUP
   install [--opencode <path>]    Install browse: choose agents for the browse MCP server, check which browsers
                                  have the extension and pair it (when none does, say to add it from the Chrome
@@ -85,7 +123,7 @@ if (command === "--version" || command === "-v") {
                                  install, npm install -g for an npm one); --check only says whether there's an
                                  update. A git clone pulls the newer commits and runs setup again.
   uninstall [--yes]              Remove everything install set up (--yes skips confirming that stored
-                                 secret profiles are deleted); --client omp removes only omp's files
+                                 secret profiles and site secrets are deleted); --client omp removes only omp's files
 
 BROWSERS (one relay drives every paired browser; each Chrome profile with browse is one)
   --profile <browser>            On any command: new sessions (execute, session new) and settings use this
@@ -100,10 +138,10 @@ executable in ~/.local/bin (or $XDG_BIN_HOME).
 
 `)
   }
-  if (command === "status" && !process.argv.includes("--json")) {
+  if (command === "status" && !askedForHelp && !process.argv.includes("--json")) {
     const { printSetupStatus } = await import("./setup.ts")
     printSetupStatus()
   }
   const { runCli } = await import("./cli.ts")
-  runCli()
+  runCli(preCliHelp ? ["--help"] : undefined)
 }

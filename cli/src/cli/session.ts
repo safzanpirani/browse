@@ -36,7 +36,7 @@ const sessionNew = Command.make(
     readOnly: Flag.Boolean("read-only").pipe(
       Flag.withDefault(false),
       Flag.withDescription(
-        "Create a read-only session: the relay rejects input-dispatching CDP so scripts can inspect but not click or type",
+        "Create a read-only session: adopt a tab the user has lent you, then snapshot, screenshot and read it; CDP input, navigation, new pages and cookie writes are refused",
       ),
     ),
     allowOrigin: Flag.String("allow-origin").pipe(
@@ -45,15 +45,22 @@ const sessionNew = Command.make(
         "Only let this session's tabs load these hosts or origins (repeatable or comma-separated): example.com, *.example.com, https://app.example.com, http://localhost:3000",
       ),
     ),
+    browser: Flag.String("browser").pipe(
+      Flag.optional,
+      Flag.withDescription(
+        "Open this session's tabs in the connected browser with this id or name (browse status --json lists them); omit for the default browser",
+      ),
+    ),
   },
-  Effect.fn("Cli.sessionNew")(function* ({ name, readOnly, allowOrigin }) {
+  Effect.fn("Cli.sessionNew")(function* ({ name, readOnly, allowOrigin, browser }) {
     const relay = yield* RelayClient.Service
     yield* ensureCliRelay()
     const store = yield* SessionStore.Service
+    const browserValue = Option.getOrUndefined(browser) ?? selectedBrowser()
     const result = yield* relay.sessionNew(Option.getOrUndefined(name), {
       ...(readOnly ? { readOnly: true } : {}),
       ...(allowOrigin.length > 0 ? { allowedOrigins: allowOrigin } : {}),
-      ...(selectedBrowser() ? { browser: selectedBrowser()! } : {}),
+      ...(browserValue ? { browser: browserValue } : {}),
     })
     yield* store.write(result.id)
     yield* Console.log(result.id)

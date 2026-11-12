@@ -1,5 +1,6 @@
 import { Deferred, Effect, Option, Semaphore } from "effect"
 import { ExecuteSandbox, type ExecuteTargetSelection } from "./execute.ts"
+import { ExecuteCpuScheduler } from "./execute-realm.ts"
 import type { NetworkCaptureOptions, NetworkCaptureResult, NetworkCaptureStatus, NetworkCaptureStopOptions } from "./network-capture.ts"
 import { generateSessionId } from "./relay/helpers.ts"
 import type { AuthenticatedJsonOutcome, AuthenticatedJsonRequest } from "./relay/schema.ts"
@@ -9,11 +10,13 @@ import { SessionAdmission } from "./session-manager/admission.ts"
 import { adoptTargetForSession, closeSessionSettledWithTimeout, sessionRelayTargetIds, type AdoptionContext } from "./session-manager/adoption.ts"
 import { executeInSession, type ExecutionContext } from "./session-manager/execution.ts"
 import {
+  defaultShutdownTimeoutMs,
   sessionError,
   sessionSummary,
   trySession,
   type AdoptionResult,
   type ExecutionResponse,
+  type PendingSessionWork,
   type RunningExecution,
   type SessionCreateOptions,
   type SessionExecuteRecord,
@@ -29,6 +32,7 @@ import {
 export {
   adoptionTipForUrl,
   defaultExecuteTimeoutMs,
+  defaultShutdownTimeoutMs,
   SessionError,
   shouldAppendAdoptionTip,
   type SessionExecuteRecord,
@@ -53,6 +57,8 @@ export function isAutoNamedSession(id: string): boolean {
 
 export class OpenCodeBrowserSessions {
   readonly sessions = new Map<string, OpenCodeBrowserSession>()
+  /** One per relay: every session's execute realm shares the event loop through it. */
+  readonly cpuScheduler = new ExecuteCpuScheduler()
   private readonly createSandbox: (id: string, onDefaultTargetChange: (target: SessionTarget | undefined) => void) => ExecuteSandboxLike
   private readonly hooks: SessionHooks
   private readonly executing = new Set<string>()
@@ -70,7 +76,7 @@ export class OpenCodeBrowserSessions {
     hooks?: SessionHooks,
     targetOwnership?: TargetOwnership,
   ) {
-    this.createSandbox = createSandbox ?? ((id, onDefaultTargetChange) => new ExecuteSandbox({ endpointUrl: this.endpointUrl, sessionId: id, onDefaultTargetChange }))
+    this.createSandbox = createSandbox ?? ((id, onDefaultTargetChange) => new ExecuteSandbox({ endpointUrl: this.endpointUrl, sessionId: id, onDefaultTargetChange, cpuScheduler: this.cpuScheduler }))
     this.hooks = hooks ?? {}
     this.targetOwnership = targetOwnership ?? new MemoryTargetOwnership()
     this.admission = new SessionAdmission(this.sessions, this.hooks)
@@ -344,9 +350,9 @@ export class OpenCodeBrowserSessions {
     return this.collectSessionIds((session) => session.sandbox.markTargetProtectedUi(targetId, protectedUi))
   }
 
-  markTargetDetached(targetId: string): string[] {
+  markTargetDetached(targetId: string, options: { readonly releasedByUser?: boolean } = {}): string[] {
     return this.collectSessionIds((session) => {
-      const detached = session.sandbox.markTargetDetached(targetId)
+      const detached = session.sandbox.markTargetDetached(targetId, options)
       if (session.target?.id === targetId && session.target.owner === "user") {
         this.notifyTargetOwnershipChange(this.targetOwnership.releaseTargetOwnership(targetId, session.id))
       }
@@ -383,6 +389,13 @@ export class OpenCodeBrowserSessions {
         }))
         yield* manager.releaseSessionTargetOwnership(session)
         yield* manager.closeOpenCodeBrowserSession(session)
+        yield* Effect.sync(() => {
+          try {
+            manager.hooks.onSessionDeleted?.(id)
+          } catch (error) {
+            console.error("Session deleted hook failed", error)
+          }
+        })
         return true
       })))
       return { deleted, ...(stopped ? { stopped } : {}) }
@@ -543,21 +556,48 @@ export class OpenCodeBrowserSessions {
     this.admission.resume()
   }
 
-  closeAll(): Effect.Effect<void> {
+  /**
+   * Relay shutdown: stop admitting, let accepted work finish and disconnect the sessions, but wait at most
+   * `timeoutMs`. A session whose work never finishes is reported through `onStalled` and dropped so the process can
+   * exit.
+   */
+  closeAll(options: {
+    readonly timeoutMs?: number
+    /** Sessions still holding work when the wait expired, called before they are dropped. */
+    readonly onStalled?: (sessions: readonly PendingSessionWork[]) => void
+  } = {}): Effect.Effect<void> {
     const manager = this
-    return Effect.gen(function* () {
+    // Persisting the catalog is the shutdown's only chance to record the sessions it held; a stuck write must not
+    // keep the process alive either.
+    const stalledFlushMs = 1_000
+    // Only the wait is interruptible (so the timeout can end it); naming, persisting and dropping stragglers is not.
+    return Effect.uninterruptible(Effect.gen(function* () {
       manager.admission.markClosed()
-      yield* manager.admission.beginDrain().pipe(Effect.ignore)
-      yield* manager.adoptSemaphore.withPermit(Effect.gen(function* () {
-        yield* Effect.forEach(Array.from(manager.sessions.values()), (session) => {
-          return session.executeSemaphore.withPermit(
-            manager.disconnectOpenCodeBrowserSession(session),
-          )
-        }, { concurrency: "unbounded", discard: true })
-        yield* manager.admission.flushPersistence().pipe(Effect.ignore)
-        manager.sessions.clear()
-      }))
-    }).pipe(Effect.uninterruptible)
+      yield* Effect.interruptible(Effect.gen(function* () {
+        yield* manager.admission.beginDrain().pipe(Effect.ignore)
+        yield* manager.adoptSemaphore.withPermit(Effect.gen(function* () {
+          yield* Effect.forEach(Array.from(manager.sessions.values()), (session) => {
+            return session.executeSemaphore.withPermit(
+              manager.disconnectOpenCodeBrowserSession(session),
+            )
+          }, { concurrency: "unbounded", discard: true })
+          yield* manager.admission.flushPersistence().pipe(Effect.ignore)
+          manager.sessions.clear()
+        }))
+      })).pipe(
+        Effect.timeoutOrElse({
+          duration: options.timeoutMs ?? defaultShutdownTimeoutMs,
+          orElse: () => Effect.gen(function* () {
+            options.onStalled?.(manager.admission.pendingWorkBySession())
+            yield* Effect.interruptible(manager.admission.flushPersistence()).pipe(
+              Effect.timeoutOrElse({ duration: stalledFlushMs, orElse: () => Effect.void }),
+              Effect.ignore,
+            )
+            manager.sessions.clear()
+          }),
+        }),
+      )
+    }))
   }
 
   summary(id: string): SessionSummary | undefined {

@@ -12,9 +12,11 @@ import {
   replayTargetCreated,
 } from "../cdp/shims.ts"
 import { ghostCursorCommandMethod, type GhostCursorTabs } from "../ghost-cursor.ts"
+import { clearDeviceMetricsOverride, type DeviceMetricsOverrides } from "../cdp/emulation.ts"
 import { beforeInput } from "../execute/human-input.ts"
 import { isCdpRequest, parseJsonObject, type CdpRequest, type JsonObject } from "../protocol.ts"
-import { dataUrlDocument, getIdText, getNumber, getObject, getString, sendCdpResponse } from "./helpers.ts"
+import { navigateTopFrameToDataUrl } from "./data-navigation.ts"
+import { createTargetUrl, getIdText, getNumber, getObject, getString, sendCdpResponse } from "./helpers.ts"
 import { relayLog } from "./log.ts"
 import type { RelayShutdown } from "./shutdown.ts"
 import type { ChildTarget, ConnectedTarget } from "./types.ts"
@@ -36,6 +38,7 @@ export function createCdpDispatcher(options: {
   readonly navigationGuard: SessionNavigationGuard
   readonly ghostCursor: GhostCursorTabs
   readonly tabActivity: TabActivity
+  readonly deviceMetricsOverrides: DeviceMetricsOverrides
   readonly mainFrameIdsByTab: Map<number, string>
   readonly blankNavigationWaiters: Map<number, (url: string, loaderId: string | undefined) => void>
   readonly sendDebuggerCommand: (command: { readonly tabId: number; readonly sessionId?: string; readonly method: string; readonly params: JsonObject }) => Effect.Effect<JsonObject, Error>
@@ -64,6 +67,7 @@ export function createCdpDispatcher(options: {
     navigationGuard,
     ghostCursor,
     tabActivity,
+    deviceMetricsOverrides,
     mainFrameIdsByTab,
     blankNavigationWaiters,
     sendDebuggerCommand,
@@ -103,7 +107,21 @@ export function createCdpDispatcher(options: {
     yield* ghostCursor.mouseEvent(mouseOptions.tabId, mouseOptions.message.params)
   })
 
+  // A hidden tab can leave Page.captureScreenshot pending until another capture reaches it. The nudge is what releases
+  // it, and Chromium answers every pending capture with the surface's bitmap tiled out to its own size, so the nudge
+  // must keep the surface the size the original asked for: a 1x1 clip shrank it and the client got a blank image.
+  // Encoding is per request, so the nudge can be a cheap JPEG. A clip already gives the same surface size, and
+  // captureBeyondViewport would re-apply the original's temporary full-page preferences and leave them behind, so it
+  // is dropped when there is a clip.
+  function captureScreenshotNudgeParams(params: JsonObject): JsonObject {
+    const nudge: JsonObject = { ...params, format: "jpeg", quality: 1 }
+    if (nudge.clip === undefined) return nudge
+    const { captureBeyondViewport: _fullPage, ...clipped } = nudge
+    return clipped
+  }
+
   function captureScreenshotNudged(command: { readonly tabId: number; readonly method: string; readonly params: JsonObject }) {
+    const nudgeParams = captureScreenshotNudgeParams(command.params)
     const nudges = Effect.gen(function* () {
       for (const delayMs of [600, 1_000, 1_500, 2_000, 3_000, 5_000, 8_000]) {
         yield* Effect.sleep(delayMs)
@@ -111,44 +129,13 @@ export function createCdpDispatcher(options: {
         yield* Effect.forkDetach(sendDebuggerCommand({
           tabId: command.tabId,
           method: "Page.captureScreenshot",
-          params: { format: "jpeg", quality: 1, clip: { x: 0, y: 0, width: 1, height: 1, scale: 1 } },
+          params: nudgeParams,
         }).pipe(Effect.ignore))
       }
       return yield* Effect.never
     })
     return Effect.raceFirst(sendDebuggerCommand(command), nudges)
   }
-
-  const navigateTopFrameToDataUrl = Effect.fnUntraced(function* (tabId: number, params: JsonObject | undefined) {
-    const url = getString(params, "url")?.trim()
-    if (!url || !/^data:/i.test(url)) return undefined
-    const frameId = mainFrameIdsByTab.get(tabId) ?? registry.tabTargets.get(tabId)?.targetInfo.targetId
-    const requestedFrameId = getString(params, "frameId")
-    if (!frameId || (requestedFrameId !== undefined && requestedFrameId !== frameId) || blankNavigationWaiters.has(tabId)) return undefined
-    const html = yield* Effect.tryPromise(() => dataUrlDocument(url)).pipe(Effect.orElseSucceed(() => undefined))
-    if (html === undefined) return undefined
-    const committedLoaders = new Set<string>()
-    let loaderCommitted: (loaderId: string) => void = () => {}
-    blankNavigationWaiters.set(tabId, (frameUrl, loaderId) => {
-      if (frameUrl !== "about:blank" || loaderId === undefined) return
-      committedLoaders.add(loaderId)
-      loaderCommitted(loaderId)
-    })
-    return yield* Effect.gen(function* () {
-      const navigated = yield* sendDebuggerCommand({ tabId, method: "Page.navigate", params: { url: "about:blank", frameId } })
-      const loaderId = getString(navigated, "loaderId")
-      if (getString(navigated, "errorText") || loaderId === undefined) return navigated
-      if (!committedLoaders.has(loaderId)) {
-        const committed = yield* Effect.promise(() => new Promise<void>((resolve) => {
-          loaderCommitted = (id) => { if (id === loaderId) resolve() }
-        })).pipe(Effect.timeoutOption(10_000))
-        if (committed._tag === "None") return navigated
-      }
-      yield* sendDebuggerCommand({ tabId, method: "Page.setDocumentContent", params: { frameId, html } })
-      relayLog("navigate.data", { tabId, chars: html.length })
-      return { frameId: getString(navigated, "frameId") ?? frameId, loaderId } as JsonObject
-    }).pipe(Effect.ensuring(Effect.sync(() => { blankNavigationWaiters.delete(tabId) })))
-  })
 
   const routeCdpCommand = Effect.fn("Relay.routeCdpCommand")(function* (socket: WebSocket, message: CdpRequest) {
     const clientOpenCodeBrowserSessionId = cdpClients.sessionId(socket)
@@ -252,7 +239,7 @@ export function createCdpDispatcher(options: {
     }
     if (message.method === "Target.createTarget" || message.method === "Target.closeTarget") {
       if (message.method === "Target.createTarget") {
-        const url = getString(message.params, "url") ?? "about:blank"
+        const url = createTargetUrl(message.params)
         const opencodeBrowserSessionId = cdpClients.sessionId(socket)
         const autoAttachParams = cdpClients.autoAttachParams(socket)
         const target = yield* createAndAttachTab({
@@ -293,8 +280,42 @@ export function createCdpDispatcher(options: {
       yield* tabActivity.focus(tabId, executingSession)
     }
     if (message.method === ghostCursorCommandMethod) return yield* ghostCursor.command(tabId, message.params)
+    // A page's CDP sessions are aliases onto the tab's chrome.debugger session, so a clear from
+    // context.newCDPSession(page) already reaches the session that set the override; repeating it
+    // covers Chrome dropping one that races the set's visible-size update. Emulation only applies
+    // at the top target, so a clear addressed to a child frame goes to the tab instead (a separate
+    // fix: that request would otherwise clear nothing).
+    if (message.method === "Emulation.clearDeviceMetricsOverride") {
+      const clientSessionId = cdpClients.sessionId(socket)
+      const owner = deviceMetricsOverrides.sessionId(tabId)
+      if (clientSessionId !== undefined && owner !== undefined && owner !== clientSessionId) {
+        // Another session's script set this tab's current override; this clear would wipe it.
+        return {}
+      }
+      const generation = deviceMetricsOverrides.generation(tabId)
+      yield* clearDeviceMetricsOverride(
+        (method, params) => sendDebuggerCommand({ tabId, method, params }),
+        { retry: () => deviceMetricsOverrides.isCurrent(tabId, generation) },
+      )
+      // The override is gone, so the execute end does not need to clear it again.
+      deviceMetricsOverrides.clear(tabId, generation, clientSessionId)
+      return {}
+    }
+    if (message.method === "Emulation.setDeviceMetricsOverride" && route.chromeSessionId === undefined) {
+      // Emulation only applies at the top target. Remember the tab, and which session's client set
+      // it, so the execute end can clear it if the script doesn't; a raw client without a browse
+      // session id marks without an owner, so no session's execute end will clear its viewport.
+      deviceMetricsOverrides.mark(tabId, cdpClients.sessionId(socket))
+    }
     if (message.method === "Page.navigate" && route.chromeSessionId === undefined) {
-      const dataNavigation = yield* navigateTopFrameToDataUrl(tabId, message.params)
+      const dataNavigation = yield* navigateTopFrameToDataUrl({
+        tabId,
+        params: message.params,
+        mainFrameIdsByTab,
+        blankNavigationWaiters,
+        registry,
+        sendDebuggerCommand,
+      })
       if (dataNavigation) return dataNavigation
     }
     const scoped = tabScopedCookieCommand(route, normalizedMessage.method, normalizedMessage.params ?? {})

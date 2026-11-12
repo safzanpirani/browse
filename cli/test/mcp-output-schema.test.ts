@@ -15,6 +15,7 @@ import {
 } from "../src/mcp/schema.ts"
 import type * as RelayClient from "../src/relay/client.ts"
 import type { ExecuteResponse } from "../src/relay/schema.ts"
+import { parseSettingChanges, settingSpecs, SettingsInputError } from "../src/relay/user-settings.ts"
 
 function executeResponse(overrides: Partial<ExecuteResponse> = {}): ExecuteResponse {
   return {
@@ -49,11 +50,52 @@ function textBlocks(result: McpSchema.CallToolResult): string[] {
   return result.content.flatMap((item) => item.type === "text" ? [item.text] : [])
 }
 
+/** The JSON type of a value. Integer and number are one type: JSON Schema matches either against both. */
+function jsonType(value: unknown): string {
+  return typeof value === "number" ? "number" : value === null ? "null" : typeof value
+}
+
+/** Every `enum` and `const` in a JSON Schema, with its path and the `type` declared beside it, if any. */
+function literals(schema: unknown): Array<{ path: string; type: string | undefined; values: readonly unknown[] }> {
+  const found: Array<{ path: string; type: string | undefined; values: readonly unknown[] }> = []
+  const visit = (node: unknown, path: string) => {
+    if (Array.isArray(node)) return node.forEach((item, index) => visit(item, `${path}[${index}]`))
+    if (node === null || typeof node !== "object") return
+    const record = node as Record<string, unknown>
+    const type = typeof record.type === "string" ? record.type : undefined
+    if (Array.isArray(record.enum)) found.push({ path: `${path}.enum`, type, values: record.enum })
+    if ("const" in record) found.push({ path: `${path}.const`, type, values: [record.const] })
+    for (const [key, value] of Object.entries(record)) visit(value, `${path}.${key}`)
+  }
+  visit(schema, "")
+  return found
+}
+
+function matchesJsonType(type: string, value: unknown): boolean {
+  switch (type) {
+    case "integer": return typeof value === "number" && Number.isInteger(value)
+    case "number": return typeof value === "number"
+    case "string": return typeof value === "string"
+    case "boolean": return typeof value === "boolean"
+    case "null": return value === null
+    case "array": return Array.isArray(value)
+    case "object": return typeof value === "object" && value !== null && !Array.isArray(value)
+    default: return true
+  }
+}
+
+/** Every JSON Schema the MCP server advertises: each tool's input, and its structured result's output. */
+function advertisedSchemas(): Array<{ name: string; json: unknown }> {
+  return specs().flatMap((spec) => [
+    { name: `${spec.name} input`, json: spec.inputSchema },
+    ...(spec.outputSchema ? [{ name: `${spec.name} output`, json: toolOutputJson(spec.outputSchema) }] : []),
+  ])
+}
+
 describe("tool output schemas", () => {
   test("the main tools advertise an object-root output schema", () => {
     const byName = new Map(specs().map((spec) => [spec.name, spec]))
     const expected = [
-      "execute",
       "status",
       "session_new",
       "session_allowlist",
@@ -80,6 +122,21 @@ describe("tool output schemas", () => {
       expect(json.type, name).toBe("object")
       expect(json.properties, name).toBeDefined()
     }
+  })
+
+  test("execute advertises no output schema, so a client that validates one accepts its image results", () => {
+    const execute = specs().find((spec) => spec.name === "execute")!
+    expect(execute.outputSchema).toBeUndefined()
+    const result = executeToolResult(executeResponse({
+      text: "Returned 1 image",
+      media: [{ type: "image", mimeType: "image/png", data: Buffer.from("png").toString("base64"), size: 3 }],
+    }))
+    expect(result.structuredContent).toBeUndefined()
+    expect(result.content.map((item) => item.type)).toEqual(["text", "image"])
+    // The MCP SDK client rejects a non-error result without structured content from a tool that declares an output
+    // schema. Every screenshot hit that while execute declared one.
+    const rejected = execute.outputSchema !== undefined && result.structuredContent === undefined && !result.isError
+    expect(rejected).toBe(false)
   })
 
   test("tool annotations describe what each tool can do", () => {
@@ -315,34 +372,59 @@ describe("tool output schemas", () => {
     expect(textBlocks(result)).toEqual(["42"])
   })
 
-  test("execute errors are MCP errors and keep diagnostics, not an isError field", () => {
+  test("execute errors put their warnings, diagnostic, page movement and logs in the text, with no structured content", () => {
     const result = executeToolResult(executeResponse({
       text: "Error: boom\n    at script:1:1",
       isError: true,
+      logs: [{ source: "script", type: "log", text: "step 1" }, { source: "page", type: "error", text: "bad", repeatCount: 3 }],
       warnings: ["the page navigated"],
+      diagnostic: "execution-context/context-destroyed; pageClosed=false; urlChanged=true; mainFrameNavigations=1",
       aftermath: {
         startUrl: "https://example.com/one",
-        endUrl: "https://example.com/one",
-        navigations: [],
+        endUrl: "https://example.com/two",
+        navigations: ["https://example.com/two"],
         consoleErrorCount: 1,
         pageErrorCount: 0,
         handoffs: 0,
       },
     }))
     expect(result.isError).toBe(true)
+    expect(result.structuredContent).toBeUndefined()
+    expect(textBlocks(result)).toEqual([[
+      "Error: boom\n    at script:1:1",
+      "Warnings:\n- the page navigated",
+      "Diagnostic: execution-context/context-destroyed; pageClosed=false; urlChanged=true; mainFrameNavigations=1",
+      "Page: moved from https://example.com/one to https://example.com/two; 1 navigation; 1 console error",
+      "Logs (2):\n[log] step 1\n[page error] bad (×3)",
+    ].join("\n\n")])
+  })
+
+  test("a bare execute error stays just the message", () => {
+    const result = executeToolResult(executeResponse({ text: "Error: boom\n    at script:1:1", isError: true }))
     expect(textBlocks(result)).toEqual(["Error: boom\n    at script:1:1"])
-    const structured = result.structuredContent as typeof ExecuteToolOutput.Type
-    expect(Schema.is(ExecuteToolOutput)(structured)).toBe(true)
-    expect(structured).not.toHaveProperty("isError")
-    expect(structured).not.toHaveProperty("value")
-    expect(structured.warnings).toEqual(["the page navigated"])
-    expect(structured.aftermath?.consoleErrorCount).toBe(1)
+  })
+
+  test("execute error text stays under 10,000 characters and keeps its warnings", () => {
+    const result = executeToolResult(executeResponse({
+      text: `locator.click: Timeout 30000ms exceeded.\nCall log:\n${"  - retrying click action\n".repeat(2000)}    at execute.js:5:1`,
+      isError: true,
+      logs: Array.from({ length: 500 }, (_, index) => ({ source: "script" as const, type: "log", text: `line ${index} ${"x".repeat(400)}` })),
+      warnings: ["Pointer action was blocked"],
+    }))
+    const text = textBlocks(result).join("")
+    expect(text.length).toBeLessThan(10_000)
+    expect(text).toStartWith("locator.click: Timeout 30000ms exceeded.")
+    expect(text).toContain("at execute.js:5:1")
+    expect(text).toContain("Warnings:\n- Pointer action was blocked")
+    expect(text).toContain("line 499")
+    expect(text).not.toContain("line 479 ")
   })
 
   test("status structured content validates and its fallback text is compact", () => {
     const value = {
       endpoint: "http://127.0.0.1:19988",
       currentSession: "mcp-1234abcd",
+      sharedSession: false,
       version: { version: "0.0.10", pid: 42 },
       status: { connected: true, version: "0.0.10", activeTargets: 1 },
       autoUpdate: { install: "npm", cli: "browse", mode: "auto", effective: "auto" },
@@ -409,5 +491,45 @@ describe("tool output schemas", () => {
     expect(value).toEqual(adopted)
     expect(value).not.toHaveProperty("confirmation")
     expect(Schema.is(spec.outputSchema!)(value)).toBe(true)
+  })
+})
+
+describe("advertised tool schemas", () => {
+  // Some MCP clients (Kimi, for one) reject a tool whose enum or const mixes JSON types, and fail the whole tool list
+  // over it. Each variant must keep its own type, through anyOf or otherwise.
+  test("every enum and const keeps one JSON type", () => {
+    const problems: string[] = []
+    for (const { name, json } of advertisedSchemas()) {
+      for (const { path, type, values } of literals(json)) {
+        const types = new Set(values.map((value) => jsonType(value)))
+        if (types.size > 1) problems.push(`${name}${path} mixes ${[...types].join(", ")}: ${JSON.stringify(values)}`)
+        if (type) {
+          const mismatched = values.filter((value) => !matchesJsonType(type, value))
+          if (mismatched.length > 0) problems.push(`${name}${path} declares type ${type} but holds ${JSON.stringify(mismatched)}`)
+        }
+      }
+    }
+    expect(problems).toEqual([])
+  })
+
+  test("settings idleMinutes splits its minutes and 'never' into single-typed enums", () => {
+    const input = specs().find((spec) => spec.name === "settings")!.inputSchema
+    const set = (input.properties as Record<string, { properties: Record<string, unknown> }>).set!
+    expect(set.properties.idleMinutes).toEqual({
+      anyOf: [
+        { type: "integer", enum: [10, 30, 60] },
+        { type: "string", enum: ["never"] },
+      ],
+      description: settingSpecs.idleMinutes.label,
+    })
+  })
+
+  test("settings idleMinutes still decodes every value it advertises", () => {
+    expect(parseSettingChanges({ idleMinutes: 10 })).toEqual({ idleMinutes: 10 })
+    expect(parseSettingChanges({ idleMinutes: "never" })).toEqual({ idleMinutes: "never" })
+    // 0 and numeric strings are the CLI's other spellings of the same values.
+    expect(parseSettingChanges({ idleMinutes: 0 })).toEqual({ idleMinutes: "never" })
+    expect(parseSettingChanges({ idleMinutes: "30" })).toEqual({ idleMinutes: 30 })
+    expect(() => parseSettingChanges({ idleMinutes: 15 })).toThrow(SettingsInputError)
   })
 })

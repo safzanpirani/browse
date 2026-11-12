@@ -5,6 +5,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import * as clack from "@clack/prompts"
 import type { AgentName, AgentReceipt } from "./agent-config.ts"
+import { writeStdout } from "../cli/output.ts"
 import { formatPairingCode } from "../relay/browser-pairing.ts"
 import {
   cacheRoot,
@@ -96,7 +97,7 @@ export const connectedMessage = "✓ Connected to your browser. Ask your agent t
 export const pairedOfflineMessage =
   "! Not connected yet. Open the browser profile already paired with browse and make sure the extension is enabled. It reconnects automatically."
 export const manualPair = (code: string) =>
-  `Open the Extensions menu → browse → Options, enter ${formatPairingCode(code)} as the pairing code, then click Pair.`
+  `Open the Extensions menu → browse → Options, expand advanced (or click Pair with a code), enter ${formatPairingCode(code)} as the pairing code, then click Connect.`
 
 export function flag(args: string[], name: string) {
   const index = args.indexOf(name)
@@ -140,7 +141,7 @@ export const tilde = (file: string) => (file === home || file.startsWith(home + 
 export const rail: { active: boolean; waiting?: ReturnType<typeof clack.spinner> | undefined } = { active: false }
 
 export function log(line: string) {
-  if (!rail.active) return void process.stdout.write(line + "\n")
+  if (!rail.active) return writeStdout(line + "\n")
   if (!line.trim()) return
   const ok = line.startsWith("✓ ")
   const warn = line.startsWith("! ")

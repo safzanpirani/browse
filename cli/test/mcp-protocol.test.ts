@@ -6,6 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import { bundleCli } from "../bundle.ts"
 import { startRelay, stopRelay } from "./relay-harness.ts"
+import { mcpStdio } from "./support/mcp-stdio.ts"
 import { freePort } from "./support/ports.ts"
 
 // The real MCP server over stdio, answering a pre-2026 client (initialize) and a 2026-07-28 client (request metadata).
@@ -18,28 +19,8 @@ const modernMeta = {
   "io.modelcontextprotocol/clientInfo": { name: "test", version: "0" },
 }
 
-function server(command = [process.execPath, path.join(import.meta.dir, "..", "src", "main.ts")], port?: number) {
-  const child = spawn(command[0]!, [...command.slice(1), "mcp"], {
-    stdio: ["pipe", "pipe", "ignore"],
-    env: { ...process.env, HOME: home, OPENCODE_BROWSER_HOME: home, ...(port ? { OPENCODE_BROWSER_PORT: String(port) } : {}), OPENCODE_BROWSER_AUTOSTART: "false", OPENCODE_BROWSER_UPDATE_CHECK: "0" },
-  })
-  const pending = new Map<number, (message: { result?: Record<string, unknown>; error?: unknown }) => void>()
-  let buffer = ""
-  let id = 0
-  child.stdout.on("data", (chunk) => {
-    buffer += chunk
-    for (let index = buffer.indexOf("\n"); index >= 0; index = buffer.indexOf("\n")) {
-      const message = JSON.parse(buffer.slice(0, index))
-      buffer = buffer.slice(index + 1)
-      pending.get(message.id)?.(message)
-    }
-  })
-  const request = (method: string, params: Record<string, unknown> = {}) =>
-    new Promise<{ result?: Record<string, unknown>; error?: unknown }>((resolve) => {
-      pending.set(++id, resolve)
-      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n")
-    })
-  return { request, notify: (method: string) => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method }) + "\n"), close: () => child.kill() }
+function server(command?: readonly string[], port?: number) {
+  return mcpStdio({ home, ...(port ? { port } : {}), ...(command ? { command } : {}) })
 }
 
 describe("binary auto-update", () => {
@@ -49,6 +30,8 @@ describe("binary auto-update", () => {
     const cli = path.join(home, "cli")
     fs.cpSync(path.join(import.meta.dir, "../script"), path.join(cli, "script"), { recursive: true })
     for (const name of ["node_modules", "src", "tsconfig.json"]) fs.symlinkSync(path.join(import.meta.dir, "..", name), path.join(cli, name))
+    // compile bakes the checkout's install script into the binary.
+    for (const name of ["install", "install.ps1"]) fs.copyFileSync(path.join(import.meta.dir, "../..", name), path.join(home, name))
     const target = `${process.platform === "win32" ? "windows" : process.platform}-${process.arch}`
     const binary = path.join(home, "bin", process.platform === "win32" ? "browse.exe" : "browse")
     const staged = `${binary}.next`
@@ -86,6 +69,8 @@ describe("binary auto-update", () => {
       fs.renameSync(staged, binary)
       const update = await Bun.$`${binary} runtime-switch ${versions[1]}`.env(env).quiet().nothrow()
       expect(update.exitCode, update.text()).toBe(0)
+      // The child runs 1.0.1 (the path now holds it); the line names the relay it replaced.
+      expect(update.text()).toContain(`switch ${versions[0]} → ${versions[1]}: done`)
       const running = await relayVersion()
       replacement = running.pid
       expect(running.version).toBe(versions[1])

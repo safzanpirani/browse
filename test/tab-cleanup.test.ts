@@ -16,6 +16,7 @@ afterAll(() => {
 })
 
 const ALARM = "opencode-browser-tab-cleanup"
+const MARKER = "\u2063"
 const alarm = () => (chrome.alarms.onAlarm as unknown as StubEvent).emit({ name: ALARM })
 const guarded = new Set<number>()
 TabCleanup.guard((tabId) => guarded.has(tabId))
@@ -38,6 +39,8 @@ async function runAlarm() {
 beforeEach(async () => {
   stub.state.tabs.clear()
   stub.state.windows.clear()
+  stub.state.groups.clear()
+  stub.state.calls.length = 0
   guarded.clear()
   window = (await stub.chrome.windows.create({ url: "https://user.example/", focused: true })).id
   await stub.chrome.storage.local.remove("tabCleanupIdleMinutes")
@@ -78,6 +81,23 @@ describe("idle tab cleanup", () => {
     expect(open(fresh)).toBe(true)
   })
 
+  test("one agent's cleanup at 0 closes its own tabs; other agents' tabs still wait for the setting", async () => {
+    const mine = await agentTab(1)
+    const theirs = await agentTab(1)
+    const theirsStale = await agentTab(11)
+    const closed = await TabCleanup.cleanup({ own: { tabIds: [mine], minutes: 0 } })
+    expect(closed.map((tab) => tab.tabId).toSorted()).toEqual([mine, theirsStale].toSorted())
+    expect(open(theirs)).toBe(true)
+  })
+
+  test("one agent's cleanup longer than the setting waits that long for every tab", async () => {
+    const mine = await agentTab(15)
+    const theirs = await agentTab(15)
+    const closed = await TabCleanup.cleanup({ own: { tabIds: [mine], minutes: 30 } })
+    expect(closed).toEqual([])
+    expect(open(mine) && open(theirs)).toBe(true)
+  })
+
   test("a guarded tab (running, waiting or recording) stays open past the time", async () => {
     await stub.chrome.storage.local.set({ tabCleanupIdleMinutes: 10 })
     const busy = await agentTab(60)
@@ -94,6 +114,78 @@ describe("idle tab cleanup", () => {
     expect(await TabCleanup.idleMinutes()).toBe(10)
     await stub.chrome.storage.local.set({ tabCleanupIdleMinutes: -5 })
     expect(await TabCleanup.idleMinutes()).toBe(10)
+  })
+})
+
+describe("closing a tab in an agent group", () => {
+  test("ungroups it before removing it, even when other tabs are in the group", async () => {
+    const first = await agentTab(0)
+    const second = await agentTab(0)
+    const groupId = await stub.chrome.tabs.group({ tabIds: [first, second] })
+    await stub.chrome.tabGroups.update(groupId, { title: `github${MARKER}` })
+    stub.state.calls.length = 0
+    const closed = await TabCleanup.cleanup({ minutes: 0 })
+    expect(closed.map((tab) => tab.tabId)).toEqual([first, second])
+    expect(stub.state.calls).toEqual([
+      `ungroup:${first}`,
+      `remove:${first}`,
+      `ungroup:${second}`,
+      `remove:${second}`,
+    ])
+    expect(stub.state.groups.has(groupId)).toBe(false)
+  })
+})
+
+describe("a tab the relay ungroups itself", () => {
+  test("keeps idle tracking, unlike a tab the user drags out of the agent group", async () => {
+    const byRelay = await agentTab(0)
+    const byUser = await agentTab(0)
+    await stub.chrome.tabs.group({ tabIds: [byRelay, byUser] })
+    await TabCleanup.relayUngroup(byRelay, () => stub.chrome.tabs.ungroup(byRelay))
+    await stub.chrome.tabs.ungroup(byUser)
+    expect(await TabCleanup.isTracked(byRelay)).toBe(true)
+    expect(await TabCleanup.isTracked(byUser)).toBe(false)
+  })
+
+  test("does not keep a mark when no group change arrives, so a later user drag-out still forgets", async () => {
+    const tabId = await agentTab(0)
+    await stub.chrome.tabs.group({ tabIds: [tabId] })
+    // The ungroup failed or the tab was already ungrouped: settle without a group-change event.
+    await TabCleanup.relayUngroup(tabId, async () => undefined)
+    await settle()
+    await stub.chrome.tabs.ungroup(tabId)
+    expect(await TabCleanup.isTracked(tabId)).toBe(false)
+  })
+})
+
+describe("a tab that fails to close", () => {
+  test("is put back in its group, stays tracked and is retried by the next cleanup", async () => {
+    const tabId = await agentTab(60)
+    const other = await stub.chrome.tabs.create({ windowId: window, url: "https://user.example/2", active: false })
+    const groupId = await stub.chrome.tabs.group({ tabIds: [tabId, other.id] })
+    await stub.chrome.tabGroups.update(groupId, { title: `github${MARKER}` })
+    const remove = stub.chrome.tabs.remove
+    let failed = false
+    stub.chrome.tabs.remove = async (ids) => {
+      const list = Array.isArray(ids) ? ids : [ids]
+      if (!failed && list.includes(tabId)) {
+        failed = true
+        throw new Error("Tabs cannot be edited right now (user may be dragging a tab).")
+      }
+      return remove(ids)
+    }
+    try {
+      expect(await TabCleanup.cleanup({ minutes: 0 })).toEqual([])
+      expect(open(tabId)).toBe(true)
+      expect(stub.state.tabs.get(tabId)!.groupId).toBe(groupId)
+      expect(await TabCleanup.isTracked(tabId)).toBe(true)
+      const closed = await TabCleanup.cleanup({ minutes: 0 })
+      expect(closed.map((tab) => tab.tabId)).toEqual([tabId])
+      expect(open(tabId)).toBe(false)
+      expect(await TabCleanup.isTracked(tabId)).toBe(false)
+    } finally {
+      stub.chrome.tabs.remove = remove
+    }
   })
 })
 

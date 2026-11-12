@@ -3,13 +3,15 @@
 // place. This supervisor starts that path, forwards stdio (newline-delimited JSON-RPC), and once the installed version
 // changes and the relay runs it (or no relay exists), starts the new server, replays the client's `initialize` to it
 // (its answer is dropped) and carries on; while it swaps, client messages wait. An npx entry or a downloaded executable
-// has nothing supervising it, and serves directly.
+// has nothing supervising it, and serves directly. So does a server another supervisor started: an older install's
+// stable shim (bin/opencode-browser.mjs) supervises the version it starts, without telling it to serve directly.
 import { spawn, type ChildProcessByStdio } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import type { Readable, Writable } from "node:stream"
 import { existsSync, statSync } from "node:fs"
 import path from "node:path"
 import { createInterface } from "node:readline"
-import { entryCommand } from "../paths.ts"
+import { entrySpawnCommand } from "../paths.ts"
 import { installedRuntime, installedVersion, type Runtime } from "../update/auto-update.ts"
 
 /** Set for the server a supervisor starts, so it serves instead of supervising again. */
@@ -27,8 +29,10 @@ function versionReader(runtime: Runtime, initial: string) {
   let stamp = ""
   return () => {
     try {
-      const stat = statSync(watchedFile(runtime))
-      const next = `${stat.mtimeMs}:${stat.size}`
+      const stat = statSync(watchedFile(runtime), { bigint: true })
+      // Packed releases can have identical mtimes and sizes. Rename replaces the inode;
+      // retain change and creation times for filesystems that don't report a useful inode.
+      const next = `${stat.dev}:${stat.ino}:${stat.ctimeNs}:${stat.birthtimeNs}:${stat.mtimeNs}:${stat.size}`
       if (next === stamp) return version
       stamp = next
       version = installedVersion(runtime) ?? version
@@ -47,7 +51,9 @@ export async function runBinaryMcp(args: readonly string[]) {
     const { runCli } = await import("../cli.ts")
     return runCli()
   }
-  const REPLAY = "opencode-browser-shim-initialize"
+  // This supervisor's own replay id: a replay from another supervisor (an older shim above this one, which uses the
+  // bare prefix) is a client request like any other, and its answer goes back up.
+  const REPLAY = `opencode-browser-shim-initialize-${randomUUID()}`
   const relayPort = Number(process.env.OPENCODE_BROWSER_PORT) || 19988
   const current = versionReader(runtime, installedVersion(runtime) ?? runtime.version)
   // A stable entry path, replaced in place by the installer.
@@ -58,14 +64,57 @@ export async function runBinaryMcp(args: readonly string[]) {
   process.env.OPENCODE_BROWSER_CLIENT_PID = String(process.pid)
   let version = current()
   let child: ChildProcessByStdio<Writable, Readable, null>
+  // Every server this supervisor started: the current one, and a swapped-out one still exiting. None may outlive us.
+  const servers = new Set<ChildProcessByStdio<Writable, Readable, null>>()
   let initialize: Message | undefined
   let initialized: string | undefined
   let swapping = false
+  let swapDeadline: ReturnType<typeof setTimeout> | undefined
   let listChanged = false
   const inflight = new Set<unknown>()
   const queue: string[] = []
   const toClient = (line: string) => process.stdout.write(line + "\n")
   const toChild = (line: string) => child.stdin.write(line + "\n")
+  // The child is gone and its stdout is fully read: give the client the answers still buffered in our own stdout, then
+  // exit with the child's status. `process.exit` alone would drop them when the client wasn't reading.
+  let finishing = false
+  const exit = (code: number, flush: boolean) => {
+    finishing = true
+    if (!flush) return process.exit(code)
+    process.stdout.write("", () => process.exit(code))
+  }
+  const finish = (code: number) => {
+    if (finishing) return
+    // A swapped-out server must not outlive the supervisor that started it.
+    for (const running of servers) running.kill()
+    exit(code, true)
+  }
+  // A child that ignores stdin EOF can't keep us here: terminate every server and exit once they are gone (SIGKILL one
+  // that ignores SIGTERM too), so none is left behind. `force` lets a signal end us even mid-flush; repeated signals are
+  // ignored, so a second one can't kill the supervisor before its servers are gone.
+  let stopping: { readonly code: number; readonly flush: boolean } | undefined
+  let stopDeadline: ReturnType<typeof setTimeout> | undefined
+  let leaving = false
+  const stopped = () => {
+    if (!stopping || leaving) return
+    leaving = true
+    clearTimeout(stopDeadline)
+    exit(stopping.code, stopping.flush)
+  }
+  const stop = (code: number, flush: boolean, force = false) => {
+    if (stopping || (finishing && !force)) return
+    stopping = { code, flush }
+    finishing = true
+    for (const running of servers) running.kill()
+    if (servers.size === 0) return stopped()
+    // A server's `close` (see start) resolves this as soon as the last one is gone; one that ignores SIGTERM is killed
+    // outright at the deadline.
+    stopDeadline = setTimeout(() => {
+      for (const running of servers) running.kill("SIGKILL")
+      stopped()
+    }, 2000)
+    stopDeadline.unref()
+  }
   const parse = (line: string): Message | undefined => {
     try {
       return JSON.parse(line) as Message
@@ -82,30 +131,45 @@ export async function runBinaryMcp(args: readonly string[]) {
     if (cancelled !== undefined) inflight.delete(cancelled)
   }
   const forward = (line: string) => {
-    trackRequest(parse(line))
+    const message = parse(line)
+    if (message?.method === "initialize") initialize = message
+    if (message?.method === "notifications/initialized") initialized = line
+    trackRequest(message)
     toChild(line)
   }
 
   const start = (replay: boolean) => {
-    const [file, ...prefix] = entryCommand(command())
-    const next = spawn(file!, [...prefix, "mcp", ...args], { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, [directEnvironmentVariable]: "1" } })
+    const [file, ...prefix] = entrySpawnCommand(command())
+    const next = spawn(file!, [...prefix, "mcp", ...args], { stdio: ["pipe", "pipe", "inherit"], env: { ...process.env, [directEnvironmentVariable]: "1" }, windowsHide: true })
     // A server that exits mid-write (an old one being replaced) must not take the supervisor down with EPIPE.
     next.stdin.on("error", () => {})
+    servers.add(next)
     child = next
-    next.on("exit", (code, signal) => {
-      if (next !== child) return
-      process.exit(code ?? (signal ? 1 : 0))
+    // A server replaced by a swap keeps exiting in the background; only the current child's status ends the supervisor.
+    // Wait for both its close (stdio is done) and readline's close (every line reached the client) before exiting.
+    let linesDone = false
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined
+    const finishChild = () => {
+      if (next !== child || !linesDone || !exited) return
+      finish(exited.code ?? (exited.signal ? 1 : 0))
+    }
+    next.on("close", (code, signal) => {
+      servers.delete(next)
+      exited = { code, signal }
+      finishChild()
+      // The last server stop() terminated is gone: leave now instead of waiting for its deadline.
+      if (stopping && servers.size === 0) stopped()
     })
-    createInterface({ input: next.stdout }).on("line", (line) => {
+    const reader = createInterface({ input: next.stdout })
+    reader.on("close", () => {
+      linesDone = true
+      finishChild()
+    })
+    reader.on("line", (line) => {
       if (next !== child) return
       const message = parse(line)
-      if (message && message.id === REPLAY) {
-        if (initialized) toChild(initialized)
-        swapping = false
-        if (listChanged) toClient(JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }))
-        for (const queued of queue.splice(0)) fromClient(queued)
-        return
-      }
+      // The replay's answer is ours alone, even when it arrives after the deadline released the queue.
+      if (message && message.id === REPLAY) return finishSwap()
       if (message && message.id !== undefined && message.method === undefined) {
         inflight.delete(message.id)
         if (message.result?.capabilities?.tools) listChanged = message.result.capabilities.tools.listChanged === true
@@ -116,11 +180,22 @@ export async function runBinaryMcp(args: readonly string[]) {
     if (replay && initialize) {
       swapping = true
       toChild(JSON.stringify({ ...initialize, id: REPLAY }))
+      // The new server reads the replay before anything queued behind it, so a late (or lost) answer needn't hold
+      // client messages: after a few seconds they go to the new server anyway.
+      swapDeadline = setTimeout(finishSwap, 5000)
+      swapDeadline.unref()
     }
   }
+  const finishSwap = () => {
+    if (!swapping) return
+    clearTimeout(swapDeadline)
+    swapping = false
+    if (initialized) toChild(initialized)
+    if (listChanged) toClient(JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }))
+    for (const queued of queue.splice(0)) fromClient(queued)
+  }
 
-  // Once the installed version changes, new requests wait for the swap instead of reaching a server whose relay is
-  // going away (or already runs the other version); a switch that doesn't happen releases them.
+  // Once the installed version changes, check which relay is serving before routing new requests.
   let heldSince: number | undefined
   const moved = () => current() !== version
   const fromClient = (line: string) => {
@@ -133,8 +208,6 @@ export async function runBinaryMcp(args: readonly string[]) {
       queue.push(line)
       return void maybeSwap()
     }
-    if (message?.method === "initialize") initialize = message
-    if (message?.method === "notifications/initialized") initialized = line
     forward(line)
   }
 
@@ -144,8 +217,8 @@ export async function runBinaryMcp(args: readonly string[]) {
   let unreachable = 0
   const relayVersion = () =>
     fetch(`http://127.0.0.1:${relayPort}/version`, { signal: AbortSignal.timeout(2000) })
-      .then((response) => (response.ok ? (response.json() as Promise<{ version?: unknown }>) : undefined))
-      .then((body) => (body && typeof body.version === "string" ? body.version : undefined), () => undefined)
+      .then((response) => (response.ok ? (response.json() as Promise<{ version?: unknown; draining?: unknown }>) : undefined))
+      .then((body) => (body && typeof body.version === "string" ? { version: body.version, draining: body.draining === true } : undefined), () => undefined)
   const maybeSwap = async () => {
     if (swapping || checking) return
     // Held requests go to the current server at the deadline even when a request still looks in flight: a cancelled
@@ -154,7 +227,7 @@ export async function runBinaryMcp(args: readonly string[]) {
       heldSince = undefined
       for (const line of queue.splice(0)) forward(line)
     }
-    if (inflight.size > 0) return
+    if (inflight.size > 0 && !queue.length) return
     const next = current()
     if (next === version) {
       unreachable = 0
@@ -166,8 +239,15 @@ export async function runBinaryMcp(args: readonly string[]) {
     const running = await relayVersion()
     checking = false
     unreachable = running === undefined ? unreachable + 1 : 0
+    if (running?.draining) return
+    if (running?.version === version) {
+      // The entry on disk moved, but the current server still matches the relay (even with other calls in flight).
+      heldSince = undefined
+      for (const line of queue.splice(0)) forward(line)
+      return
+    }
     // Held requests don't wait forever for a relay that never reports the new version: they go to the current server.
-    if (running !== next && unreachable < 3) return
+    if (running?.version !== next && unreachable < 3) return
     if (swapping || inflight.size > 0 || current() !== next) return
     const old = child
     version = next
@@ -180,13 +260,21 @@ export async function runBinaryMcp(args: readonly string[]) {
   start(false)
   createInterface({ input: process.stdin }).on("line", fromClient).on("close", () => {
     child.stdin.end()
-    setTimeout(() => process.exit(0), 5000).unref()
+    // The child normally exits on its own and `finish` flushes first. This terminates one that never does, without
+    // cutting off a flush already in progress; a tool call still running after 5 seconds is cut here.
+    setTimeout(() => stop(0, true), 5000).unref()
   })
+  // A signal ends the supervisor, but never the server it started: terminate it, then leave with the signal's code.
+  process.on("SIGINT", () => stop(130, false, true))
+  process.on("SIGTERM", () => stop(143, false, true))
   setInterval(() => void maybeSwap(), 1000).unref()
 }
 
 /** Whether this process should supervise its MCP server (an installed binary or global npm package). */
 export function supervisesMcp(): boolean {
+  // A supervisor names itself the client before starting its server. The shim older installs left in agents' configs
+  // starts each runtime version this way, and supervising again under it would stack two supervisors on one server.
+  if (process.env.OPENCODE_BROWSER_CLIENT_PID === String(process.ppid)) return false
   const runtime = installedRuntime()
   return !!runtime && runtime.kind !== "npx" && existsSync(runtime.entry)
 }

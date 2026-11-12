@@ -24,14 +24,14 @@ registerMcpTools({
   build: (ctx) => [
     {
       name: "session_new",
-      description: "Create a browse session and make it current for this MCP server.",
+      description: "Create a browse session and make it your current one. Agents the client names keep theirs; otherwise the current session is shared by every agent on this server.",
       inputSchema: objectSchema({
         browser: ctx.browserProperty,
         id: { type: "string", description: "Optional lowercase session id." },
         readOnly: {
           type: "boolean",
           description:
-            "Create a read-only session: the relay rejects input-dispatching CDP so scripts can inspect but not click or type.",
+            "Create a read-only session: adopt a tab the user has lent you, then snapshot, screenshot and read it; CDP input, navigation, new pages and cookie writes are refused.",
         },
         allowedOrigins: {
           type: "array",
@@ -58,7 +58,7 @@ registerMcpTools({
             ...(allowedOrigins ? { allowedOrigins } : {}),
             ...(browser ? { browser } : {}),
           })
-          ctx.establishCurrentSession(session.id, session.browser)
+          ctx.establishCurrentSession(yield* ctx.caller, session.id, session.browser)
           return { session }
         }),
     },
@@ -85,7 +85,7 @@ registerMcpTools({
       outputSchema: SessionContainer,
       handle: (input) =>
         Effect.gen(function* () {
-          const sessionId = ctx.resolveSessionId(input)
+          const sessionId = yield* ctx.resolveSessionId(input)
           const allowedOrigins = requireObject(input).allowedOrigins
           if (!Array.isArray(allowedOrigins) || !allowedOrigins.every((item) => Predicate.isString(item))) {
             return yield* Effect.fail(new Error("allowedOrigins must be an array of strings"))
@@ -107,7 +107,7 @@ registerMcpTools({
     },
     {
       name: "session_use",
-      description: "Set this MCP server's current browse session id.",
+      description: "Make an existing browse session your current one, for calls that don't name a session. Agents the client names keep theirs; otherwise the current session is shared by every agent on this server. Pass `session` explicitly to share one deliberately.",
       inputSchema: objectSchema(
         {
           id: { type: "string", description: "Existing browse session id." },
@@ -123,8 +123,9 @@ registerMcpTools({
         Effect.gen(function* () {
           const id = yield* Effect.try(() => requiredStringField(input, "id"))
           const session = yield* ensureSessionExists(ctx.relay, id)
-          ctx.establishCurrentSession(id, session.browser)
-          return { currentSession: ctx.currentSession.id }
+          const caller = yield* ctx.caller
+          ctx.establishCurrentSession(caller, id, session.browser)
+          return { currentSession: caller.id }
         }),
     },
     {
@@ -141,9 +142,9 @@ registerMcpTools({
       outputSchema: SessionResetResponse,
       handle: (input) =>
         Effect.gen(function* () {
-          const id = ctx.resolveSessionId(input, "id")
+          const id = yield* ctx.resolveSessionId(input, "id")
           const reset = yield* ctx.relay.sessionReset(id)
-          ctx.establishCurrentSession(id, reset.session.browser)
+          ctx.establishCurrentSession(yield* ctx.caller, id, reset.session.browser)
           return reset
         }),
     },
@@ -161,14 +162,16 @@ registerMcpTools({
       outputSchema: SessionDeleteToolOutput,
       handle: (input) =>
         Effect.gen(function* () {
-          const id = ctx.resolveSessionId(input, "id")
+          const id = yield* ctx.resolveSessionId(input, "id")
           const result = yield* ctx.relay.sessionDelete(id)
-          if (ctx.currentSession.id === id) {
-            ctx.currentSession.id = `mcp-${crypto.randomUUID().slice(0, 8)}`
-            ctx.currentSession.established = false
-            ctx.currentSession.browser = undefined
+          const caller = yield* ctx.caller
+          ctx.forgetSession(id)
+          if (caller.id === id) {
+            caller.id = `mcp-${crypto.randomUUID().slice(0, 8)}`
+            caller.established = false
+            caller.browser = undefined
           }
-          return { ...result, currentSession: ctx.currentSession.id }
+          return { ...result, currentSession: caller.id }
         }),
     },
     {
@@ -179,7 +182,7 @@ registerMcpTools({
         session: {
           type: "string",
           description:
-            "Optional existing browse session id. Explicit ids must already exist; omit this field to use the MCP server's current session, which is created when needed.",
+            "Optional existing browse session id. Explicit ids must already exist; omit this field to use your current session, which is created when needed.",
         },
         targetUrl: {
           type: "string",
@@ -204,10 +207,11 @@ registerMcpTools({
       handle: (input) =>
         Effect.gen(function* () {
           const args = yield* Effect.try(() => parseAdoptArguments(input))
-          const sessionId = args.session ?? ctx.currentSession.id
+          const caller = yield* ctx.caller
+          const sessionId = args.session ?? caller.id
           // The implicit session stays in the browser the relay last reported it in; one this server creates (or
           // recreates after the relay dropped it) gets the server's browser (`browse --profile <p> mcp`).
-          const browser = args.session ? undefined : ctx.currentSession.browser ?? selectedBrowser()
+          const browser = args.session ? undefined : caller.browser ?? selectedBrowser()
           const result = yield* ctx.relay.sessionAdopt({
             sessionId,
             createIfMissing: !args.session,
@@ -215,7 +219,7 @@ registerMcpTools({
             ...(args.tabId === undefined ? {} : { tabId: args.tabId }),
             ...(browser ? { browser } : {}),
           })
-          ctx.establishCurrentSession(sessionId, result.session.browser)
+          ctx.establishCurrentSession(caller, sessionId, result.session.browser)
           return result
         }),
     },

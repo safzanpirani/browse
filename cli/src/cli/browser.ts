@@ -21,7 +21,7 @@ const tabsCleanup = Command.make(
     idleMinutes: Flag.Int("idle-minutes").pipe(
       Flag.optional,
       Flag.withDescription(
-        "Close agent tabs idle at least this long; 0 closes every eligible agent tab (default: the extension's setting, 10; still 10 when it is set to never)",
+        "Close agent tabs idle at least this long; 0 closes every eligible agent tab, other sessions' too (default: the extension's setting, 10; still 10 when it is set to never)",
       ),
     ),
     json: jsonFlag,
@@ -184,7 +184,7 @@ const status = Command.make(
     )
     if ((extensionStatus.rejectedConnections ?? 0) > 0) {
       yield* Console.log(
-        `Warning: ${extensionStatus.rejectedConnections} competing browser/profile connection attempt(s) rejected; the active connection was preserved. Use browse in one browser/profile at a time.`,
+        `Warning: ${extensionStatus.rejectedConnections} competing browser/profile connection attempt(s) rejected; the active connection was preserved. The relay is an older browse that connects one browser at a time; update browse on the computer running the relay, or close the other browser.`,
       )
     }
     if (extensionStatus.nextStep) yield* Console.log(extensionStatus.nextStep)
@@ -196,7 +196,7 @@ const status = Command.make(
     if ((extensionStatus.processFaults?.suppressed ?? 0) > 0) {
       const faults = extensionStatus.processFaults!
       yield* Console.log(
-        `Warning: the relay survived ${faults.suppressed} Playwright fault(s)${faults.lastAt ? `, last at ${faults.lastAt}` : ""}${faults.lastMessage ? `: ${faults.lastMessage}` : ""}. See the relay log.`,
+        `Warning: the relay survived ${faults.suppressed} process fault(s)${faults.lastAt ? `, last at ${faults.lastAt}` : ""}${faults.lastMessage ? `: ${faults.lastMessage}` : ""}. See the relay log.`,
       )
     }
     if (extensionStatus.protocolVersion !== undefined && extensionStatus.protocolVersion !== null) {

@@ -45,8 +45,11 @@ export function createHttpRequestHandler(options: {
   /** The id of the connected browser a relay tab id belongs to. */
   readonly browserOfTab?: (tabId: number) => string | undefined
   readonly sessions: OpenCodeBrowserSessions
-  /** Asks the extension to close agent-opened tabs idle for `idleMinutes` (its setting when omitted). */
-  readonly cleanupTabs: (idleMinutes: number | undefined) => Effect.Effect<JsonObject, Error>
+  /**
+   * Asks the extension to close agent-opened tabs idle for `idleMinutes` (its setting when omitted). With `sessions`,
+   * `idleMinutes` applies only to those sessions' tabs, and every other tab also waits for the setting.
+   */
+  readonly cleanupTabs: (idleMinutes: number | undefined, sessions?: readonly string[]) => Effect.Effect<JsonObject, Error>
   /** Reloads the extension so an unpacked install picks up files `install` just replaced. */
   readonly reloadExtension: () => Effect.Effect<JsonObject, Error>
   /** Drops the connection of the browser with this profile key, whose token `pair --revoke` just deleted. */
@@ -96,6 +99,7 @@ export function createHttpRequestHandler(options: {
         managed: options.relayInstance.managed,
         shutdownProtocol: 2,
         clientProtocol: relayClientProtocolVersion,
+        ...(!options.shutdown.accepting ? { draining: true } : {}),
         ...compatibility,
         ...installHint,
       })
@@ -140,9 +144,11 @@ export function createHttpRequestHandler(options: {
     }
     if (pathname === "/tabs/cleanup" && request.method === "POST") {
       run(Effect.gen(function* () {
-        const rawIdleMinutes = getNumber(getObject(yield* readJsonBody(request)), "idleMinutes")
+        const body = getObject(yield* readJsonBody(request))
+        const rawIdleMinutes = getNumber(body, "idleMinutes")
         const idleMinutes = rawIdleMinutes === undefined ? undefined : Math.max(0, rawIdleMinutes)
-        sendJson(response, yield* options.cleanupTabs(idleMinutes))
+        const sessions = Array.isArray(body?.sessions) ? body.sessions.filter((id) => typeof id === "string") : undefined
+        sendJson(response, yield* options.cleanupTabs(idleMinutes, sessions))
       }))
       return
     }

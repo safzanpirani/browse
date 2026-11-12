@@ -70,6 +70,10 @@ export const extensionOriginsConfig = Config.String("OPENCODE_BROWSER_EXTENSION_
 
 export const endpointForPort = (port: number): string => `http://127.0.0.1:${port}`
 
+/** How long a read waits before this client has had any answer from the port, and after. See `make`. */
+export const unknownRelayReadSeconds = 5
+export const busyRelayReadSeconds = 30
+
 export class RelayUnreachable extends Schema.TaggedError<RelayUnreachable>()(
   "RelayClient.RelayUnreachable",
   {
@@ -149,7 +153,8 @@ export interface Interface {
   readonly recordingStop: (target: RecordingTargetRequest) => Effect.Effect<RecordingStopResponse, RelayClientError>
   readonly recordingStatus: (target: RecordingTargetRequest) => Effect.Effect<RecordingStatusResponse, RelayClientError>
   readonly recordingCancel: (target: RecordingTargetRequest) => Effect.Effect<RecordingCancelResponse, RelayClientError>
-  readonly tabsCleanup: (idleMinutes?: number) => Effect.Effect<TabsCleanupResponse, RelayClientError>
+  /** With `sessions`, `idleMinutes` applies only to those sessions' tabs; other tabs also wait for the user's setting. */
+  readonly tabsCleanup: (idleMinutes?: number, sessions?: readonly string[]) => Effect.Effect<TabsCleanupResponse, RelayClientError>
   /** The user's settings (one browser's options page; the default browser's without `browser`), with env overrides. */
   readonly settingsGet: (browser?: string) => Effect.Effect<SettingsGetResponse, RelayClientError>
   /** Changes settings; validated strictly by the relay. */
@@ -245,14 +250,24 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
     return options?.clientPid === undefined ? authorized : HttpClientRequest.setHeader(authorized, "opencode-browser-client-pid", String(options.clientPid))
   }
 
+  // Every session's execute code shares the relay's event loop, so under load even /version can wait several seconds
+  // for its turn. Until this client has had any answer on the port, a stalled read means a frozen relay or another
+  // program, and fails fast. Once the relay has answered, a stalled read is most likely a busy relay, so it waits longer.
+  let relayAnswered = false
+  const execute = (request: HttpClientRequest.HttpClientRequest) =>
+    httpClient.execute(authorize(request)).pipe(Effect.tap(() => Effect.sync(() => { relayAnswered = true })))
+
   const getJson = <A>(path: string, schema: Schema.ConstraintDecoder<A>): Effect.Effect<A, RelayClientError> =>
-    Effect.suspend(() => httpClient.execute(authorize(HttpClientRequest.get(new URL(path, endpoint))))).pipe(
-      Effect.mapError(transportError(path)),
-      Effect.flatMap((response) => handleResponse(response, path, schema)),
-      Effect.timeoutOrElse({ duration: 5000, orElse: () => Effect.fail(new RelayTimedOut({
-        message: `The relay on port ${new URL(endpoint).port} isn't answering (${path} timed out).`, path,
-      })) }),
-    )
+    Effect.suspend(() => {
+      const seconds = relayAnswered ? busyRelayReadSeconds : unknownRelayReadSeconds
+      return execute(HttpClientRequest.get(new URL(path, endpoint))).pipe(
+        Effect.mapError(transportError(path)),
+        Effect.flatMap((response) => handleResponse(response, path, schema)),
+        Effect.timeoutOrElse({ duration: `${seconds} seconds`, orElse: () => Effect.fail(new RelayTimedOut({
+          message: `The relay on port ${new URL(endpoint).port} isn't answering (${path} timed out after ${seconds}s).`, path,
+        })) }),
+      )
+    })
 
   // Writes can legitimately wait for a human handoff or a command with no deadline. Probe the relay while waiting,
   // rather than shortening those operations or retrying a write whose outcome we don't know.
@@ -269,7 +284,7 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
       path,
       cause,
     })),
-    Effect.flatMap((request) => httpClient.execute(authorize(request)).pipe(
+    Effect.flatMap((request) => execute(request).pipe(
       Effect.mapError(transportError(path)),
       Effect.flatMap((response) => handleResponse(response, path, schema)),
       Effect.raceFirst(checkWhileWaiting),
@@ -343,7 +358,8 @@ export const make = Effect.fn("RelayClient.make")(function* (options?: {
     recordingStop: (target) => postJson("/recording/stop", recordingTargetBody(target), RecordingStopResponse),
     recordingStatus: (target) => getJson(`/recording/status${recordingTargetQuery(target)}`, RecordingStatusResponse),
     recordingCancel: (target) => postJson("/recording/cancel", recordingTargetBody(target), RecordingCancelResponse),
-    tabsCleanup: (idleMinutes) => postJson("/tabs/cleanup", idleMinutes === undefined ? {} : { idleMinutes }, TabsCleanupResponse),
+    tabsCleanup: (idleMinutes, sessions) =>
+      postJson("/tabs/cleanup", { ...(idleMinutes === undefined ? {} : { idleMinutes }), ...(sessions ? { sessions } : {}) }, TabsCleanupResponse),
     settingsGet: (browser) =>
       getJson(browser ? `/settings?browser=${encodeURIComponent(browser)}` : "/settings", SettingsGetResponse),
     settingsSet: (changes, browser) => postJson("/settings", { set: changes, ...(browser ? { browser } : {}) }, SettingsSetResponse),

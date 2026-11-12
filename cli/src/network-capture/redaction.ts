@@ -14,6 +14,12 @@ const secretNamePattern = /auth(?:orization)?|cookie|credential|csrf|xsrf|token|
 // Values typed into these fields (passwords, one-time codes) are redacted but never stored as reusable slots.
 const oneTimeFieldPattern = /pass(?:word|wd|code|phrase)|(?:^|[-_.])pwd(?:$|[-_.])|otp|totp|(?:^|[-_.])(?:mfa_?|2fa_?|verification_?|auth_?)?code(?:$|[-_.])|(?:^|[-_.])pin(?:$|[-_.])/i
 const referencePattern = String.raw`BC_(?:SECRET|REDACTED)_\d+`
+/**
+ * Known values shorter than this are not replaced inside unrelated output or
+ * captured text: short strings collide with ordinary text. A whole value that
+ * equals the known value is still replaced.
+ */
+export const minimumKnownSubstringLength = 8
 const secretHeaders = new Set([
   "authorization",
   "proxy-authorization",
@@ -23,15 +29,25 @@ const secretHeaders = new Set([
   "csrf-token",
   "x-xsrf-token",
 ])
-
-// Standard headers whose names match secretNamePattern but whose values are not credentials: the host,
-// CORS metadata that lists header names (`authorization`) or says `true`, and Google's signed-in account index.
+// HTTP/2 pseudo-headers (except :path, which is protected like a request URL), standard CORS headers
+// (which list header names such as `authorization` or say `true`) and Google's signed-in account index
+// carry routing, policy or account metadata, not credentials, and must never become secret slots.
 const nonSecretHeaders = new Set([
   ":authority",
+  ":method",
+  ":scheme",
+  ":status",
+  ":protocol",
   "access-control-allow-credentials",
+  "access-control-allow-origin",
+  "access-control-allow-methods",
   "access-control-allow-headers",
   "access-control-expose-headers",
+  "access-control-max-age",
+  "access-control-request-method",
   "access-control-request-headers",
+  "access-control-allow-private-network",
+  "access-control-request-private-network",
   "x-goog-authuser",
 ])
 // Query and fragment fields whose names match secretNamePattern but hold an account index, not a credential.
@@ -46,6 +62,10 @@ export class SecretCollector {
   private readonly retiredRefsByValue = new Map<string, string>()
   // Redaction-only references (BC_REDACTED_N) for one-time values and token-like URL path segments.
   private readonly redactedRefsByValue = new Map<string, string>()
+  // Values from addRedactionOnly (typed site secrets) and one-time request fields (passwords, codes) are
+  // always replaced, whatever their length. Stored profile values are not: a short reusable cookie ("1",
+  // "dark") matches ordinary execute output far more often than it protects a credential.
+  private readonly alwaysRedacted = new Set<string>()
   private nextRedactedRef = 1
   private nextRef = 1
   private updated = new Set<string>()
@@ -77,7 +97,7 @@ export class SecretCollector {
       occurrences.set(lowerName, occurrence + 1)
       return {
       name,
-        value: this.protectHeader(name, value, sourceName(requestScope, `${location}.header.${lowerName}`, occurrence)),
+        value: this.protectHeader(name, value, sourceName(requestScope, `${location}.header.${lowerName}`, occurrence), requestScope),
       }
     })
   }
@@ -111,7 +131,7 @@ export class SecretCollector {
     const type = contentType?.toLowerCase() ?? ""
     if (type.includes("json")) {
       try {
-        return JSON.stringify(this.protectJson(JSON.parse(body), sourceName(requestScope, location)))
+        return JSON.stringify(this.protectJson(JSON.parse(body), sourceName(requestScope, location), location))
       } catch {
         return undefined
       }
@@ -142,11 +162,11 @@ export class SecretCollector {
   }
 
   redactText(text: string): string {
-    return redactKnownValues(text, this.redactionSlots())
+    return redactOutputText(text, this.redactionSlots(), this.alwaysRedacted)
   }
 
   redactValue(value: unknown): unknown {
-    return redactKnownValue(value, this.redactionSlots())
+    return redactOutputValue(value, this.redactionSlots(), this.alwaysRedacted)
   }
 
   redactExactValue(value: unknown, minimumLength: number): unknown {
@@ -181,7 +201,10 @@ export class SecretCollector {
 
   /** Redact `value` everywhere from now on under a redaction-only reference (never persisted to a profile). */
   addRedactionOnly(value: string): void {
-    if (value) this.redactionReference(value)
+    if (value) {
+      this.alwaysRedacted.add(value)
+      this.redactionReference(value)
+    }
   }
 
   /** Replace these values (raw, percent- and form-encoded) under their redaction-only references, at any length. */
@@ -212,17 +235,20 @@ export class SecretCollector {
     return `\${${ref}}`
   }
 
-  private protectHeader(name: string, value: string, source: string): string {
+  private protectHeader(name: string, value: string, source: string, requestScope = ""): string {
     if (!value) return value
     const lower = name.toLowerCase()
+    // :path carries the request path and query, so protect it exactly like the request URL.
+    if (lower === ":path") return this.protectUrl(value, requestScope)
+    if (nonSecretHeaders.has(lower)) return value
     if (lower === "cookie" || lower === "set-cookie") {
       const cookieOccurrences = new Map<string, number>()
-      return value.split(/;\s*/).map((part, index) => {
+      const protectLine = (line: string) => line.split(/;\s*/).map((part, index) => {
         const separator = part.indexOf("=")
         if (separator < 1) return part
         const cookieName = part.slice(0, separator).trim()
         const cookieValue = part.slice(separator + 1)
-        if (lower === "set-cookie" && index > 0 && /^(domain|path|expires|max-age|samesite|priority|partitioned)$/i.test(cookieName)) {
+        if (lower === "set-cookie" && index > 0 && /^(domain|path|expires|max-age|samesite|priority|partitioned|secure|httponly)$/i.test(cookieName)) {
           return part
         }
         if (!cookieValue) return part
@@ -230,6 +256,8 @@ export class SecretCollector {
         cookieOccurrences.set(cookieName, occurrence + 1)
         return `${cookieName}=${this.reference(cookieValue, sourceName("", `${source}.${cookieName}`, occurrence))}`
       }).join("; ")
+      // Raw headers can arrive as one value with each cookie on its own line.
+      return lower === "set-cookie" ? value.split("\n").map(protectLine).join("\n") : protectLine(value)
     }
     if (lower === "location" || lower === "referer" || lower === "referrer") {
       return this.protectUrl(value, `${source}.url`)
@@ -238,23 +266,32 @@ export class SecretCollector {
       const match = /^(\S+)\s+(.+)$/.exec(value)
       if (match) return `${match[1]} ${this.reference(match[2] ?? "", source)}`
     }
-    if (!nonSecretHeaders.has(lower) && (secretHeaders.has(lower) || secretNamePattern.test(lower))) {
+    if (secretHeaders.has(lower) || secretNamePattern.test(lower)) {
       return this.reference(value, source)
     }
     return value
   }
 
-  private protectJson(value: unknown, location: string, path: readonly string[] = [], inSecret = false): unknown {
+  private protectJson(value: unknown, location: string, role: "request" | "response", path: readonly string[] = [], field: JsonField = "open"): unknown {
     if (Array.isArray(value)) {
-      return value.map((item, index) => this.protectJson(item, location, [...path, String(index)], inSecret))
+      // Only direct string elements of a DocC codeListing `code` array are content; everything else is secret.
+      if (field === "codeListing") {
+        return value.map((item, index) => Predicate.isString(item)
+          ? item
+          : this.protectJson(item, location, role, [...path, String(index)], "secret"))
+      }
+      return value.map((item, index) => this.protectJson(item, location, role, [...path, String(index)], field))
     }
     if (Predicate.isObject(value)) {
+      // DocC content never reaches nested objects: everything below a `code` object is secret.
+      const inherited = field === "codeListing" || field === "codeVoice" ? "secret" : field
       return Object.fromEntries(Object.entries(value).map(([key, item]) => [
         key,
-        this.protectJson(item, location, [...path, key], inSecret || secretNamePattern.test(key)),
+        this.protectJson(item, location, role, [...path, key], jsonField(key, inherited, role, value.type, item)),
       ]))
     }
-    if (!inSecret || value === null || value === "") return value
+    if (field === "open" || value === null || value === "") return value
+    if (field === "codeVoice" && Predicate.isString(value)) return value
     return this.reference(String(value), `${location}.json.${path.join(".")}`)
   }
 
@@ -288,7 +325,10 @@ export class SecretCollector {
   }
 
   private reference(value: string, source: string): string {
-    if (oneTimeFieldPattern.test(sourceFieldName(source))) return this.redactionReference(value)
+    if (oneTimeFieldPattern.test(sourceFieldName(source))) {
+      this.alwaysRedacted.add(value)
+      return this.redactionReference(value)
+    }
     const sourceRef = this.refsBySource.get(source)
     if (sourceRef) {
       const slot = this.slotsByRef.get(sourceRef)
@@ -360,6 +400,21 @@ function sourceFieldName(source: string): string {
 }
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+type JsonField = "open" | "secret" | "codeListing" | "codeVoice"
+
+/**
+ * Only a DocC codeListing/codeVoice `code` value is content. Every other secret-looking key, including
+ * a bare `code` in requests and responses, stays secret exactly as before.
+ */
+function jsonField(key: string, inherited: JsonField, role: "request" | "response", type: unknown, value: unknown): JsonField {
+  if (inherited === "secret") return "secret"
+  if (!secretNamePattern.test(key)) return inherited
+  if (key !== "code" || role !== "response") return "secret"
+  if (type === "codeListing" && Array.isArray(value)) return "codeListing"
+  if (type === "codeVoice" && Predicate.isString(value)) return "codeVoice"
+  return "secret"
+}
 
 /** Path segments that look like credentials: JWTs, long hex, and long high-entropy base64/base64url. */
 export function looksLikeTokenSegment(segment: string): boolean {
@@ -437,38 +492,78 @@ function sourceName(requestScope: string, location: string, occurrence = 0): str
   return occurrence === 0 ? base : `${base}.${occurrence}`
 }
 
-/**
- * Output redaction replaces every occurrence of a known value. In execute output, values this short
- * ("1", "0", "true", "dark") match ordinary text far more often than they protect
- * a credential, so they stay profile slots but are never rewritten there.
- */
-const minimumOutputRedactionLength = 6
-/**
- * `secrets run` output comes from a command holding the real values, so every nonempty profile value is
- * redacted there, however short. Non-credentials such as the account index never become slots.
- */
-export const minimumSecretRunRedactionLength = 1
-
-export function redactKnownValues(text: string, slots: readonly RedactionSlot[], minimumLength = minimumOutputRedactionLength): string {
+export function redactKnownValues(text: string, slots: readonly RedactionSlot[], minimumLength = minimumKnownSubstringLength): string {
   return slots
     .filter((slot) => slot.value.length >= minimumLength)
     .sort((left, right) => right.value.length - left.value.length)
     .reduce((output, slot) => replaceOutsideReferences(output, slot.value, `\${${slot.ref}}`), text)
 }
 
-export function redactKnownValue(value: unknown, slots: readonly RedactionSlot[]): unknown {
-  if (Predicate.isString(value)) return redactKnownValues(value, slots)
+/**
+ * `secrets run` output comes from a command holding the real values, so every nonempty profile value is
+ * redacted there, however short. Non-credentials such as the account index never become slots.
+ */
+export const minimumSecretRunRedactionLength = 1
+
+/**
+ * Redact execute output. Explicitly registered values (typed site secrets,
+ * one-time request fields) and known values of at least
+ * `minimumKnownSubstringLength` are replaced anywhere. A whole string equal to
+ * any known value is replaced even when the value is shorter: output that is
+ * exactly a credential is intentional credential output.
+ */
+function redactOutputText(
+  text: string,
+  slots: readonly RedactionSlot[],
+  alwaysRedacted: ReadonlySet<string>,
+): string {
+  return outputStringRedactor(slots, alwaysRedacted)(text)
+}
+
+function redactOutputValue(
+  value: unknown,
+  slots: readonly RedactionSlot[],
+  alwaysRedacted: ReadonlySet<string>,
+): unknown {
+  return redactValueWith(value, slots, outputStringRedactor(slots, alwaysRedacted), alwaysRedacted)
+}
+
+function outputStringRedactor(
+  slots: readonly RedactionSlot[],
+  alwaysRedacted: ReadonlySet<string>,
+): (text: string) => string {
+  const exact = new Map<string, RedactionSlot>()
+  for (const slot of slots) {
+    if (slot.value && !exact.has(slot.value)) exact.set(slot.value, slot)
+  }
+  const referenceText = new RegExp(String.raw`^\$\{${referencePattern}\}$`)
+  const substringSlots = slots.filter((slot) =>
+    slot.value.length >= minimumKnownSubstringLength || alwaysRedacted.has(slot.value))
+  return (text) => {
+    const match = text && !referenceText.test(text) ? exact.get(text) : undefined
+    return match ? `\${${match.ref}}` : redactKnownValues(text, substringSlots, 1)
+  }
+}
+
+function redactValueWith(
+  value: unknown,
+  slots: readonly RedactionSlot[],
+  redactString: (text: string) => string,
+  alwaysRedacted: ReadonlySet<string>,
+): unknown {
+  if (Predicate.isString(value)) return redactString(value)
   if (Predicate.isNumber(value) || Predicate.isBoolean(value)) {
+    // A short number or boolean (`count: 1`, `flag: false`) is data, not a credential, unless typed as a secret.
     const serialized = String(value)
-    if (serialized.length < minimumOutputRedactionLength) return value
+    if (serialized.length < minimumKnownSubstringLength && !alwaysRedacted.has(serialized)) return value
     const slot = slots.find((candidate) => candidate.value === serialized)
     return slot ? `\${${slot.ref}}` : value
   }
-  if (Array.isArray(value)) return value.map((item) => redactKnownValue(item, slots))
+  if (Array.isArray(value)) return value.map((item) => redactValueWith(item, slots, redactString, alwaysRedacted))
   if (!Predicate.isObject(value)) return value
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [
     key,
-    secretNamePattern.test(key) ? redactSecretValue(item) : redactKnownValue(item, slots),
+    secretNamePattern.test(key) ? redactSecretValue(item) : redactValueWith(item, slots, redactString, alwaysRedacted),
   ]))
 }
 

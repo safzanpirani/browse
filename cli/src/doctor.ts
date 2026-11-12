@@ -389,10 +389,10 @@ function buildDoctorChecks(options: {
     }] : []),
     ...(options.extensionResult.ok && options.extensionResult.value.processFaults !== undefined ? [{
       id: "relay-process-faults",
-      label: "relay Playwright faults",
+      label: "relay process faults",
       status: options.extensionResult.value.processFaults.suppressed > 0 ? "warn" as const : "ok" as const,
       message: options.extensionResult.value.processFaults.suppressed > 0
-        ? `${options.extensionResult.value.processFaults.suppressed} uncaught Playwright fault(s) caught and survived${options.extensionResult.value.processFaults.lastMessage ? `; last: ${options.extensionResult.value.processFaults.lastMessage}` : ""}`
+        ? `${options.extensionResult.value.processFaults.suppressed} uncaught fault(s) caught and survived${options.extensionResult.value.processFaults.lastMessage ? `; last: ${options.extensionResult.value.processFaults.lastMessage}` : ""}`
         : "none since the relay started",
     }] : []),
     {
@@ -557,7 +557,7 @@ function buildDoctorRecommendations(options: {
     return !artifact.exists
   }) ? [`Rebuild or reinstall the missing files with \`${installCommand()}\`.`] : []
   const connectionConflictRecommendations = options.extensionResult.ok && (options.extensionResult.value.rejectedConnections ?? 0) > 0
-    ? ["Keep browse enabled in one browser/profile. To switch, disable it in the current browser before connecting the other; new sessions do not change the active browser."]
+    ? ["The relay is an older browse that connects one browser at a time. Update browse on the computer running the relay, or close the other browser."]
     : []
   const staleSessionRecommendations = options.staleCurrent && options.current ? [
     `Current session ${options.current} is stale; run \`${cliCommand("session new")}\` or \`${cliCommand("session use <id>")}\` after the relay is running.`,

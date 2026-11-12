@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Fiber } from "effect"
-import { boundExecuteResult, jsonValueWarning, maxExecuteResultChars, toJsonSafeValue, type ExecuteResult } from "../src/execute.ts"
+import { boundExecuteResult, jsonValueWarning, maxExecuteResultChars, toJsonSafeValue, type ExecuteOptions, type ExecuteResult } from "../src/execute.ts"
 import { ExecuteRealm } from "../src/execute-realm.ts"
 import { HandoffRegistry } from "../src/session-manager/handoff.ts"
 import type { ConnectedTarget, ExecuteSandboxLike } from "../src/relay/types.ts"
@@ -21,9 +21,11 @@ const ok = (text: string): ExecuteResult => ({
 class FakeSandbox implements ExecuteSandboxLike {
   aborted = 0
   executions = 0
+  readonly calls: Array<ExecuteOptions | undefined> = []
   private abortWaiters: Array<() => void> = []
   constructor(readonly script: (sandbox: FakeSandbox) => Promise<ExecuteResult>) {}
-  execute() {
+  execute(_code: string, options?: ExecuteOptions) {
+    this.calls.push(options)
     this.executions += 1
     return Effect.promise(() => this.script(this))
   }
@@ -55,7 +57,11 @@ class FakeSandbox implements ExecuteSandboxLike {
   getStatus() { return { connected: true, pageUrl: null, stateKeys: [] } }
 }
 
-function manager(script: (sandbox: FakeSandbox) => Promise<ExecuteResult>, options: { readonly handoffs?: HandoffRegistry } = {}) {
+function manager(script: (sandbox: FakeSandbox) => Promise<ExecuteResult>, options: {
+  readonly handoffs?: HandoffRegistry
+  readonly executeTimeoutMs?: number
+  readonly onSessionDeleted?: (sessionId: string) => void
+} = {}) {
   const sandboxes: FakeSandbox[] = []
   const sessions = new OpenCodeBrowserSessions("http://127.0.0.1:0", () => {
     const sandbox = new FakeSandbox(script)
@@ -64,6 +70,8 @@ function manager(script: (sandbox: FakeSandbox) => Promise<ExecuteResult>, optio
   }, {
     stopGraceMs: 300,
     lifecycleTimeoutMs: 5_000,
+    ...(options.executeTimeoutMs === undefined ? {} : { executeTimeoutMs: options.executeTimeoutMs }),
+    ...(options.onSessionDeleted ? { onSessionDeleted: options.onSessionDeleted } : {}),
     ...(options.handoffs ? { onCancelSessionHandoff: (id: string) => options.handoffs?.cancelForSession(id) !== undefined } : {}),
   })
   return { sessions, sandboxes }
@@ -125,6 +133,15 @@ describe("stopping an execute", () => {
 })
 
 describe("delete and reset while busy", () => {
+  test("delete reports the session to the deleted hook", async () => {
+    const deleted: string[] = []
+    const { sessions } = manager(async () => ok("x"), { onSessionDeleted: (sessionId) => { deleted.push(sessionId) } })
+
+    await run(sessions.execute({ sessionId: "d0", code: "...", createIfMissing: true }))
+    expect(await run(sessions.delete("d0"))).toEqual({ deleted: true })
+    expect(deleted).toEqual(["d0"])
+  })
+
   test("delete stops a running execute and returns promptly", async () => {
     const { sessions } = manager(async (sandbox) => {
       await sandbox.playwrightCall()
@@ -296,6 +313,27 @@ describe("execute timeouts, disconnects, one-shot cleanup, and idle reaping", ()
     const done = await run(sessions.execute({ sessionId: "t-pause", code: "...", createIfMissing: true, timeoutMs: 50 }))
     expect(done.result.isError).toBe(false)
     expect(done.result.text).toBe("finished after handoff")
+  })
+
+  test("a chosen timeoutMs is the action budget too, never below 30s", async () => {
+    const { sessions, sandboxes } = manager(async () => ok("done"))
+    await run(sessions.execute({ sessionId: "t-actions", code: "...", createIfMissing: true, timeoutMs: 240_000 }))
+    await run(sessions.execute({ sessionId: "t-actions", code: "...", createIfMissing: false, timeoutMs: 5_000 }))
+    await run(sessions.execute({ sessionId: "t-actions", code: "...", createIfMissing: false, timeoutMs: 0 }))
+    expect(sandboxes[0]?.calls.map((options) => options?.actionTimeoutMs)).toEqual([240_000, 30_000, 0])
+  })
+
+  test("without a chosen timeout, actions keep Playwright's 30s default", async () => {
+    const { sessions, sandboxes } = manager(async () => ok("done"))
+    await run(sessions.execute({ sessionId: "t-default", code: "...", createIfMissing: true }))
+    expect(sandboxes[0]?.calls[0]?.actionTimeoutMs).toBeUndefined()
+  })
+
+  test("the relay's executeTimeoutMs is the action budget, and a per-call timeoutMs wins", async () => {
+    const { sessions, sandboxes } = manager(async () => ok("done"), { executeTimeoutMs: 120_000 })
+    await run(sessions.execute({ sessionId: "t-hook", code: "...", createIfMissing: true }))
+    await run(sessions.execute({ sessionId: "t-hook", code: "...", createIfMissing: false, timeoutMs: 60_000 }))
+    expect(sandboxes[0]?.calls.map((options) => options?.actionTimeoutMs)).toEqual([120_000, 60_000])
   })
 
   test("disconnecting a caller while execute runs aborts the script and frees the lock", async () => {

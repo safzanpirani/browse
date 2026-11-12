@@ -2,16 +2,20 @@
 //
 // Layout: one state file, auto-update.json in the state root (logs are beside it in logs/). There is no versions
 // directory, no current.json and no shim any more:
-//   binary install  the install script replaces ~/.local/bin/browse by atomic rename (Windows renames the running
-//                   executable aside first); running processes keep their old inode on unix.
+//   binary install  the install script this release shipped with (baked in by script/compile.ts) replaces
+//                   ~/.local/bin/browse by atomic rename (Windows renames the running executable aside first); running
+//                   processes keep their old inode on unix.
 //   npm global      `npm install -g @opencode/browse@<version>` replaces the package in place.
 //   npx             no-op: npx resolves the package itself, and install never writes npx entries.
+// The self-managed runtime of releases before 0.0.11 (runtime/versions under the old data root, setup/legacy.ts) runs as
+// an npm install whose updates land in npm's global folder (updateTarget); the relay restarted from there takes the old
+// runtime over (setup/legacy-runtime.ts).
 //
 // The relay checks its channel at launch and at least once an hour. A binary install reads its channel's manifest from
 // Anomaly's release service (release-service.ts, anomalyco/release docs/protocol.md) and follows it; an npm global
 // install reads the npm dist-tag (latest, or dev for a dev build, which every push to dev publishes). Mode "on"
-// (default) runs the installer in its own process, then once no agent is using the browser restarts the relay from the
-// same entry path. "notify" only shows the update; "off" doesn't check.
+// (default) waits for idle before running the installer in its own process and again before restarting the relay from
+// the same entry path. "notify" only shows the update; "off" doesn't check.
 // OPENCODE_BROWSER_AUTO_UPDATE overrides the stored mode. Installed binaries and npm global installs supervise their MCP
 // server (mcp/supervisor.ts): it notices the installed version change and swaps the server between requests once the
 // relay runs it. The installer and npm do their own integrity checks (the release service's size and SHA-256 for a
@@ -20,15 +24,14 @@ import { spawn, spawnSync } from "node:child_process"
 import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, realpathSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { cliPrefix, compiledBinary, entryCommand, fromCheckout, installedBinary, stateRoot } from "../paths.ts"
+import { cliPrefix, compiledBinary, entrySpawnCommand, fromCheckout, installedBinary, stateRoot } from "../paths.ts"
+import { insidePath, legacyDataRoot } from "../setup/legacy.ts"
 import { opencodeBrowserVersion } from "../version.ts"
 import { checkRelease, releaseChannel, runningServiceTarget, type ReleaseChannel, type ReleaseDecision } from "./release-service.ts"
 
 export const PACKAGE_NAME = "@opencode/browse"
 const HOUR_MS = 60 * 60 * 1000
 const DEFAULT_REGISTRY = "https://registry.npmjs.org"
-const INSTALL_SCRIPT = "https://opencode.ai/browse/install"
-const INSTALL_SCRIPT_WINDOWS = "https://opencode.ai/browse/install.ps1"
 
 export const autoUpdateModes = ["on", "notify", "off"] as const
 export type AutoUpdateMode = (typeof autoUpdateModes)[number]
@@ -107,10 +110,28 @@ export function installedRuntime(entry = process.argv[1] ?? process.execPath): R
   return { kind, entry: resolved, version: packageVersion(resolved) ?? opencodeBrowserVersion }
 }
 
+/**
+ * Where `npm install -g` puts updates for this runtime: the runtime itself, except for one the old shim starts from
+ * runtime/versions under the old data root (setup/legacy.ts), whose updates land in npm's global folder. The relay
+ * restarted from there takes the old runtime over (setup/legacy-runtime.ts).
+ */
+export async function updateTarget(runtime: Runtime, run: Run = runCommand, env: NodeJS.ProcessEnv = process.env): Promise<Runtime | undefined> {
+  if (runtime.kind !== "npm" || !insidePath(runtime.entry, path.join(legacyDataRoot(), "runtime", "versions"))) return runtime
+  const root = await npmGlobalRoot(run, env)
+  return root ? { ...runtime, entry: path.join(root, ...PACKAGE_NAME.split("/"), "dist", "cli.mjs") } : undefined
+}
+
+/** npm's global package root (`npm root -g`), where `npm install -g` puts packages; undefined when npm can't say. */
+export async function npmGlobalRoot(run: Run = runCommand, env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const result = await run("npm", ["root", "-g"], { timeoutMs: 20_000, env })
+  const root = result.status === 0 ? result.stdout.trim() : ""
+  return root && path.isAbsolute(root) ? root : undefined
+}
+
 /** The version currently on disk at the runtime's stable entry (a binary reports it with --version). */
 export function installedVersion(runtime: Runtime): string | undefined {
   if (runtime.kind === "binary") {
-    const result = spawnSync(runtime.entry, ["--version"], { encoding: "utf8", timeout: 15_000, env: { ...process.env, OPENCODE_BROWSER_AUTOSTART: "0" } })
+    const result = spawnSync(runtime.entry, ["--version"], { encoding: "utf8", timeout: 15_000, env: { ...process.env, OPENCODE_BROWSER_AUTOSTART: "0" }, windowsHide: true })
     return result.status === 0 ? result.stdout.trim() || undefined : undefined
   }
   return packageVersion(runtime.entry)
@@ -227,7 +248,12 @@ export function describeAutoUpdate(status: AutoUpdateStatus): string {
   if (status.install !== "binary" && status.install !== "npm") return "Updates:   not an installed runtime"
   const mode = { on: "automatic", notify: "notify only", off: "off" }[status.effective]
   const parts = [`${mode}${status.overriddenBy ? ` (set by ${status.overriddenBy})` : ""}`, `channel ${status.channel ?? "latest"}`]
-  if (updateAvailable(status)) parts.push(`${status.latest} available; the installer runs when no agent is using the browser`)
+  if (updateAvailable(status))
+    parts.push(
+      status.effective === "on"
+        ? `${status.latest} available; the installer runs when no agent is using the browser`
+        : `${status.latest} available; run \`${status.cli} update\` to install it`,
+    )
   if (status.lastError) parts.push(`last attempt failed: ${status.lastError.message}`)
   return `Updates:   ${parts.join("; ")}`
 }
@@ -254,7 +280,7 @@ export const runCommand: Run = (command, args, options = {}) =>
     // On Windows npm is npm.cmd, which Node only runs through a shell; run npm's own entry beside node.exe instead.
     const npmCli = process.platform === "win32" && command === "npm" ? path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js") : undefined
     const [file, argv] = npmCli && existsSync(npmCli) ? [process.execPath, [npmCli, ...args]] : [command, args]
-    const child = spawn(file, argv, { env: options.env ?? process.env, stdio: ["ignore", "pipe", "pipe"] })
+    const child = spawn(file, argv, { env: options.env ?? process.env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
     let stdout = ""
     let stderr = ""
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => void (stdout += chunk))
@@ -304,12 +330,20 @@ export type InstallerOptions = {
   readonly fetch?: typeof fetch
   readonly env?: NodeJS.ProcessEnv
   readonly platform?: NodeJS.Platform
+  /** The installer text a binary install runs: this release's baked-in one by default, or a test's fixture. */
+  readonly installer?: string
 }
 
 /**
- * Reruns whatever installed browse. Binary installs download the install script and run it non-interactively with
- * --no-setup, so it only replaces the executable (the PATH and agent entries install wrote stay). npm global installs run
- * npm install -g. npx is a no-op. Returns the version now installed.
+ * How long the install script may download and run: the Windows build is large, so on a slow connection the download
+ * alone can take well over ten minutes.
+ */
+const INSTALL_SCRIPT_TIMEOUT_MS = 60 * 60_000
+
+/**
+ * Reruns whatever installed browse. A binary install runs the install script this release shipped with, non-interactively
+ * with --no-setup, so it only replaces the executable (the PATH and agent entries install wrote stay). npm global installs
+ * run npm install -g. npx is a no-op. Returns the version now installed.
  */
 export async function runInstaller(options: InstallerOptions): Promise<string> {
   const run = options.run ?? runCommand
@@ -320,18 +354,28 @@ export async function runInstaller(options: InstallerOptions): Promise<string> {
     const spec = `${PACKAGE_NAME}@${options.version ?? options.channel ?? "latest"}`
     const npm = await run("npm", ["install", "-g", spec], { timeoutMs: 10 * 60_000, env })
     if (npm.status !== 0) throw new Error(`npm install -g ${spec} failed: ${(npm.stderr || npm.stdout).trim().split("\n").slice(-3).join(" ")}`)
-    const version = installedVersion(options.runtime) ?? options.version ?? options.channel ?? "latest"
+    const target = await updateTarget(options.runtime, run, env)
+    if (!target) throw new Error(`npm install -g ${spec} ran, but \`npm root -g\` didn't say where it installed`)
+    const found = existsSync(target.entry) ? installedVersion(target) : undefined
+    // A runtime outside npm's folder can only see the update there, so it is there or the install failed.
+    if (!found && target !== options.runtime) throw new Error(`npm install -g ${spec} ran, but ${target.entry} isn't there`)
+    const version = found ?? options.version ?? options.channel ?? "latest"
     if (options.version && compareVersions(version, options.version) < 0)
       throw new Error(`npm install -g ${spec} left ${version}, not the requested ${options.version}`)
     return version
   }
-  const scriptUrl = env.OPENCODE_BROWSER_INSTALL_SCRIPT || (platform === "win32" ? INSTALL_SCRIPT_WINDOWS : INSTALL_SCRIPT)
-  const script = existsSync(scriptUrl)
-    ? readFileSync(scriptUrl, "utf8")
-    : await (options.fetch ?? fetch)(scriptUrl, { signal: AbortSignal.timeout(60_000) }).then(async (response) => {
-        if (!response.ok) throw new Error(`couldn't download the installer (${response.status})`)
-        return response.text()
-      })
+  // OPENCODE_BROWSER_INSTALL_SCRIPT is the explicit override tests and developers use (a local file or a URL); every
+  // other binary install runs the installer this release shipped with, never one fetched at update time.
+  const override = env.OPENCODE_BROWSER_INSTALL_SCRIPT
+  const script = override
+    ? existsSync(override)
+      ? readFileSync(override, "utf8")
+      : await (options.fetch ?? fetch)(override, { signal: AbortSignal.timeout(60_000) }).then(async (response) => {
+          if (!response.ok) throw new Error(`couldn't download the installer (${response.status})`)
+          return response.text()
+        })
+    : (options.installer ?? globalThis.__OPENCODE_BROWSER_INSTALLER__)
+  if (!script) throw new Error("this build has no installer to run; install browse again with the install script")
   const directory = mkdtempSync(path.join(os.tmpdir(), "browse-install-"))
   const file = path.join(directory, platform === "win32" ? "install.ps1" : "install")
   const args = [...(options.version ? ["--version", options.version] : options.channel ? ["--channel", options.channel] : []), "--no-setup"]
@@ -339,7 +383,7 @@ export async function runInstaller(options: InstallerOptions): Promise<string> {
     writeFileSync(file, script, { mode: platform === "win32" ? 0o600 : 0o700 })
     const command = platform === "win32" ? "powershell.exe" : "sh"
     const argv = platform === "win32" ? ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", file, ...args] : [file, ...args]
-    const installed = await run(command, argv, { timeoutMs: 10 * 60_000, env })
+    const installed = await run(command, argv, { timeoutMs: INSTALL_SCRIPT_TIMEOUT_MS, env })
     if (installed.status !== 0)
       throw new Error(`the installer failed: ${(installed.stderr || installed.stdout).trim().split("\n").slice(-3).join(" ")}`)
   } finally {
@@ -372,16 +416,19 @@ export type AutoUpdaterDeps = {
   readonly log: (event: string, fields?: Record<string, unknown>) => void
   /** The notice changed (status page, MCP note). */
   readonly onChange?: () => void
-  /** Starts a detached child process of this version's CLI (`self-update`, `runtime-switch`); onExit gets its exit code. */
-  readonly spawnChild?: (args: readonly string[], onExit: (code: number | null) => void) => number | undefined
+  /**
+   * Starts a detached child from the install's stable entry (`self-update`, `runtime-switch`), which an installer may
+   * already have replaced with the new build; onExit gets its exit code. `from` is the install to start it from (a pre-0.0.11 runtime has its own).
+   */
+  readonly spawnChild?: (args: readonly string[], onExit: (code: number | null) => void, from: Runtime) => number | undefined
   readonly env?: NodeJS.ProcessEnv
   readonly fetch?: typeof fetch
   readonly run?: Run
   readonly now?: () => number
 }
 
-/** How long an installer may run before the relay gives up on it (the script's own timeout is 10 minutes). */
-const INSTALL_TIMEOUT_MS = 15 * 60_000
+/** How long an installer may run before the relay gives up on it: the install script's own timeout plus a margin to finish writing. */
+const INSTALL_TIMEOUT_MS = INSTALL_SCRIPT_TIMEOUT_MS + 5 * 60_000
 /** How long a runtime-switch child may run (a drain is bounded by the relay's restart timeout, a start by seconds). */
 const SWITCH_TIMEOUT_MS = 5 * 60_000
 
@@ -397,7 +444,9 @@ export function createAutoUpdater(deps: AutoUpdaterDeps) {
   const { runtime } = deps
   const running = runtime.version
   const checkIntervalMs = Math.min(Number(env.OPENCODE_BROWSER_AUTO_UPDATE_INTERVAL_MS) || HOUR_MS, HOUR_MS)
-  const spawnChild = deps.spawnChild ?? ((args, onExit) => spawnRuntimeChild(runtime, args, onExit, env))
+  const spawnChild = deps.spawnChild ?? ((args, onExit, from) => spawnRuntimeChild(from, args, onExit, env))
+  /** Where updates land (updateTarget), found on the first tick that needs it. */
+  let updates: Runtime | undefined
   let busy = false
   /** A runtime-switch child in flight; a stuck one is given up on after SWITCH_TIMEOUT_MS. */
   let switching: { pid: number | undefined; startedAt: number } | undefined
@@ -456,37 +505,50 @@ export function createAutoUpdater(deps: AutoUpdaterDeps) {
             deps.log("autoupdate.checked", { channel, latest: published.version, running })
           }
         } catch (error) {
-          state = updateState(({ latest: _latest, ...rest }) => ({ ...rest, checkedAt: now(), failed: (error as Error).message }))
+          state = updateState(({ latest: _latest, etag: _etag, ...rest }) => ({ ...rest, checkedAt: now(), failed: (error as Error).message }))
           deps.log("autoupdate.check_failed", { error: (error as Error).message })
         }
         deps.onChange?.()
       }
-      const wanted = runtime.kind === "binary" ? state.latest : state.latest && compareVersions(state.latest, running) > 0 ? state.latest : undefined
+      // A binary channel doesn't order versions: any release that differs from the running build is one to install. npm's
+      // dist-tag does, so only a newer one is.
+      const wanted = runtime.kind === "binary" ? (state.latest !== running ? state.latest : undefined) : state.latest && compareVersions(state.latest, running) > 0 ? state.latest : undefined
+      // A failure is stale once its version runs, a different release supersedes it, or nothing is left to install. A
+      // failed check says nothing new about releases, so it keeps the failure.
+      if (state.lastError && (state.lastError.version === running || (!state.failed && (!wanted || state.lastError.version !== wanted)))) {
+        state = updateState(({ lastError: _lastError, ...rest }) => rest)
+        deps.onChange?.()
+      }
       if (!wanted || mode !== "on") return
 
+      // A failed `npm root -g` isn't kept: the next tick asks again.
+      updates ??= await updateTarget(runtime, deps.run ?? runCommand, env)
+      if (!updates) return void deps.log("autoupdate.no_target", { reason: "npm root -g failed" })
       // An installer in its own process: wait for it, or record that it died without saying how it went.
       const installing = state.installing
       if (installing) {
         const alive = processAlive(installing.pid) && now() - installing.startedAt < INSTALL_TIMEOUT_MS
         if (alive) return
-        const installed = installedVersion(runtime)
+        const installed = installedVersion(updates)
         state = updateState(({ installing: _installing, ...rest }) => ({
           ...rest,
           ...(installed && installed !== running ? {} : { lastError: { message: "the installer stopped without finishing", at: new Date(now()).toISOString(), version: installing.version } }),
         }))
         deps.log("autoupdate.installer_gone", { version: installing.version })
       }
-      const installed = installedVersion(runtime)
+      // The installer replaces the stable entry new clients start. Don't launch it while this relay is busy;
+      // recheck on the switch tick in case an agent came back during the download.
+      if (!deps.isIdle()) return
+      const installed = installedVersion(updates)
       if (installed === wanted) {
         // The build is on disk (this installer's, or another process's). Restart the relay with it once nothing is using the browser.
-        if (!deps.isIdle()) return
         switching = { pid: undefined, startedAt: now() }
         deps.log("autoupdate.switching", { from: running, to: installed })
         switching.pid = spawnChild(["runtime-switch", installed], (code) => {
           if (switching) switching = undefined
           if (code !== 0) deps.log("autoupdate.restart_refused", { version: installed, code })
           deps.onChange?.()
-        })
+        }, updates)
         return
       }
       if (state.lastError?.version === wanted) {
@@ -496,18 +558,32 @@ export function createAutoUpdater(deps: AutoUpdaterDeps) {
         const age = now() - Date.parse(failure.at)
         if (age >= 0 && age < Math.min(backoff, checkIntervalMs)) return
       }
+      const priorFailureAt = state.lastError?.at
       deps.log("autoupdate.installing", { version: wanted })
-      const pid = spawnChild(["self-update", wanted, "--channel", channelOf(running)], (code) => {
+      const startedAt = now()
+      const pid = spawnChild(["self-update", wanted, "--channel", channelOf(running), "--from", running], (code) => {
         deps.log(code === 0 ? "autoupdate.installed" : "autoupdate.install_failed", { version: wanted, code })
-        updateState(({ installing: _installing, ...rest }) => ({
-          ...rest,
-          ...(code === 0 ? {} : { lastError: { message: "the installer failed", at: new Date(now()).toISOString(), version: wanted, attempts: 1 + (rest.lastError?.version === wanted ? rest.lastError.attempts ?? 1 : 0) } }),
-        }))
+        updateState(({ installing: _installing, ...rest }) => {
+          if (code === 0) {
+            // The installer follows the channel, so it may have installed a newer release than the cached latest. Drop
+            // the check too: the immediate tick re-reads the manifest before deciding, instead of downloading again.
+            const { checkedAt: _checkedAt, etag: _etag, lastError: _lastError, ...kept } = rest
+            return kept
+          }
+          // The self-update child records its own detailed failure (runtime-update.ts), with this attempt's count. Keep it
+          // when it wrote one for this version during this attempt, so one failure isn't counted twice.
+          const failure = rest.lastError
+          if (failure !== undefined && failure.version === wanted && failure.at !== priorFailureAt) return rest
+          return {
+            ...rest,
+            lastError: { message: "the installer failed", at: new Date(now()).toISOString(), version: wanted, attempts: 1 + (failure?.version === wanted ? failure.attempts ?? 1 : 0) },
+          }
+        })
         deps.onChange?.()
         // Switch as soon as it's ready rather than at the next tick.
         if (code === 0) void tick()
-      })
-      if (pid) updateState((rest) => ({ ...rest, installing: { version: wanted, pid, startedAt: now() } }))
+      }, runtime)
+      if (pid) updateState((rest) => ({ ...rest, installing: { version: wanted, pid, startedAt } }))
     } catch (error) {
       deps.log("autoupdate.error", { error: (error as Error).message })
     } finally {
@@ -536,8 +612,8 @@ export function spawnRuntimeChild(runtime: Runtime, args: readonly string[], onE
   mkdirSync(directory, { recursive: true, mode: 0o700 })
   const log = openSync(path.join(directory, "auto-update.log"), "a", 0o600)
   try {
-    const [file, ...prefix] = entryCommand(runtime.entry)
-    const child = spawn(file!, [...prefix, ...args], { detached: true, stdio: ["ignore", log, log], env: rest })
+    const [file, ...prefix] = entrySpawnCommand(runtime.entry)
+    const child = spawn(file!, [...prefix, ...args], { detached: true, stdio: ["ignore", log, log], env: rest, windowsHide: true })
     child.on("error", () => onExit(null))
     child.on("exit", (code) => onExit(code))
     child.unref()

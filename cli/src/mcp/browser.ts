@@ -7,7 +7,7 @@ import { updateJson } from "../update.ts"
 import { securityVariables, settingSpecs, type SettingReport } from "../relay/user-settings.ts"
 import { TabsCleanupResponse } from "../relay/schema.ts"
 import { registerMcpTools } from "./registry.ts"
-import { agentSettingKeys, emptyInputSchema, objectSchema, SettingsToolOutput, StatusToolOutput } from "./schema.ts"
+import { agentSettingKeys, emptyInputSchema, objectSchema, SettingsToolOutput, StatusToolOutput, valuesSchema } from "./schema.ts"
 
 /** The settings report without update behaviour: agents may see its value in status but never read or change it here. */
 const agentSettings = (settings: Record<string, SettingReport>) =>
@@ -29,12 +29,14 @@ registerMcpTools({
       handle: () =>
         Effect.gen(function* () {
           const [version, status] = yield* Effect.all([ctx.relay.version, ctx.relay.extensionStatus])
+          const caller = yield* ctx.caller
           const buildProblem = RelayLifecycle.relayBuildProblem(version)
           const buildDrift = RelayLifecycle.relayBuildDrift(version)
           const available = updateJson(ctx.update())
           return {
             endpoint: ctx.relay.endpoint,
-            currentSession: ctx.currentSession.id,
+            currentSession: caller.id,
+            sharedSession: caller.shared,
             version,
             status,
             ...(buildProblem ? { buildProblem } : {}),
@@ -53,13 +55,13 @@ registerMcpTools({
     {
       name: "tabs_cleanup",
       description:
-        "Close tabs agents opened that nobody has used for a while (no agent command and not visited by the user). Tabs the user shared or pinned, the active tab, tabs playing audio, recording, or waiting for a handoff stay open. Call it when you finish a task to leave the user's browser tidy; browse also does this automatically after the user's idle setting (10 minutes unless they changed it).",
+        "Close tabs agents opened that nobody has used for a while (no agent command and not visited by the user). Tabs the user shared or pinned, the active tab, tabs playing audio, recording, or waiting for a handoff stay open. `idleMinutes` applies to the sessions the calling agent made current; when the client doesn't name agents, that is every session made current over this server, so agents sharing one should not use `idleMinutes: 0` unless the user asks. Every other agent tab closes only once idle for the user's setting too. To finish your own work, `session_reset` or `session_delete` is more direct. browse also does this automatically after the user's idle setting (10 minutes unless they changed it).",
       inputSchema: objectSchema({
         idleMinutes: {
           type: "integer",
           minimum: 0,
           description:
-            "Close tabs idle at least this long. 0 closes every eligible agent tab. Defaults to the user's setting (10 minutes; still 10 when the user set automatic cleanup to never).",
+            "Close the calling agent's own sessions' tabs idle at least this long; 0 closes all of them. When the client doesn't name agents, every session made current over this server counts, so only use 0 when the user asks. Defaults to the user's setting (10 minutes; still 10 when the user set automatic cleanup to never).",
         },
       }),
       readOnly: false,
@@ -67,11 +69,13 @@ registerMcpTools({
       idempotent: true,
       openWorld: false,
       outputSchema: TabsCleanupResponse,
-      handle: (input) => {
-        const value =
-          typeof input === "object" && input !== null && "idleMinutes" in input ? input.idleMinutes : undefined
-        return ctx.relay.tabsCleanup(typeof value === "number" && value >= 0 ? value : undefined)
-      },
+      handle: (input) =>
+        Effect.gen(function* () {
+          const value =
+            typeof input === "object" && input !== null && "idleMinutes" in input ? input.idleMinutes : undefined
+          const caller = yield* ctx.caller
+          return yield* ctx.relay.tabsCleanup(typeof value === "number" && value >= 0 ? value : undefined, [...caller.sessions])
+        }),
     },
     {
       name: "settings",
@@ -81,7 +85,7 @@ registerMcpTools({
           type: "object",
           description: "Settings to change; omit to only read them.",
           properties: Object.fromEntries(
-            agentSettingKeys.map((key) => [key, { enum: [...settingSpecs[key].values], description: settingSpecs[key].label }]),
+            agentSettingKeys.map((key) => [key, valuesSchema(settingSpecs[key].values, settingSpecs[key].label)]),
           ),
           additionalProperties: false,
         },

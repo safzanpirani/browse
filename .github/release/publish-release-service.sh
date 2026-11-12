@@ -7,8 +7,8 @@
 #
 # Every channel publishes both artifacts:
 #
-#   extension  chromium   the unpacked extension zip: browse-extension-<version>.zip on dev, the store zip
-#                         opencode-browser-<version>.zip on stable
+#   extension  chromium   the extension zip: browse-extension-<version>.zip, the store build on stable and the unpacked
+#                         one on dev
 #   cli        one target per binary (the same eleven targets as @opencode/browse-<target>), npm's darwin is the
 #              service's macos: opencode-browse-<target>-<version>.tgz
 #
@@ -24,10 +24,11 @@ binaries_dir=$2
 signed_dir=${3:-}
 : "${NOTES_URL:?Set NOTES_URL}"
 case "$BROWSE_CHANNEL" in
-  dev) channel=dev extension="browse-extension-$BROWSE_VERSION.zip" ;;
-  latest) channel=stable extension="opencode-browser-$BROWSE_VERSION.zip" ;;
+  dev) channel=dev ;;
+  latest) channel=stable ;;
   *) die "Unknown channel $BROWSE_CHANNEL" ;;
 esac
+extension="browse-extension-$BROWSE_VERSION.zip"
 [[ "$BROWSE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "Not a release version: $BROWSE_VERSION"
 if [ "$channel" = stable ]; then stable_version "$BROWSE_VERSION" || die "Not a stable version: $BROWSE_VERSION"; fi
 
@@ -83,7 +84,21 @@ publish() { # <artifact> <target=file>...
   shift
   set -- "$@" --app browse --artifact "$artifact" --release "$work/release.json" \
     --out "$work/manifest-$artifact.json" --verify-downloads
-  client publish "$@"
+  # Publishing is idempotent (a rerun skips files the service already has), so retry a transient network error
+  # instead of failing the job, for example a connection reset while the client re-downloads files to verify them.
+  local attempt delay status
+  delay=10
+  for attempt in 1 2 3; do
+    if client publish "$@"; then
+      return 0
+    else
+      status=$?
+    fi
+    if [ "$attempt" -eq 3 ]; then return "$status"; fi
+    echo "publish $artifact: attempt $attempt failed (exit $status); retrying in ${delay}s" >&2
+    sleep "$delay"
+    delay=30
+  done
 }
 publish extension --target "chromium=$build_dir/$extension"
 set --

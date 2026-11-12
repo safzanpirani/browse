@@ -19,7 +19,7 @@ secrets locally, and nothing is built, tagged or published from a laptop. Work l
 | Mode | Starts from | Version | Publishes |
 | --- | --- | --- | --- |
 | dev | every push to `dev` (not Markdown-only) | `<next patch>-dev.<run>`, e.g. `0.2.1-dev.57` | the [release service](#the-release-service) channel `dev` (`browse-extension-<version>.zip`, loaded unpacked, and every CLI binary target), then npm dist-tag `dev` (the binaries, then `@opencode/browse`) |
-| stable | **Actions → Release → Run workflow** on `dev` with a bump or version and release notes | `x.y.z` | tag `v<version>`, the [release service](#the-release-service) channel `stable` (the extension zip and every CLI binary target), npm `latest`, the public Chrome Web Store item (`opencode-browser-<version>.zip`), the GitHub release |
+| stable | **Actions → Release → Run workflow** on `dev` with a bump or version and release notes | `x.y.z` | tag `v<version>`, the [release service](#the-release-service) channel `stable` (the extension zip and every CLI binary target), npm `latest`, the public Chrome Web Store item (`browse-extension-<version>.zip`), the GitHub release |
 | check | the same button with bump `check` and no version, on any branch | `cli/package.json` | nothing: builds, checks and attests the stable artifacts and runs every publish script, the release service included, as a dry run |
 
 There's no `production` branch: browse has no website. If it gets one, the site deploys from `production`, as in
@@ -75,8 +75,8 @@ environment, secrets or id-token. The tag job checks out the repository but runs
 hooks off).
 
 So `.github/` is what to protect: [.github/CODEOWNERS](.github/CODEOWNERS) makes Dax and Ryan its owners, and the
-rulesets below require their review. The jobs that hold secrets run in the environment `release`, which admits only
-`dev`.
+rulesets below require their review. The jobs that need a secret run in the environment `release`, which admits only
+`dev`, and fetch it from AWS Secrets Manager ([Secrets](#secrets)).
 
 ## How a dev install gets its extension
 
@@ -98,7 +98,7 @@ checks the token against `registry/browse.json` there ([scripts/release-registry
 
 | Artifact | Target | File | Latest link |
 | --- | --- | --- | --- |
-| `extension` | `chromium` | `browse-extension-<version>.zip` on dev; `opencode-browser-<version>.zip` on stable | https://anoma.ly/release/browse/extension/stable/chromium |
+| `extension` | `chromium` | `browse-extension-<version>.zip` (the store build on stable, unpacked on dev); `opencode-browser-<version>.zip` on releases before the rename | https://anoma.ly/release/browse/extension/stable/chromium |
 | `cli` | `linux-x64`, `linux-x64-baseline`, `linux-arm64`, `linux-x64-musl`, `linux-x64-baseline-musl`, `linux-arm64-musl` | `opencode-browse-<target>-<version>.tgz` | https://anoma.ly/release/browse/cli/stable/linux-x64 |
 | `cli` | `macos-arm64`, `macos-x64`, `macos-x64-baseline` (files say `darwin-*`) | `opencode-browse-darwin-<arch>-<version>.tgz` | https://anoma.ly/release/browse/cli/stable/macos-arm64 |
 | `cli` | `windows-x64`, `windows-x64-baseline` | `opencode-browse-windows-<arch>-<version>.tgz` | https://anoma.ly/release/browse/cli/stable/windows-x64 |
@@ -107,6 +107,10 @@ Every target has a `.../<target>/info` with its version, size and SHA-256. `inst
 file's size and SHA-256 and installs it; a binary install's updater polls `cli/<stable|dev>.json` at launch and at
 least hourly with `If-None-Match` and User-Agent `browse/<channel>/<version>/cli`. `--version` stays on npm because the
 protocol has one current release per channel and no version lookup. npm global installs keep reading npm's dist-tag.
+
+A binary install's updater runs the install script baked into the binary it is running ([cli/script/compile.ts](cli/script/compile.ts)),
+so older releases keep reading future channel manifests with their own installer. Manifest changes must stay readable by
+older installers: relative `url`s, flat target objects, and `release.version` before any other `version` key.
 
 ## One-time setup
 
@@ -125,17 +129,19 @@ protocol has one current release per channel and no version lookup. npm global i
    secrets): `gh variable set CWS_PUBLISHER_ID --body <id>` and `gh variable set CWS_ITEM_ID --body <id>`.
 4. **Chrome Web Store API.** In an Anomaly Google Cloud project enable the Chrome Web Store API, set the OAuth consent
    screen to *Internal* (or *External*, **In production**: testing refresh tokens expire in 7 days), and create an
-   OAuth client of type **Desktop app**. Store `CWS_CLIENT_ID` and `CWS_CLIENT_SECRET` with
-   `gh secret set <name> --env release`, then run `bun scripts/cws-auth.ts --set-secret` signed in as the publisher's
-   Google account; it pipes the refresh token into `CWS_REFRESH_TOKEN` of `release`, never to disk.
+   OAuth client of type **Desktop app**. The client ID is a repository variable
+   (`gh variable set CWS_CLIENT_ID --body <id>`); the client secret goes to AWS as `browse/release/CWS_CLIENT_SECRET`
+   (`read -rs VALUE && printf %s "$VALUE" | bun set browse release CWS_CLIENT_SECRET`, in
+   [anomalyco/secrets](https://github.com/anomalyco/secrets)). Then run `bun scripts/cws-auth.ts` signed in as the
+   publisher's Google account and pipe the refresh token it prints into
+   `bun set browse release CWS_REFRESH_TOKEN`; nothing goes to disk.
 5. **Environment `release`** (Settings → Environments): *Deployment branches and tags* → *Selected* → branch `dev`
-   only. No required reviewers: who may release is decided by `plan`'s admin/maintain check and the rulesets. Secrets:
-   `CWS_CLIENT_ID`, `CWS_CLIENT_SECRET`, `CWS_REFRESH_TOKEN` and `RELEASE_TAG_KEY`; npm needs none (trusted
-   publishing). Delete the old `npm`, `chrome-web-store`, `release-dev`, `npm-dev` and `chrome-web-store-dev`
-   environments.
+   only. No required reviewers: who may release is decided by `plan`'s admin/maintain check and the rulesets. It holds
+   no secrets: it is the environment claim the AWS role's trust requires ([Secrets](#secrets)). Delete the old `npm`,
+   `chrome-web-store`, `release-dev`, `npm-dev` and `chrome-web-store-dev` environments.
 6. **Release deploy key.** `ssh-keygen -t ed25519 -N "" -C "browse release tags" -f release-tag-key`; add
-   `release-tag-key.pub` under Settings → Deploy keys with write access, store the private key with
-   `gh secret set RELEASE_TAG_KEY --env release < release-tag-key`, and delete both files.
+   `release-tag-key.pub` under Settings → Deploy keys with write access, store the private key as
+   `browse/release/RELEASE_TAG_KEY` (`bun set browse release RELEASE_TAG_KEY < release-tag-key`), and delete both files.
 7. **Rulesets** (Settings → Rules):
    - branch `dev`: require a pull request with code owner review, block force pushes and deletion; bypass:
      *Repository admin* and *Deploy keys* (the release commit comes back to dev with the deploy key).
@@ -156,9 +162,26 @@ protocol has one current release per channel and no version lookup. npm global i
    `npm trust list @opencode/browse-<target>` checks one.
 10. **macOS signing (optional).** Without it the macOS binaries carry the ad-hoc signature `bun build --compile` gives
     them, which runs fine from the install script and npm (neither sets quarantine). To sign with a Developer ID:
-    `base64 -i cert.p12 | gh secret set APPLE_SIGNING_CERTIFICATE --env release` (a Developer ID Application
-    certificate exported without a password), then `gh variable set MACOS_SIGNING --body true`; the sign-macos job
-    then runs and publish-npm takes the macOS packages only from it.
+    the certificate is `shared/APPLE_SIGNING_CERTIFICATE` in AWS (a Developer ID Application certificate exported
+    without a password, base64 encoded, shared with every Anomaly app); then `gh variable set MACOS_SIGNING --body true`
+    and the sign-macos job runs, with publish-npm taking the macOS packages only from it.
+
+## Secrets
+
+Release secrets live in AWS Secrets Manager (account `anomaly-secrets`), managed from
+[anomalyco/secrets](https://github.com/anomalyco/secrets). A job that needs one runs in the `release` environment and
+assumes `role/github/browse-release` with its GitHub OIDC token, fetching only the secrets it uses; the role's trust
+requires that environment, and it can read `browse/release/*` and `shared/APPLE_SIGNING_CERTIFICATE`. Set a value with
+`bun set browse release <NAME>` in that repo; no release secret is stored in GitHub. npm needs none (trusted
+publishing).
+
+| Secret | Use |
+| --- | --- |
+| `browse/release/RELEASE_TAG_KEY` | the release deploy key: `tag` pushes `v<version>`, `push-release-to-dev` pushes the release commit |
+| `browse/release/CWS_CLIENT_SECRET`, `browse/release/CWS_REFRESH_TOKEN`, var `CWS_CLIENT_ID` | the Chrome Web Store API (`publish-cws`) |
+| `shared/APPLE_SIGNING_CERTIFICATE` | `sign-macos`, when the repository variable `MACOS_SIGNING` is true |
+
+The Chrome Web Store ids are repository variables, not secrets: `CWS_CLIENT_ID`, `CWS_PUBLISHER_ID` and `CWS_ITEM_ID`.
 
 ## Undoing a bad release
 

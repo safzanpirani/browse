@@ -42,6 +42,14 @@ export type AdoptionResult = {
 }
 
 export const defaultExecuteTimeoutMs = 60_000
+/** How long relay shutdown waits for accepted session work before leaving it behind. */
+export const defaultShutdownTimeoutMs = 3_000
+
+/** A session still holding tracked work when shutdown's bounded wait expired. */
+export type PendingSessionWork = {
+  readonly sessionId: string
+  readonly pending: number
+}
 
 export type SessionHooks = {
   readonly checkBrowserResponsive?: (key: string) => Effect.Effect<void, Error>
@@ -52,6 +60,8 @@ export type SessionHooks = {
   readonly onExecuteStateChange?: (sessionId: string, executing: boolean) => void | Effect.Effect<void>
   /** Called after each execute completes, for journaling. Failure is logged and ignored. */
   readonly onExecuteRecord?: (record: SessionExecuteRecord) => unknown | Promise<unknown>
+  /** Called after a session is deleted, to drop state keyed by it. Failure is logged and ignored. */
+  readonly onSessionDeleted?: (sessionId: string) => void
   /** How long lifecycle commands wait for a permit or sandbox operation. */
   readonly lifecycleTimeoutMs?: number
   /** Overall budget for a single execute call (paused while handoff waits on the user); 0 disables. */
