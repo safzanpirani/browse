@@ -20,6 +20,8 @@ const referencePattern = String.raw`BC_(?:SECRET|REDACTED)_\d+`
  * equals the known value is still replaced.
  */
 export const minimumKnownSubstringLength = 8
+/** Whole numbers this long (one-time codes, PINs) are redacted when they equal a known value; shorter ones are data. */
+const minimumKnownNumberLength = 6
 const secretHeaders = new Set([
   "authorization",
   "proxy-authorization",
@@ -555,7 +557,7 @@ function redactValueWith(
   if (Predicate.isNumber(value) || Predicate.isBoolean(value)) {
     // A short number or boolean (`count: 1`, `flag: false`) is data, not a credential, unless typed as a secret.
     const serialized = String(value)
-    if (serialized.length < minimumKnownSubstringLength && !alwaysRedacted.has(serialized)) return value
+    if (serialized.length < minimumKnownNumberLength && !alwaysRedacted.has(serialized)) return value
     const slot = slots.find((candidate) => candidate.value === serialized)
     return slot ? `\${${slot.ref}}` : value
   }

@@ -340,9 +340,11 @@ describe("SecretCollector", () => {
       { ref: "BC_SECRET_1", value: "1", sources: ["request.header.cookie.count"] },
       { ref: "BC_SECRET_2", value: "90817263", sources: ["request.header.cookie.uid"] },
       { ref: "BC_SECRET_3", value: "false", sources: ["request.body.flag"] },
+      { ref: "BC_SECRET_4", value: "492817", sources: ["request.body.code.value"] },
     ])
     expect(collector.redactValue({ count: 1, flag: false, price: "Flat 10% off", uid: 90817263 }))
       .toEqual({ count: 1, flag: false, price: "Flat 10% off", uid: "${BC_SECRET_2}" })
+    expect(collector.redactValue(492817)).toBe("${BC_SECRET_4}")
   })
 
   test("keeps documentation code listings and inline code in a response", () => {
