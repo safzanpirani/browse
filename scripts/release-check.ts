@@ -20,13 +20,15 @@ import { cargoLockMemberVersions, cargoWorkspaceVersion, manifestVersionFields, 
 const root = path.resolve(import.meta.dir, "..")
 const release = path.join(root, "release")
 const json = async (file: string) => JSON.parse(await readFile(path.join(root, file), "utf8")) as Record<string, unknown>
+/** The omp fork's version (0.1.5-omp.1): never published, it only has to agree across the version files. */
+const OMP_VERSION = /^\d+\.\d+\.\d+-omp\.[1-9]\d{0,4}$/
 
 /** Everything that must agree before a release: the versions, the tag, and the changelog entry. */
 export async function versionProblems(options: { tag?: string; requireChangelog?: boolean } = {}) {
   const cli = (await json("cli/package.json")).version as string
   const problems: string[] = []
   try {
-    parseReleaseVersion(cli)
+    if (!OMP_VERSION.test(cli)) parseReleaseVersion(cli)
   } catch (error) {
     problems.push(`cli/package.json: ${(error as Error).message}`)
   }
@@ -59,7 +61,7 @@ if (import.meta.main) {
   if (problems.length) fail(problems)
   console.log(`✓ version ${version} agrees across cli/package.json, package.json, public/manifest.json and the Rust workspace${values.tag ? ` and ${values.tag}` : ""}`)
   if (values["versions-only"]) process.exit(0)
-  const dev = parseReleaseVersion(version).channel === "dev"
+  const dev = !OMP_VERSION.test(version) && parseReleaseVersion(version).channel === "dev"
   // The Rust CLI has the public store item built in (rust/crates/browse-relay/src/protocol.rs PUBLIC_STORE_ID), where
   // the TypeScript CLI took it from OPENCODE_BROWSER_STORE_ID (the CWS_ITEM_ID repository variable) at build time.
   const storeId = process.env.OPENCODE_BROWSER_STORE_ID?.trim()

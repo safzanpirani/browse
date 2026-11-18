@@ -31,11 +31,14 @@ export function parseReleaseVersion(version: string): ReleaseVersion {
   return { version, channel: "dev", manifest: { version: `${core}.${run}`, version_name: version } }
 }
 
-/** The manifest fields for a package version; a development version (0.0.0-dev) maps to 0.0.0. */
+/**
+ * The manifest fields for a package version; a development version (0.0.0-dev) maps to 0.0.0, and the omp fork's
+ * 0.1.5-omp.1 to 0.1.5.1 (version_name 0.1.5-omp.1).
+ */
 export function manifestVersionFields(version: string): ReleaseVersion["manifest"] {
   if (RELEASE_VERSION.test(version)) return parseReleaseVersion(version).manifest
-  const base = /^(\d+)\.(\d+)\.(\d+)/.exec(version)
-  return { version: base ? `${base[1]}.${base[2]}.${base[3]}` : "0.0.0", version_name: version }
+  const base = /^(\d+)\.(\d+)\.(\d+)(?:-omp\.([1-9]\d{0,4}))?/.exec(version)
+  return { version: base ? `${base[1]}.${base[2]}.${base[3]}${base[4] ? `.${base[4]}` : ""}` : "0.0.0", version_name: version }
 }
 
 /** Sets version (and version_name, or removes a stale one) on a parsed manifest. */
@@ -134,7 +137,8 @@ if (import.meta.main) {
   const [command, argument] = positionals
   try {
     if (command === "set" && argument) {
-      parseReleaseVersion(argument)
+      // The omp fork's own version (0.1.5-omp.1) is never released; it only has to map onto the manifest.
+      if (!/^\d+\.\d+\.\d+-omp\.[1-9]\d{0,4}$/.test(argument)) parseReleaseVersion(argument)
       await setVersion(argument)
       console.log(argument)
     } else {
