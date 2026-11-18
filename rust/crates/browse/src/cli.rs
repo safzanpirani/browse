@@ -321,7 +321,11 @@ fn parse(spec: &ToolSpec, args: &[String]) -> anyhow::Result<ParseResult> {
                         }
                         None => Value::Bool(true),
                     },
-                    None => bail!("--{flag} needs a value; see `browse {name} --help`"),
+                    // `--action reload`, as the help shows: the next word is the value.
+                    None => match take(&mut i) {
+                        Some(raw) => coerce(flag, schema, raw)?,
+                        None => bail!("--{flag} needs a value; see `browse {name} --help`"),
+                    },
                 };
                 arguments.insert(key, value);
             }
@@ -619,5 +623,17 @@ mod tests {
         let (globals, rest) = split_globals(&args);
         assert_eq!(globals, ["--tab", "12", "--output=a.png"]);
         assert_eq!(rest, ["screenshot"]);
+    }
+
+    #[test]
+    fn flags_take_the_next_word_as_their_value() {
+        let parsed = parse_arguments(&navigate(), &["--tab", "12", "--action", "reload"]).unwrap();
+        assert_eq!(parsed.get("action"), Some(&json!("reload")));
+        let parsed = parse_arguments(&type_tool(), &["--tab", "12", "--text", "hello world"]).unwrap();
+        assert_eq!(parsed.get("text"), Some(&json!("hello world")));
+        let parsed = parse_arguments(&navigate(), &["--url=https://x.test"]).unwrap();
+        assert_eq!(parsed.get("url"), Some(&json!("https://x.test")));
+        assert!(parse_arguments(&navigate(), &["--action"]).unwrap_err().to_string().contains("needs a value"));
+        assert!(parse_arguments(&navigate(), &["--action", "--readOnly"]).unwrap_err().to_string().contains("needs a value"));
     }
 }

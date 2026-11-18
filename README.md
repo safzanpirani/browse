@@ -14,6 +14,26 @@ prompt, a payment), they hand the tab back to you and continue once you click **
 
 It works in Chrome, Edge, Brave, Arc, Helium, Vivaldi, Opera and Chromium.
 
+## This fork (omp)
+
+`safzanpirani/browse` branch `omp-rust` is upstream's Rust browse plus what Safzan's omp agents use. It versions itself
+`<upstream>-omp.<n>` (now `0.1.5-omp.1`; the extension says `0.1.5.1`), never updates itself from the release service
+(that would install upstream's build), and has an orange-bordered icon so it can't be mistaken for the store build.
+
+- `--profile <browser>` on any command, or `OPENCODE_BROWSER_PROFILE`: the tabs the command opens (`navigate`, `tabs
+  new`, `execute`) and the `settings` it reads go to that paired browser. `browse --profile work mcp` does the same
+  for an MCP server. `execute` and `settings` also take `browser` as an argument.
+- `browse find [site] [--json]`: every paired browser, connected or not, with the tabs agents can use in it; with a
+  site, the matching tabs and the command to run next. It never starts a relay.
+- `browse stop` stops the relay; `browse restart` restarts it.
+- `browse install --client omp [--mcp] [--bin-dir <dir>] [--skills-dir <dir>]` writes a `browse` launcher for this
+  build and the omp browse skill (`rust/crates/browse/src/omp-skill.md` with the paired browsers' table);
+  `browse uninstall --client omp` removes them.
+- Network captures treat `x-goog-authuser` and `authuser` as data, and short known numbers (`1`, `true`) stay data
+  unless they were a password or one-time code. Storage cookie commands use the tab's own profile.
+- `skills/browse-remote`: ampere drives this Mac's relay through one ssh tunnel on the same port, with a Linux build
+  of the same browse.
+
 ## Install
 
 ```sh

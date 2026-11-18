@@ -41,7 +41,7 @@ fn live() -> Value {
     let endpoint = relay_api::endpoint();
     let down = |note: String| json!({ "relay": { "running": false, "endpoint": endpoint, "note": note }, "browsers": [], "tabs": [] });
     match relay::probe() {
-        relay::Probe::Absent => down("No relay is running; the next browse command starts it.".into()),
+        relay::Probe::Absent => down("No relay is running.".into()),
         relay::Probe::Foreign(message) => down(message),
         relay::Probe::Running(version) if legacy::is_legacy(&version) => json!({
             "relay": { "running": true, "endpoint": endpoint, "note": "A TypeScript browse relay runs here; this browse can't read its tabs without replacing it (`browse restart` does that)." },
@@ -49,20 +49,22 @@ fn live() -> Value {
             "tabs": [],
         }),
         relay::Probe::Running(_) => {
-            let request = ToolCallRequest { name: "status".into(), arguments: json!({}) };
-            let status = relay::call(&request, None).ok().and_then(|output| {
-                output.content.iter().find_map(|content| match content {
-                    Content::Text { text } => serde_json::from_str::<Value>(text).ok(),
-                    Content::Image { .. } => None,
+            // `status` names the browsers; `tabs` lists the tabs with their current titles.
+            let answer = |name: &str, arguments: Value| {
+                relay::call(&ToolCallRequest { name: name.into(), arguments }, None).ok().and_then(|output| {
+                    output.content.iter().find_map(|content| match content {
+                        Content::Text { text } => serde_json::from_str::<Value>(text).ok(),
+                        Content::Image { .. } => None,
+                    })
                 })
-            });
-            match status {
-                Some(status) => json!({
+            };
+            match (answer("status", json!({})), answer("tabs", json!({ "action": "list" }))) {
+                (Some(status), Some(tabs)) => json!({
                     "relay": { "running": true, "endpoint": endpoint },
                     "browsers": status["extension"]["browsers"],
-                    "tabs": status["tabs"],
+                    "tabs": tabs["tabs"],
                 }),
-                None => down("The relay didn't answer its status.".into()),
+                _ => down("The relay didn't answer status and tabs.".into()),
             }
         }
     }

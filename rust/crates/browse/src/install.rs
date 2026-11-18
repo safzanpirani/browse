@@ -427,7 +427,7 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
             println!("or rerun with `browse install --agent <name>` ({}).", AGENTS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "));
         }
         println!();
-    } else if !ask && flags.requested.is_empty() && !flags.all {
+    } else if !ask && flags.requested.is_empty() && !flags.all && !flags.omp {
         let others: Vec<&str> = locations.iter().filter(|l| l.installed && !selected.contains(&l.name)).map(|l| l.name).collect();
         if !others.is_empty() {
             println!("Also found {}. To add browse there too: browse install --agent {}", names(&others), others.join(" "));
@@ -445,7 +445,7 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
     update::write_private(&setup::settings_path(), format!("{saved:#}\n").as_bytes())?;
 
     let agent = !std::io::stdout().is_terminal();
-    if agent && let Some(caller) = caller {
+    if agent && !flags.none && let Some(caller) = caller {
         println!("Agent: browse's tools appear in {} once it reloads its MCP servers; if they don't show up, ask the user to restart {}.", agents::label(caller), agents::label(caller));
     }
     if flags.remote {
