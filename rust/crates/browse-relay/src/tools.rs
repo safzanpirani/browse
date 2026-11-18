@@ -360,15 +360,24 @@ impl Tool for SettingsTool {
                 "Read or change the user's browse settings from the extension's options page: where agent tabs open (window), how they're grouped (grouping), when untouched agent tabs close (idleMinutes), human-like input (humanInput) and handoff notifications (handoffNotifications). Use it only when the user asks to change how browse behaves. Without `set` it returns each setting's stored value, the value in effect and the relay environment variable that overrides it, if any. With `set` it validates every value, applies the change at once and returns what changed: tell the user what you changed. Security switches ({}) are environment-only and can't be read or changed here.",
                 crate::settings::SECURITY_VARIABLES.join(", ")
             ),
-            input_schema: object(json!({ "set": { "type": "object", "description": "Settings to change; omit to only read them.", "properties": properties, "additionalProperties": false } }), &[]),
+            input_schema: object(
+                json!({
+                    "set": { "type": "object", "description": "Settings to change; omit to only read them.", "properties": properties, "additionalProperties": false },
+                    "browser": { "type": "string", "description": "Which connected browser's settings (each browser keeps its own), by the id or name `status` lists. Defaults to the first connected one." },
+                }),
+                &[],
+            ),
         }
     }
 
     async fn call(&self, _ctx: ToolContext, args: Value) -> anyhow::Result<ToolOutput> {
         let relay = relay()?;
-        let link = relay.st().default_link().filter(|l| l.connected()).ok_or_else(|| {
-            anyhow!("The browse extension isn't connected, so its settings can't be read or changed. Ask the user to open the browser with the extension; its options page shows whether it's connected.")
-        })?;
+        let link = match string(&args, "browser") {
+            Some(name) => relay.link_for(Some(&name)).await?,
+            None => relay.st().default_link().filter(|l| l.connected()).ok_or_else(|| {
+                anyhow!("The browse extension isn't connected, so its settings can't be read or changed. Ask the user to open the browser with the extension; its options page shows whether it's connected.")
+            })?,
+        };
         let read = |answer: Result<Value, crate::link::RpcError>| -> anyhow::Result<Vec<(String, String)>> {
             let answer = answer.map_err(|error| match error.to_string() {
                 text if text.contains("Invalid extension command") => anyhow!("The connected browse extension is too old to read or change settings from here. Update it, or change them on its options page."),

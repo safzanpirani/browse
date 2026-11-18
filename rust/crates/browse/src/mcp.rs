@@ -185,7 +185,11 @@ fn cancel(running: &Running, request: &Value) {
 
 fn call(params: &Value, client: &str, key: &str) -> ToolOutput {
     let name = params.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let arguments = params.get("arguments").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
+    let mut arguments = params.get("arguments").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
+    // `browse --profile <browser> mcp`: the tabs this server's agent opens, and its settings, are that browser's.
+    if let Some(map) = arguments.as_object_mut() {
+        crate::profile::apply(&name, map, crate::profile::selected());
+    }
     relay::call_keyed(&ToolCallRequest { name: name.clone(), arguments }, Some(client), Some(key))
         .unwrap_or_else(|error| ToolOutput::error(format!("{name} failed: {error:#}")))
 }

@@ -40,6 +40,12 @@ fn version() -> String {
     String::from_utf8(Command::new(env!("CARGO_BIN_EXE_browse")).arg("--version").output().unwrap().stdout).unwrap().trim().to_owned()
 }
 
+/// The omp fork's builds (`-omp.` versions) never update themselves or check in (method.rs `install`), so the
+/// update tests below only run on upstream versions.
+fn fork_build() -> bool {
+    version().contains("-omp.")
+}
+
 fn channel() -> &'static str {
     let version = version();
     if version.contains("-dev.") {
@@ -288,6 +294,9 @@ impl Drop for Scene {
 
 #[test]
 fn binary_install_checks_the_release_service() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("binary");
     let binary = scene.home.join(".browse/bin/browse");
     std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
@@ -305,6 +314,9 @@ fn binary_install_checks_the_release_service() {
 
 #[test]
 fn npx_run_checks_the_release_service() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("npx");
     let modules = scene.home.join(".npm/_npx/4d2a/node_modules");
     let launcher = scene.package(&modules.join("@opencode/browse"));
@@ -322,6 +334,9 @@ fn npx_run_checks_the_release_service() {
 
 #[test]
 fn npm_global_install() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("npm");
     let prefix = scene.home.join(".nvm/versions/node/v22.11.0");
     let package = prefix.join("lib/node_modules/@opencode/browse");
@@ -337,6 +352,9 @@ fn npm_global_install() {
 
 #[test]
 fn npm_global_install_waits_quietly_when_npm_lags_the_release() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("npm-etarget");
     let prefix = scene.home.join(".nvm/versions/node/v22.11.0");
     let package = prefix.join("lib/node_modules/@opencode/browse");
@@ -388,6 +406,9 @@ fn npm_global_install_waits_quietly_when_npm_lags_the_release() {
 
 #[test]
 fn bun_global_install() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("bun");
     let root = scene.home.join(".bun");
     let global = root.join("install/global");
@@ -402,6 +423,9 @@ fn bun_global_install() {
 
 #[test]
 fn yarn_global_install() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("yarn");
     let folder = scene.home.join(".local/share/yarn/global");
     write(&folder.join("package.json"), r#"{"dependencies":{"@opencode/browse":"0.1.0"}}"#);
@@ -466,6 +490,9 @@ fn answers_version(port: u16) -> bool {
 /// the old idle-shutdown setting): it doesn't restart itself.
 #[test]
 fn a_relay_with_no_special_environment_checks_at_launch_and_stays_up() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("launch");
     let binary = scene.binary();
     let (service, requests) = release_service_with(Some(scene.tarball()));
@@ -483,9 +510,34 @@ fn a_relay_with_no_special_environment_checks_at_launch_and_stays_up() {
     assert!(!scene.started.exists(), "a foreground relay doesn't start the new executable");
 }
 
+/// A fork build installed like the install script's binary never asks the release service and installs nothing: an
+/// upstream release would replace the fork's features.
+#[test]
+fn a_fork_build_never_checks_in_or_updates() {
+    if !fork_build() {
+        return;
+    }
+    let scene = Scene::new("fork");
+    let binary = scene.binary();
+    let (service, requests) = release_service_with(Some(scene.tarball()));
+    let port = free_port();
+    let mut relay = scene.serve(&binary, &service, port).env("OPENCODE_BROWSER_MANAGED_RELAY", "1").env("OPENCODE_BROWSER_AUTO_UPDATE_QUIET_MS", "0").spawn().unwrap();
+    wait_for("the relay", Duration::from_secs(20), || answers_version(port));
+    std::thread::sleep(Duration::from_secs(3));
+    let running = relay.try_wait().unwrap().is_none();
+    let _ = relay.kill();
+    let _ = relay.wait();
+    assert!(running, "the relay exited or restarted itself");
+    assert!(requests.lock().unwrap().is_empty(), "a fork build asked the release service");
+    assert_eq!(std::fs::read(&binary).unwrap(), std::fs::read(env!("CARGO_BIN_EXE_browse")).unwrap(), "nothing installed");
+}
+
 /// Updates off: the relay still checks the manifest, with the same User-Agent, and downloads and installs nothing.
 #[test]
 fn updates_off_still_checks_and_installs_nothing() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("off");
     let binary = scene.binary();
     let (service, requests) = release_service_with(Some(scene.tarball()));
@@ -511,6 +563,9 @@ fn updates_off_still_checks_and_installs_nothing() {
 /// it.
 #[test]
 fn a_relay_updates_without_curl() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("no-curl");
     let binary = scene.binary();
     let (service, requests) = release_service_with(Some(scene.tarball()));
@@ -534,6 +589,9 @@ fn a_relay_updates_without_curl() {
 /// and installs nothing.
 #[test]
 fn an_unrecognized_install_checks_in_and_installs_nothing() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("other");
     // Outside the target folder, which would make it a checkout build.
     let outside = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(".cache/oc-tmp/browse-other-{}", std::process::id()));

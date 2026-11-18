@@ -78,6 +78,7 @@ impl Tool for ExecuteTool {
                     "code": { "type": "string", "description": CODE_DESCRIPTION },
                     "timeoutMs": { "type": "integer", "minimum": 0, "description": "Overall timeout in milliseconds (paused while handoff waits on the user); default 60000, 0 for none. Includes waiting behind another execute in the same tab." },
                     "tab": { "type": ["integer", "string"], "description": "The tab `page` stands for: the `tab` an earlier execute (or navigate, tabs) returned, or a chosen id like `work-mail` given to tabs new. Leave it out to start without a tab; page.goto(url) then opens one." },
+                    "browser": { "type": "string", "description": "Which connected browser the tabs this execute opens go to (page.goto without a tab, context.newPage(), browse.navigate or browse.tabs new without their own `browser`), by the id or name `status` lists. Defaults to the first connected one; tabs that already exist stay in their browser." },
                 },
                 "required": ["code"],
                 "additionalProperties": false,
@@ -124,7 +125,8 @@ impl Tool for ExecuteTool {
         tools.sort();
         let state = held.as_deref().cloned().unwrap_or_else(|| "{}".to_string());
         let job = engine::Job { code: code.to_string(), state, tools, tab, timeout_ms: remaining };
-        let host = host::Host { ctx: ctx.clone(), tools: self.tools.clone() };
+        let browser = args.get("browser").and_then(Value::as_str).map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
+        let host = host::Host { ctx: ctx.clone(), tools: self.tools.clone(), browser };
         let outcome = host.run(job).await;
         let mut warnings = outcome.warnings.clone();
         let report = outcome.finished.as_ref().and_then(|f| f.report.as_ref());

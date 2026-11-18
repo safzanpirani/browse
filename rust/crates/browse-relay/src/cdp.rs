@@ -153,6 +153,10 @@ impl Cdp for TabCdp {
             params
         };
         let auto_attach = method == "Target.setAutoAttach" && session_id.is_none() && params["autoAttach"] == true;
+        let (method, params) = match crate::guardrails::tab_scoped_cookie_command(method, &params) {
+            Some((twin, params)) => (twin, params),
+            None => (method, params),
+        };
         let result = if method == "Page.captureScreenshot" && session_id.is_none() {
             self.screenshot(params).await
         } else {

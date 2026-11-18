@@ -539,8 +539,13 @@ fn pnpm_globals(home: &Path) -> Vec<PathBuf> {
     found.into_iter().map(|(_, path)| path).collect()
 }
 
-/// This process's install.
+/// This process's install. The omp fork's builds (a version with `-omp.`) count as checkout builds wherever they
+/// sit: the release service and npm publish upstream's browse, which would replace the fork's features, so a fork
+/// build never updates itself, never checks in and is used where it is.
 pub fn install() -> Install {
+    if crate::VERSION.contains("-omp.") {
+        return Install::Checkout;
+    }
     let Ok(exe) = crate::relay::current_exe() else { return Install::Other };
     detect(&exe, &Launcher::from_env(), &crate::relay_api::bin_root().join(EXECUTABLE))
 }

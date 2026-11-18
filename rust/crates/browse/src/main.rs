@@ -2,6 +2,7 @@ mod agents;
 mod browsers;
 mod cli;
 mod dsh;
+mod find;
 mod http;
 mod install;
 mod jsonc;
@@ -9,6 +10,7 @@ mod legacy;
 mod mcp;
 mod method;
 mod picker;
+mod profile;
 mod protocol;
 mod relay;
 mod relay_api;
@@ -33,6 +35,8 @@ const COMMANDS: &[&str] = &[
     "uninstall",
     "set",
     "restart",
+    "stop",
+    "find",
     "pair",
     "extension",
     "update",
@@ -75,6 +79,9 @@ SETUP
 RUNNING
   serve                       Run the relay in the foreground (agents start it on demand)
   restart                     Restart the relay with this terminal's environment; agent tabs stay open
+  stop                        Stop the relay without starting another; agent tabs stay open
+  find [site] [--json]        Every browser (connected or not) and the tabs agents can use in it; with a site, the
+                              matching tabs and the command to run next. Starts no relay
   mcp                         The MCP server agents run (stdio)
   tools                       List the browser tools
   <tool> [value]... [--arg value]...
@@ -90,10 +97,26 @@ RUNNING
   execute --file <script.js>  Run a JavaScript file (Playwright-style `page`, snapshot(), ref(), handoff(), browse.*);
                               --code '<js>' or a positional value runs inline code, --file - reads stdin.
                               It prints the tab it ended in; --tab <id> continues there
+
+BROWSERS (one relay drives every paired browser; each Chrome profile with browse is one)
+  --profile <browser>         On any command: the tabs it opens (navigate, tabs new, execute) and the settings it
+                              reads use this browser: its id or name from `browse status`. OPENCODE_BROWSER_PROFILE
+                              works too; without either, the first connected browser
 ";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--profile <browser>` may come anywhere before `--` (profile.rs).
+    let args = match profile::take(&args) {
+        Ok((rest, chosen)) => {
+            profile::select(chosen);
+            rest
+        }
+        Err(error) => {
+            eprintln!("browse: {error}");
+            std::process::exit(2);
+        }
+    };
     // Global flags may come before the tool name: `browse --tab 12 snapshot`.
     let (globals, mut args) = cli::split_globals(&args);
     if !globals.is_empty() && args.first().is_some_and(|a| !a.starts_with('-')) {
@@ -138,6 +161,11 @@ fn main() {
             println!("✓ The relay restarted");
             0
         }),
+        "stop" => relay::stop().map(|stopped| {
+            println!("{}", if stopped { format!("✓ Stopped the relay at {}", relay_api::endpoint()) } else { format!("No relay is running at {}", relay_api::endpoint()) });
+            0
+        }),
+        "find" => find::command(rest),
         "pair" => setup::pair(rest),
         "extension" => Ok(setup::extension()),
         "update" => update::command(rest).map(|_| 0),

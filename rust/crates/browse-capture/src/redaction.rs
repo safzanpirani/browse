@@ -15,6 +15,9 @@ pub const REDACTED: &str = "[redacted]";
 const SENTINEL: &str = "__browse_redacted__";
 /// Known values shorter than this are not replaced inside unrelated text; short strings collide with ordinary text.
 pub const MINIMUM_KNOWN_SUBSTRING_LENGTH: usize = 8;
+/// Numbers and booleans this long (one-time codes, PINs) are redacted when they equal a known value; shorter ones
+/// (`count: 1`, `flag: false`) are data, unless they were a password or one-time code.
+const MINIMUM_KNOWN_NUMBER_LENGTH: usize = 6;
 
 static SECRET_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i-u)auth(?:orization)?|cookie|credential|csrf|xsrf|token|secret|session|password|passwd|pwd|passcode|otp|(?:^|[-_.])code(?:$|[-_.])|(?:api|access|refresh)[-_.]?key|signature|(?:^|[-_.])sig(?:$|[-_.])").unwrap()
@@ -28,7 +31,8 @@ static PART_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i-u:;[ \t]*
 
 const SECRET_HEADERS: &[&str] =
     &["authorization", "proxy-authorization", "x-api-key", "api-key", "x-csrf-token", "csrf-token", "x-xsrf-token"];
-// HTTP/2 pseudo-headers (except :path, protected like a URL) and CORS headers carry routing and policy, not secrets.
+// HTTP/2 pseudo-headers (except :path, protected like a URL) and CORS headers carry routing and policy, not secrets;
+// Google's signed-in account index (x-goog-authuser) is account metadata, not a credential.
 const NON_SECRET_HEADERS: &[&str] = &[
     ":authority",
     ":method",
@@ -45,7 +49,10 @@ const NON_SECRET_HEADERS: &[&str] = &[
     "access-control-request-headers",
     "access-control-allow-private-network",
     "access-control-request-private-network",
+    "x-goog-authuser",
 ];
+// Form, query and fragment fields whose names look secret but hold an account index, not a credential.
+const NON_SECRET_FIELDS: &[&str] = &["authuser"];
 const COOKIE_ATTRIBUTES: &[&str] =
     &["domain", "path", "expires", "max-age", "samesite", "priority", "partitioned", "secure", "httponly"];
 
@@ -57,6 +64,11 @@ pub struct Header {
 
 pub fn is_secret_name(name: &str) -> bool {
     SECRET_NAME.is_match(name)
+}
+
+/// A form, query or fragment field holding a credential: a secret-looking name that isn't a known account index.
+fn is_secret_field(name: &str) -> bool {
+    is_secret_name(name) && !NON_SECRET_FIELDS.iter().any(|field| field.eq_ignore_ascii_case(name))
 }
 
 #[derive(Default)]
@@ -186,14 +198,16 @@ impl SecretRedactor {
         output
     }
 
-    /// Redacts scalars that equal a known value (numbers and booleans included).
+    /// Redacts scalars that equal a known value: numbers and booleans of at least MINIMUM_KNOWN_NUMBER_LENGTH
+    /// characters, or any length when they were a password or one-time code.
     pub fn redact_scalar(&self, value: &Value) -> Value {
         let text = match value {
             Value::Number(number) => number.to_string(),
             Value::Bool(flag) => flag.to_string(),
             _ => return value.clone(),
         };
-        if self.known.contains(&text) || self.always.contains(&text) { Value::String(REDACTED.into()) } else { value.clone() }
+        let known = self.always.contains(&text) || (text.chars().count() >= MINIMUM_KNOWN_NUMBER_LENGTH && self.known.contains(&text));
+        if known { Value::String(REDACTED.into()) } else { value.clone() }
     }
 
     /// Remember `value` for redaction everywhere.
@@ -243,7 +257,7 @@ impl SecretRedactor {
         let pairs = parse_form(text)
             .into_iter()
             .map(|(name, value)| {
-                let value = if value.is_empty() || !is_secret_name(&name) {
+                let value = if value.is_empty() || !is_secret_field(&name) {
                     value
                 } else if from_url {
                     self.scrub_url_field(&value, &name)
@@ -263,7 +277,7 @@ impl SecretRedactor {
                 let Some(separator) = part.find('=').filter(|index| *index >= 1) else { return part.to_string() };
                 let Some((name, value)) = parse_form(part).into_iter().next() else { return part.to_string() };
                 let plain = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-');
-                if !plain || !is_secret_name(&name) || value.is_empty() {
+                if !plain || !is_secret_field(&name) || value.is_empty() {
                     return part.to_string();
                 }
                 format!("{}{}", &part[..separator + 1], self.scrub_url_field(&value, &name))
@@ -660,5 +674,28 @@ mod tests {
         assert_eq!(redactor.redact_text("longsecretvalue123"), "[redacted]");
         redactor.protect_headers(&[header("X-Token", "short")]);
         assert_eq!(redactor.redact_text("a short word"), "a short word");
+    }
+
+    #[test]
+    fn short_known_numbers_stay_data_and_long_ones_go() {
+        let mut redactor = SecretRedactor::new();
+        // A captured cookie `theme=1` must not turn every `1` in a JSON body into [redacted].
+        redactor.protect_headers(&[header("Cookie", "theme=1; flag=true; pin=482193")]);
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(1)), serde_json::json!(1));
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(true)), serde_json::json!(true));
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(482193)), serde_json::json!(REDACTED));
+        // A one-time code is redacted at any length.
+        redactor.protect_body(r#"{"otp":"4821"}"#, Some("application/json"));
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(4821)), serde_json::json!(REDACTED));
+    }
+
+    #[test]
+    fn account_indexes_are_not_secrets() {
+        let mut redactor = SecretRedactor::new();
+        let protected = redactor.protect_headers(&[header("X-Goog-AuthUser", "1")]);
+        assert_eq!(protected[0].value, "1");
+        assert_eq!(redactor.protect_url("https://mail.google.com/mail/?authuser=2&auth_token=abc"), "https://mail.google.com/mail/?authuser=2&auth_token=[redacted]");
+        assert_eq!(redactor.protect_url("https://x.test/#authuser=0&access_token=xyz"), "https://x.test/#authuser=0&access_token=[redacted]");
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(2)), serde_json::json!(2));
     }
 }

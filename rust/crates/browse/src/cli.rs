@@ -349,7 +349,7 @@ pub fn call(name: &str, args: &[String]) -> anyhow::Result<i32> {
         return Ok(2);
     };
     let name = spec.name.as_str();
-    let (arguments, output) = match parse(spec, args)? {
+    let (mut arguments, output) = match parse(spec, args)? {
         ParseResult::Help => {
             help(spec);
             return Ok(0);
@@ -357,6 +357,10 @@ pub fn call(name: &str, args: &[String]) -> anyhow::Result<i32> {
         ParseResult::Call(parsed) => (parsed.arguments, parsed.output),
     };
     check(name, &properties(spec), &arguments)?;
+    // A browser the call doesn't name itself comes from `--profile` (profile.rs), where the tool picks one.
+    if properties(spec).contains_key("browser") {
+        crate::profile::apply(name, &mut arguments, crate::profile::selected());
+    }
     if let Some(dir) = output.as_ref().and_then(|p| p.parent()).filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("can't create {} for --output", dir.display()))?;
     }

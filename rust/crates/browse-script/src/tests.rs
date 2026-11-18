@@ -51,8 +51,8 @@ impl Tool for Fake {
             "echo" => ToolOutput::text(args.to_string()),
             "fail" => ToolOutput::error(args["message"].as_str().unwrap_or("failed").to_string()),
             "picture" => ToolOutput { content: vec![Content::Image { data: "iVBORw0KGgo=".into(), mime_type: "image/png".into() }], is_error: false },
-            // Without a tab, navigate opens tab 7.
-            "navigate" => ToolOutput::text(json!({ "tab": args.get("tab").cloned().unwrap_or(json!(7)), "url": args["url"], "title": "T", "status": 200, "navigated": true }).to_string()),
+            // Without a tab, navigate opens tab 7 (in the browser the call names, echoed back).
+            "navigate" => ToolOutput::text(json!({ "tab": args.get("tab").cloned().unwrap_or(json!(7)), "url": args["url"], "title": "T", "status": 200, "navigated": true, "browser": args.get("browser") }).to_string()),
             "handoff" => {
                 tokio::time::sleep(Duration::from_millis(args["ms"].as_u64().unwrap_or(0))).await;
                 ToolOutput::text(json!({ "outcome": "continued" }).to_string())
@@ -183,4 +183,20 @@ async fn handoff_pauses_the_timeout() {
     let (text, output) = run_in(&context(), json!({ "code": "await browse.handoff({ ms: 600 }); return 'after'", "timeoutMs": 300 })).await;
     assert!(!output.is_error, "{text}");
     assert!(text.starts_with("after") && text.contains("1 handoff"), "{text}");
+}
+
+/// An execute's `browser` reaches the calls that open a tab, unless they name their own; a call in an existing tab is
+/// left alone.
+#[tokio::test]
+async fn the_execute_browser_goes_to_calls_that_open_tabs() {
+    let returned = |text: &str, value: &str| text.lines().any(|line| line == value);
+    let (text, output) = run_in(&context(), json!({ "code": "const r = await browse.navigate({ url: 'https://example.com/' }); return r.browser", "browser": "work" })).await;
+    assert!(!output.is_error, "{text}");
+    assert!(returned(&text, "work"), "{text}");
+    let (own, _) = run_in(&context(), json!({ "code": "const r = await browse.navigate({ url: 'https://example.com/', browser: 'patty' }); return r.browser", "browser": "work" })).await;
+    assert!(returned(&own, "patty"), "{own}");
+    let (existing, _) = run_in(&context(), json!({ "code": "const r = await browse.navigate({ url: 'https://example.com/', tab: 7 }); return r.browser ?? 'none'", "browser": "work" })).await;
+    assert!(returned(&existing, "none"), "{existing}");
+    let (default, _) = run_in(&context(), json!({ "code": "const r = await browse.navigate({ url: 'https://example.com/' }); return r.browser ?? 'none'" })).await;
+    assert!(returned(&default, "none"), "{default}");
 }

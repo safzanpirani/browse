@@ -142,6 +142,10 @@ pub fn start_from(executable: &std::path::Path) -> anyhow::Result<()> {
     command.arg("serve").env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     for (name, value) in std::env::vars_os() {
         let upper = name.to_string_lossy().to_uppercase();
+        // The relay serves every browser: the one that happened to start it (`--profile`) isn't its business.
+        if upper == crate::profile::VARIABLE {
+            continue;
+        }
         // The package managers' own settings, for a global install's updates.
         let npm = ["NPM_CONFIG_", "BUN_", "PNPM_", "YARN_", "VOLTA_", "COREPACK_"].iter().any(|p| upper.starts_with(p)) || upper == "NODE_EXTRA_CA_CERTS";
         if ENV_NAMES.contains(&upper.as_str()) || upper.starts_with("OPENCODE_BROWSER_") || upper.starts_with("LC_") || npm {

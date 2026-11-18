@@ -60,6 +60,8 @@ impl Drop for CancelOnDrop {
 pub struct Host {
     pub ctx: ToolContext,
     pub tools: Arc<HashMap<String, Arc<dyn Tool>>>,
+    /// The execute's `browser`: where the tabs it opens go, unless a call names its own.
+    pub browser: Option<String>,
 }
 
 impl Host {
@@ -94,8 +96,9 @@ impl Host {
                         }
                         let ctx = self.ctx.clone();
                         let tools = self.tools.clone();
+                        let browser = self.browser.clone();
                         let user = is_handoff(&op, &payload);
-                        inflight.push(Box::pin(async move { (id, run_async(ctx, tools, &op, payload).await, user) }));
+                        inflight.push(Box::pin(async move { (id, run_async(ctx, tools, browser.as_deref(), &op, payload).await, user) }));
                     }
                     Some(ToHost::Sync { op, payload, reply }) => {
                         let result = self.run_sync(&op, payload, &mut outcome).await;
@@ -229,7 +232,7 @@ impl Host {
 
     async fn run_sync(&self, op: &str, payload: Value, outcome: &mut Outcome) -> Result<Value, String> {
         match op {
-            "tool" => run_async(self.ctx.clone(), self.tools.clone(), op, payload).await.map(|value| self.absorb(value, outcome)),
+            "tool" => run_async(self.ctx.clone(), self.tools.clone(), self.browser.as_deref(), op, payload).await.map(|value| self.absorb(value, outcome)),
             "url" => {
                 let tab = tab_argument(&self.ctx, &payload).map_err(|e| format!("{e:#}"))?;
                 let page = async { browse_page::state::tab(&self.ctx, tab).await?.page(&self.ctx).await }.await.map_err(|e| format!("{e:#}"))?;
@@ -263,7 +266,16 @@ pub(crate) fn tab_argument(ctx: &ToolContext, payload: &Value) -> anyhow::Result
     }
 }
 
-async fn run_async(ctx: ToolContext, tools: Arc<HashMap<String, Arc<dyn Tool>>>, op: &str, payload: Value) -> Result<Value, String> {
+/// Whether a tool call opens a tab, so the execute's `browser` applies: navigate without a tab, or tabs new.
+fn opens_tab(name: &str, args: &serde_json::Map<String, Value>) -> bool {
+    match name {
+        "navigate" => !args.contains_key("tab"),
+        "tabs" => args.get("action").and_then(Value::as_str) == Some("new"),
+        _ => false,
+    }
+}
+
+async fn run_async(ctx: ToolContext, tools: Arc<HashMap<String, Arc<dyn Tool>>>, browser: Option<&str>, op: &str, payload: Value) -> Result<Value, String> {
     match op {
         "tool" => {
             let name = payload["name"].as_str().unwrap_or_default();
@@ -280,6 +292,12 @@ async fn run_async(ctx: ToolContext, tools: Arc<HashMap<String, Arc<dyn Tool>>>,
                         let tab = ctx.browser.resolve_tab(value).map_err(|e| format!("{e:#}"))?;
                         *value = json!(tab);
                     }
+                }
+                if let Some(browser) = browser
+                    && !map.contains_key("browser")
+                    && opens_tab(name, map)
+                {
+                    map.insert("browser".into(), json!(browser));
                 }
             }
             let output = tool.call(ctx, args).await.map_err(|e| format!("{e:#}"))?;

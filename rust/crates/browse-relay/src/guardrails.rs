@@ -255,6 +255,27 @@ pub fn scope_result(method: &str, mut result: Value, page_urls: &dyn Fn() -> Vec
     result
 }
 
+/// Chrome resolves the Storage cookie commands through the browser's default context, which is the last-focused
+/// profile, even when they're sent to a tab. With several profiles of one Chrome paired to the relay, that reads or
+/// writes another profile's cookies. The Network equivalents use the tab's own profile, so a Storage cookie command
+/// without an explicit `browserContextId` is sent as its Network twin (one with a context is left for Chrome to
+/// reject on a tab). The host checks above cover both spellings.
+pub fn tab_scoped_cookie_command(method: &str, params: &Value) -> Option<(&'static str, Value)> {
+    let twin = match method {
+        "Storage.getCookies" => "Network.getAllCookies",
+        "Storage.setCookies" => "Network.setCookies",
+        _ => return None,
+    };
+    if params.get("browserContextId").is_some_and(|v| !v.is_null()) {
+        return None;
+    }
+    let mut params = params.clone();
+    if let Some(object) = params.as_object_mut() {
+        object.remove("browserContextId");
+    }
+    Some((twin, params))
+}
+
 /// Browser-internal or other-extension documents chrome.debugger refuses to expose.
 pub fn is_restricted_url(url: &str) -> bool {
     ["chrome://", "chrome-extension://", "chrome-untrusted://", "devtools://", "edge://", "brave://"].iter().any(|p| url.starts_with(p))
@@ -285,6 +306,22 @@ mod tests {
         assert!(guard("DOMStorage.getDOMStorageItems", &json!({"storageId": {"securityOrigin": "https://app.example.com"}}), false, &urls).is_none());
         assert!(guard("DOMStorage.getDOMStorageItems", &json!({"storageId": {"securityOrigin": "https://bank.com"}}), false, &urls).is_some());
         let scoped = scope_result("Network.getCookies", json!({"cookies": [{"domain": "example.com"}, {"domain": "bank.com"}]}), &urls);
+        assert_eq!(scoped["cookies"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn storage_cookie_commands_use_the_tabs_profile() {
+        let (method, params) = tab_scoped_cookie_command("Storage.getCookies", &json!({})).unwrap();
+        assert_eq!((method, params), ("Network.getAllCookies", json!({})));
+        let cookies = json!({ "cookies": [{ "name": "a", "value": "b", "domain": "example.com" }], "browserContextId": null });
+        let (method, params) = tab_scoped_cookie_command("Storage.setCookies", &cookies).unwrap();
+        assert_eq!(method, "Network.setCookies");
+        assert_eq!(params, json!({ "cookies": [{ "name": "a", "value": "b", "domain": "example.com" }] }));
+        assert!(tab_scoped_cookie_command("Storage.getCookies", &json!({ "browserContextId": "ctx" })).is_none());
+        assert!(tab_scoped_cookie_command("Network.getCookies", &json!({})).is_none());
+        // The rewritten read is still scoped to the tab's hosts.
+        let urls = || vec!["https://app.example.com/x".to_string()];
+        let scoped = scope_result("Network.getAllCookies", json!({"cookies": [{"domain": ".example.com"}, {"domain": "bank.com"}]}), &urls);
         assert_eq!(scoped["cookies"].as_array().unwrap().len(), 1);
     }
 }
