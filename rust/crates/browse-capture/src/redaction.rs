@@ -79,6 +79,8 @@ pub struct SecretRedactor {
     named_fields: HashSet<String>,
     // Passwords and one-time codes are replaced at any length, unlike short reusable captures.
     always: HashSet<String>,
+    // Credentials a header names outright (Authorization, X-API-Key, X-OTP, ...): replaced as scalars at any length.
+    named_headers: HashSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -199,14 +201,16 @@ impl SecretRedactor {
     }
 
     /// Redacts scalars that equal a known value: numbers and booleans of at least MINIMUM_KNOWN_NUMBER_LENGTH
-    /// characters, or any length when they were a password or one-time code.
+    /// characters, or any length when they were a password, a one-time code or a credential header's value.
     pub fn redact_scalar(&self, value: &Value) -> Value {
         let text = match value {
             Value::Number(number) => number.to_string(),
             Value::Bool(flag) => flag.to_string(),
             _ => return value.clone(),
         };
-        let known = self.always.contains(&text) || (text.chars().count() >= MINIMUM_KNOWN_NUMBER_LENGTH && self.known.contains(&text));
+        let known = self.always.contains(&text)
+            || self.named_headers.contains(&text)
+            || (text.chars().count() >= MINIMUM_KNOWN_NUMBER_LENGTH && self.known.contains(&text));
         if known { Value::String(REDACTED.into()) } else { value.clone() }
     }
 
@@ -227,6 +231,15 @@ impl SecretRedactor {
             self.always.insert(value.to_string());
         }
         SENTINEL.to_string()
+    }
+
+    /// A credential header's value: scrubbed under the header's name, so a password or one-time-code header keeps that
+    /// class, and remembered as a credential named outright.
+    fn scrub_header(&mut self, value: &str, header: &str) -> String {
+        if !value.is_empty() {
+            self.named_headers.insert(value.to_string());
+        }
+        self.scrub(value, header)
     }
 
     /// A secret-named URL query or fragment field value, remembered for the body-string pass too.
@@ -328,11 +341,11 @@ impl SecretRedactor {
                 let scheme = &value[..index];
                 let credential = value[index..].trim_start();
                 if !credential.is_empty() {
-                    return format!("{scheme} {}", self.scrub(credential, ""));
+                    return format!("{scheme} {}", self.scrub_header(credential, &lower));
                 }
             }
         if SECRET_HEADERS.contains(&lower.as_str()) || is_secret_name(&lower) {
-            return self.scrub(value, "");
+            return self.scrub_header(value, &lower);
         }
         value.to_string()
     }
@@ -687,6 +700,19 @@ mod tests {
         // A one-time code is redacted at any length.
         redactor.protect_body(r#"{"otp":"4821"}"#, Some("application/json"));
         assert_eq!(redactor.redact_scalar(&serde_json::json!(4821)), serde_json::json!(REDACTED));
+    }
+
+    #[test]
+    fn short_credential_headers_are_redacted_where_they_reappear_as_numbers() {
+        let mut redactor = SecretRedactor::new();
+        let protected = redactor.protect_headers(&[header("X-OTP", "1234"), header("Authorization", "Bearer 4242")]);
+        assert_eq!(protected[0].value, REDACTED);
+        // The one-time code comes back under an ordinary key: `{"value":1234}`.
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(1234)), serde_json::json!(REDACTED));
+        // A credential the Authorization header named outright is exempt from the floor too.
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(4242)), serde_json::json!(REDACTED));
+        // Ordinary small numbers stay data.
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(12)), serde_json::json!(12));
     }
 
     #[test]

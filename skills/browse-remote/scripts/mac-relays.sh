@@ -238,13 +238,19 @@ export OPENCODE_BROWSER_HOME="\$HOME/.opencode-browser-mac"
 export OPENCODE_BROWSER_PORT=$port
 # Updates come from \`mac-relays.sh sync\`, not this copy (a fork build never updates itself either).
 export OPENCODE_BROWSER_UPDATE_CHECK=0
+# This CLI's process id means nothing to the Mac's relay, so the CLI doesn't send it (the relay would cancel its calls).
+export OPENCODE_BROWSER_TUNNEL=1
 # The CLI sends the relay token on every call, so it runs only while 127.0.0.1:$port is this script's own tunnel.
-# A long-lived server would keep sending it after the tunnel closed, so mcp and serve don't run here.
-# The CLI accepts flags before the command, so any argument before \`--\` that names one refuses the call.
+# A long-lived server would keep sending it after the tunnel closed, so mcp and serve don't run here. The command is
+# the first word that isn't a global flag or its value (\`browse --profile work find mcp\` is find).
+skip=
 for arg in "\$@"; do
+  if [ -n "\$skip" ]; then skip=; continue; fi
   case \$arg in
-    --) break ;;
+    --profile|--tab|--json|--output) skip=1 ;;
+    -*) ;;
     mcp|serve) echo "browse: \$arg doesn't run over the Mac tunnel; use the CLI (skill browse-remote)" >&2; exit 1 ;;
+    *) break ;;
   esac
 done
 BROWSE_PORT=$port $(shq "$skill/scripts/mac-relays.sh") check || exit 1

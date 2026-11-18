@@ -231,6 +231,8 @@ fn service() -> String {
 
 /// GETs `url` with this install's User-Agent, failing on an error status, a body over `limit` bytes or `timeout`.
 fn get(kind: Kind, url: &str, timeout: Duration, limit: u64) -> anyhow::Result<Vec<u8>> {
+    #[cfg(test)]
+    tests::REQUESTS.fetch_add(1, Ordering::SeqCst);
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(timeout)).user_agent(kind.user_agent()).build().into();
     let mut response = agent.get(url).call().with_context(|| format!("couldn't get {url}"))?;
     Ok(response.body_mut().with_config().limit(limit).read_to_vec()?)
@@ -538,6 +540,14 @@ fn switch_hint(exe: &Path) -> String {
     format!("run `{} install` for the self-updating binary, or install it globally with one of {globals}", exe.display())
 }
 
+/// What `browse update` says on a fork build (a version with `-omp.`), which never asks upstream's release service:
+/// its releases would replace the fork's features.
+fn fork_notice(version: &str) -> Option<String> {
+    version.contains("-omp.").then(|| {
+        format!("browse {version} is a build of the omp fork; it doesn't update from upstream's releases. Rebuild it from the fork's checkout (branch omp-rust) instead.")
+    })
+}
+
 /// `browse update [--check]`.
 pub fn command(args: &[String]) -> anyhow::Result<()> {
     let check_only = args.iter().any(|a| a == "--check");
@@ -549,6 +559,10 @@ pub fn command(args: &[String]) -> anyhow::Result<()> {
         if let Some(fixed) = override_mode().filter(|m| *m != mode) {
             println!("! OPENCODE_BROWSER_AUTO_UPDATE keeps it {} in this environment.", fixed.name());
         }
+        return Ok(());
+    }
+    if let Some(notice) = fork_notice(VERSION) {
+        println!("{notice}");
         return Ok(());
     }
     let install = install();
@@ -936,6 +950,21 @@ fn record_failure(version: &str, error: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::{Global, Install, Kind, Manager, Runner, dist_tag, package_wanted};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Release-service requests this test process made (`get` counts them).
+    pub(super) static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn a_fork_build_never_asks_the_release_service() {
+        assert!(super::fork_notice("0.1.5-omp.1").is_some());
+        assert!(super::fork_notice("0.1.5").is_none());
+        assert!(crate::VERSION.contains("-omp."), "this crate is the fork's build");
+        let before = REQUESTS.load(Ordering::SeqCst);
+        super::command(&["--check".to_owned()]).unwrap();
+        super::command(&[]).unwrap();
+        assert_eq!(REQUESTS.load(Ordering::SeqCst), before, "update and update --check made no request");
+    }
 
     #[test]
     fn checks_name_the_install_kind_in_the_user_agent() {

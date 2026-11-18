@@ -39,12 +39,32 @@ fn recorded() -> Option<Paths> {
     Some(Paths { launcher: value["launcher"].as_str()?.into(), skill: value["skill"].as_str()?.into() })
 }
 
-/// Where install writes: `--bin-dir`/`--skills-dir`, else the environment, else the defaults.
+/// omp's mcp.json: the one an earlier install recorded, else where omp keeps it (agents.rs).
+pub fn mcp_location() -> crate::agents::Location {
+    let recorded = std::fs::read(manifest_file()).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v["mcpConfig"].as_str().map(PathBuf::from));
+    let default = crate::agents::locations(&crate::setup::opencode_config(), None).into_iter().find(|l| l.name == "omp").map(|l| l.file);
+    let file = recorded.or(default).unwrap_or_else(|| crate::setup::home().join(".omp").join("agent").join("mcp.json"));
+    crate::agents::Location { name: "omp", file, installed: true }
+}
+
+/// Where install writes: `--bin-dir`/`--skills-dir`, else the environment, else where an earlier install wrote, else
+/// the defaults.
 pub fn paths(bin_dir: Option<&Path>, skills_dir: Option<&Path>) -> Paths {
     let env = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let bin = bin_dir.map(Path::to_path_buf).or_else(|| env("OPENCODE_BROWSER_BIN_DIR")).unwrap_or_else(relay_api::bin_root);
-    let skills = skills_dir.map(Path::to_path_buf).or_else(|| env("OPENCODE_BROWSER_SKILLS_DIR")).unwrap_or_else(|| crate::setup::home().join(".agents").join("skills"));
-    Paths { launcher: bin.join("browse"), skill: skills.join("browse").join("SKILL.md") }
+    let bin = bin_dir.map(Path::to_path_buf).or_else(|| env("OPENCODE_BROWSER_BIN_DIR"));
+    let skills = skills_dir.map(Path::to_path_buf).or_else(|| env("OPENCODE_BROWSER_SKILLS_DIR"));
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let defaults = Paths { launcher: relay_api::bin_root().join("browse"), skill: crate::setup::home().join(".agents").join("skills").join("browse").join("SKILL.md") };
+    resolve(bin, skills, recorded(), &cwd, defaults)
+}
+
+/// Each file at its override's folder (made absolute, so status and uninstall find it from anywhere), else where an
+/// earlier install recorded it, else at its default.
+fn resolve(bin: Option<PathBuf>, skills: Option<PathBuf>, recorded: Option<Paths>, cwd: &Path, defaults: Paths) -> Paths {
+    let absolute = |dir: PathBuf| if dir.is_absolute() { dir } else { cwd.join(dir) };
+    let launcher = bin.map(|dir| absolute(dir).join("browse")).or_else(|| recorded.as_ref().map(|r| r.launcher.clone())).unwrap_or(defaults.launcher);
+    let skill = skills.map(|dir| absolute(dir).join("browse").join("SKILL.md")).or_else(|| recorded.map(|r| r.skill)).unwrap_or(defaults.skill);
+    Paths { launcher, skill }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -115,8 +135,9 @@ fn write_owned(file: &Path, text: &str, executable: bool) -> anyhow::Result<&'st
 }
 
 /// Installs the launcher (unless `executable` is already at its path) and the skill. Refuses, having written
-/// nothing, when either file exists and isn't this install's. Returns the lines to print.
-pub fn install(paths: &Paths, executable: &Path, browsers: &[(String, String)], manifest_file: &Path) -> anyhow::Result<Vec<String>> {
+/// nothing, when either file exists and isn't this install's. Records `mcp_config` when install keeps an MCP entry
+/// there. Returns the lines to print.
+pub fn install(paths: &Paths, executable: &Path, browsers: &[(String, String)], manifest_file: &Path, mcp_config: Option<&Path>) -> anyhow::Result<Vec<String>> {
     let same = |a: &Path, b: &Path| std::fs::canonicalize(a).ok().is_some_and(|a| std::fs::canonicalize(b).ok() == Some(a));
     let launcher = !same(&paths.launcher, executable);
     let mut refused: Vec<&Path> = Vec::new();
@@ -144,7 +165,10 @@ pub fn install(paths: &Paths, executable: &Path, browsers: &[(String, String)], 
     let browsers: Vec<(String, String)> = browsers.iter().map(|(id, name)| (id.clone(), kept.iter().find(|(k, _)| k == id).map_or_else(|| name.clone(), |(_, n)| n.clone()))).collect();
     let done = write_owned(&paths.skill, &skill(&browsers), false)?;
     lines.push(format!("✓ omp skill {done}: {}", tilde(&paths.skill)));
-    let manifest = json!({ "launcher": paths.launcher, "skill": paths.skill, "launcherWritten": launcher });
+    let mut manifest = json!({ "launcher": paths.launcher, "skill": paths.skill, "launcherWritten": launcher });
+    if let Some(file) = mcp_config {
+        manifest["mcpConfig"] = json!(file);
+    }
     crate::update::write_private(manifest_file, format!("{manifest:#}\n").as_bytes())?;
     Ok(lines)
 }
@@ -170,6 +194,7 @@ fn table_names(file: &Path) -> Vec<(String, String)> {
 /// Removes what install recorded writing (else what it would write at the defaults), each only with its marker.
 pub fn uninstall() -> Vec<String> {
     let paths = recorded().unwrap_or_else(|| paths(None, None));
+    let mcp = mcp_location();
     let mut lines = Vec::new();
     for file in [&paths.launcher, &paths.skill] {
         match owner(file) {
@@ -180,6 +205,12 @@ pub fn uninstall() -> Vec<String> {
             Owner::Foreign => lines.push(format!("! {} wasn't written by browse; left it alone", tilde(file))),
             Owner::Missing => {}
         }
+    }
+    // The MCP entry an omp install wrote (its marker says so; any other server named browse stays).
+    match crate::agents::edit(&mcp, &["browse".to_owned(), "mcp".to_owned()], true) {
+        Ok(crate::agents::Edit::Removed) => lines.push(format!("✓ Removed browse from omp's {}", tilde(&mcp.file))),
+        Ok(_) => {}
+        Err(error) => lines.push(format!("! Couldn't remove browse from {}: {error:#}", tilde(&mcp.file))),
     }
     if let Some(dir) = paths.skill.parent() {
         let _ = std::fs::remove_dir(dir);
@@ -227,17 +258,17 @@ mod tests {
         std::fs::create_dir_all(paths.launcher.parent().unwrap()).unwrap();
         std::fs::write(&paths.launcher, format!("#!/bin/sh\n# {LEGACY_MARKER}\nexec node cli.mjs \"$@\"\n")).unwrap();
         let manifest = dir.join("omp.json");
-        let lines = install(&paths, &exe, &[], &manifest).unwrap();
+        let lines = install(&paths, &exe, &[], &manifest, None).unwrap();
         assert!(lines[0].contains("updated") && lines[1].contains("added"), "{lines:?}");
         assert_eq!(std::fs::read_to_string(&paths.launcher).unwrap(), launcher_script(&exe));
         assert_eq!(owner(&paths.skill), Owner::Ours);
-        assert!(install(&paths, &exe, &[], &manifest).unwrap().iter().all(|l| l.contains("unchanged")));
+        assert!(install(&paths, &exe, &[], &manifest, None).unwrap().iter().all(|l| l.contains("unchanged")));
         std::fs::write(&paths.skill, "someone's skill").unwrap();
-        let error = install(&paths, &exe, &[], &manifest).unwrap_err().to_string();
+        let error = install(&paths, &exe, &[], &manifest, None).unwrap_err().to_string();
         assert!(error.contains("won't overwrite") && error.contains("SKILL.md"), "{error}");
         // A build that is the launcher's own file gets no launcher.
         std::fs::remove_file(&paths.skill).unwrap();
-        let lines = install(&paths, &paths.launcher, &[], &manifest).unwrap();
+        let lines = install(&paths, &paths.launcher, &[], &manifest, None).unwrap();
         assert_eq!(lines.len(), 1, "{lines:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -252,7 +283,7 @@ mod tests {
         );
         std::fs::write(&paths.skill, installed).unwrap();
         let browsers = [("safzan".to_owned(), "safzan".to_owned()), ("work".to_owned(), "Work".to_owned()), ("an".to_owned(), "an".to_owned())];
-        install(&paths, &paths.launcher, &browsers, &dir.join("omp.json")).unwrap();
+        install(&paths, &paths.launcher, &browsers, &dir.join("omp.json"), None).unwrap();
         let text = std::fs::read_to_string(&paths.skill).unwrap();
         assert!(text.contains("| safzan | safzan (Helium, his main personal browser since 2026-11-13) |"), "{text}");
         assert!(text.contains("| work | work |") && text.contains("| an | an |"), "{text}");
@@ -263,5 +294,35 @@ mod tests {
     #[test]
     fn the_launcher_quotes_its_target() {
         assert_eq!(launcher_script(Path::new("/a b/it's/browse")).lines().last(), Some("exec '/a b/it'\\''s/browse' \"$@\""));
+    }
+
+    #[test]
+    fn overrides_are_recorded_absolute_and_a_reinstall_reuses_what_was_recorded() {
+        let defaults = || Paths { launcher: "/home/u/.local/bin/browse".into(), skill: "/home/u/.agents/skills/browse/SKILL.md".into() };
+        let cwd = Path::new("/work");
+        let paths = resolve(Some("bin".into()), Some("/s".into()), None, cwd, defaults());
+        assert_eq!(paths, Paths { launcher: "/work/bin/browse".into(), skill: "/s/browse/SKILL.md".into() });
+        // No override: the files an earlier install recorded, not the defaults.
+        let again = resolve(None, None, Some(paths.clone()), Path::new("/elsewhere"), defaults());
+        assert_eq!(again, paths);
+        assert_eq!(resolve(None, None, None, cwd, defaults()), defaults());
+    }
+
+    #[test]
+    fn omp_mcp_entries_are_ours_only_with_the_marker() {
+        use crate::agents::{Edit, decide, definition};
+        let expected = definition("omp", "/home/u/.local/bin/browse", &["mcp".to_owned()]);
+        // Someone's own `node .../cli.mjs mcp` named browse is not this install's.
+        let theirs = serde_json::json!({ "command": "node", "args": ["/x/cli.mjs", "mcp"] });
+        assert_eq!(decide(Some(&theirs), &expected, false).0, Edit::Conflict);
+        assert_eq!(decide(Some(&theirs), &expected, true).0, Edit::Conflict);
+        // The TypeScript fork's entry (its runtime fingerprint) is refreshed in place, keeping the user's env.
+        let legacy = serde_json::json!({ "command": "/n/node", "args": ["/b/cli/dist/cli.mjs", "mcp"], "env": { "OPENCODE_BROWSER_RUNTIME": "fp", "X": "1" } });
+        let (edit, change) = decide(Some(&legacy), &expected, false);
+        assert_eq!(edit, Edit::Updated);
+        let server = change.unwrap().unwrap();
+        assert_eq!(server["command"], "/home/u/.local/bin/browse");
+        assert_eq!(server["env"], serde_json::json!({ "OPENCODE_BROWSER_RUNTIME": "browse-rust", "X": "1" }));
+        assert_eq!(decide(Some(&legacy), &expected, true).0, Edit::Removed);
     }
 }

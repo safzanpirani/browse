@@ -253,6 +253,11 @@ fn parse(spec: &ToolSpec, args: &[String]) -> anyhow::Result<ParseResult> {
     while i < args.len() {
         let arg = &args[i];
         i += 1;
+        // `--` ends the options: every word after it is a value (`browse type -- --profile=work`).
+        if arg == "--" {
+            positional.extend(args[i..].iter().cloned());
+            break;
+        }
         let Some(flag) = arg.strip_prefix("--").filter(|f| !f.is_empty()) else {
             positional.push(arg.clone());
             continue;
@@ -505,6 +510,17 @@ mod tests {
         let tabs = spec(json!({ "properties": { "action": { "enum": ["list", "new", "close"] }, "url": {} }, "required": [] }));
         assert_eq!(slot(&tabs, &Map::new(), "close").as_deref(), Some("action"));
         assert!(looks_like_ref("f1a5") && looks_like_ref("e3") && !looks_like_ref("example") && !looks_like_ref("e"));
+    }
+
+    #[test]
+    fn a_double_dash_ends_the_options() {
+        let typing = named("type", json!({ "properties": { "text": { "type": "string" }, "tab": { "type": ["integer", "string"] } }, "required": ["text"] }));
+        let parsed = parse_arguments(&typing, &["--tab", "3", "--", "--profile=work"]).unwrap();
+        assert_eq!(parsed.get("text"), Some(&json!("--profile=work")));
+        assert_eq!(parsed.get("tab"), Some(&json!(3)));
+        // main.rs leaves everything after `--` to the tool, so the browser selection doesn't see it.
+        let (rest, profile) = crate::profile::take(&["type".to_owned(), "--".to_owned(), "--profile=work".to_owned()]).unwrap();
+        assert_eq!((rest.len(), profile), (3, None));
     }
 
     #[test]

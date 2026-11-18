@@ -337,16 +337,28 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
         println!("{} is running this, so browse is set up for {}.", agents::label(caller), agents::label(caller));
     }
     let entry = place(&flags)?;
+    let command = vec![entry.to_string_lossy().into_owned(), "mcp".to_owned()];
     if flags.omp {
         let browsers: Vec<(String, String)> = browse_relay::pairing::read_browser_pairings(&relay_api::paths())
             .into_values()
             .filter_map(|pairing| Some((pairing.id?, pairing.name.unwrap_or_default())))
             .collect();
-        for line in crate::omp::install(&crate::omp::paths(flags.bin_dir.as_deref(), flags.skills_dir.as_deref()), &entry, &browsers, &crate::omp::manifest_file())? {
+        // omp's MCP entry: written by the agent step below with --mcp; without it, an entry an earlier omp install
+        // wrote (the TypeScript fork's included) is pointed at this build, so it never runs a runtime that's gone.
+        let mcp = crate::omp::mcp_location();
+        let kept = !flags.mcp && agents::has_marked_entry(&mcp.file);
+        let recorded = if flags.mcp { agents::locations(&setup::opencode_config(), None).into_iter().find(|l| l.name == "omp").map(|l| l.file) } else { kept.then(|| mcp.file.clone()) };
+        for line in crate::omp::install(&crate::omp::paths(flags.bin_dir.as_deref(), flags.skills_dir.as_deref()), &entry, &browsers, &crate::omp::manifest_file(), recorded.as_deref())? {
             println!("{line}");
         }
+        if kept {
+            match agents::edit(&mcp, &command, false) {
+                Ok(Edit::Updated) => println!("✓ Updated browse in omp ({})", tilde(&mcp.file)),
+                Ok(_) => {}
+                Err(error) => println!("! Couldn't update browse in {}: {error:#}", tilde(&mcp.file)),
+            }
+        }
     }
-    let command = vec![entry.to_string_lossy().into_owned(), "mcp".to_owned()];
     restart_outdated_relay();
 
     let opencode = flags.opencode.clone().or_else(|| std::env::var_os("OPENCODE_BIN").map(PathBuf::from)).or_else(|| browsers::on_path("opencode"));

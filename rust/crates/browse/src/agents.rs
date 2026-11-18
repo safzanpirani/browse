@@ -259,8 +259,25 @@ pub fn definition(name: &str, command: &str, args: &[String]) -> Value {
         "vibe" => json!({ "name": "browse", "transport": "stdio", "command": command, "args": args }),
         "dsh" => json!({ "serverName": "browse", "transport": "stdio", "command": command, "args": args }),
         "claude" | "vscode" | "cortex" | "droid" | "codebuddy" => json!({ "type": "stdio", "command": command, "args": args }),
+        // omp's entry carries the marker the TypeScript fork's `install --client omp` used, so install and uninstall
+        // touch only an entry an omp install wrote (owned_by_marker).
+        "omp" => json!({ "command": command, "args": args, "env": { "OPENCODE_BROWSER_RUNTIME": "browse-rust" } }),
         _ => json!({ "command": command, "args": args }),
     }
+}
+
+/// The env key that marks an MCP entry `install --client omp` wrote (the TypeScript fork's runtime fingerprint, kept).
+pub const OMP_MARKER: &str = "OPENCODE_BROWSER_RUNTIME";
+
+/// Whether an entry carries the omp install's marker.
+fn owned_by_marker(server: &Value) -> bool {
+    server.get("env").and_then(|env| env.get(OMP_MARKER)).is_some_and(Value::is_string)
+}
+
+/// Whether omp's mcp.json at `file` has a browse server an omp install wrote.
+pub fn has_marked_entry(file: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(file) else { return false };
+    crate::jsonc::parse(&text).ok().is_some_and(|config| config.get("mcpServers").and_then(|servers| servers.get("browse")).is_some_and(owned_by_marker))
 }
 
 /// The command line an MCP server entry runs: `command` as an array, or `command`/`cmd` plus `args`.
@@ -340,6 +357,13 @@ fn kind(name: &str) -> &'static str {
 fn merged(current: Option<&Value>, expected: &Value) -> Value {
     let mut server = current.filter(|c| c.is_object()).cloned().unwrap_or_else(|| json!({}));
     for (key, value) in expected.as_object().into_iter().flatten() {
+        // Variables the user added to the entry's env stay beside the marker.
+        if key == "env"
+            && let (Some(mine), Some(theirs)) = (value.as_object(), server.get_mut("env").and_then(Value::as_object_mut))
+        {
+            theirs.extend(mine.clone());
+            continue;
+        }
         server[key] = value.clone();
     }
     // An entry that ran `[command, args...]` in one array and now takes `command` plus `args`, or the other way round.
@@ -353,9 +377,11 @@ fn merged(current: Option<&Value>, expected: &Value) -> Value {
 
 /// What an add or remove does to an entry that's there, and the new entry (None to remove it, or to leave it).
 pub(crate) fn decide(current: Option<&Value>, expected: &Value, remove: bool) -> (Edit, Option<Option<Value>>) {
+    // An entry browse marks (omp's) is browse's only with the marker; any other `... cli.mjs mcp` named browse is not.
+    let ours = |c: &Value| if owned_by_marker(expected) { owned_by_marker(c) } else { owned(c) };
     match (current, remove) {
         (None, true) => (Edit::Unchanged, None),
-        (Some(c), _) if !owned(c) => (Edit::Conflict, None),
+        (Some(c), _) if !ours(c) => (Edit::Conflict, None),
         (Some(_), true) => (Edit::Removed, Some(None)),
         (None, false) => (Edit::Added, Some(Some(expected.clone()))),
         (Some(c), false) => {

@@ -630,7 +630,17 @@
     },
     browser() { return browserObject },
     async close() { warn("context.close() does nothing: the browser is the user's. Close tabs you opened with page.close()") },
-    cookies() { unsupported("context.cookies()", "cookies stay in the user's browser; read what the page can see with page.evaluate(() => document.cookie)") },
+    /** The cookies of `page`'s tab (its profile), for `urls` or the page's own; the relay keeps only those of the hosts its pages show. */
+    async cookies(urls) {
+      const list = urls === undefined ? [] : (Array.isArray(urls) ? urls : [urls]).map(String)
+      const cookies = await hostAsync("cookies", defaultPage._args({ urls: list }))
+      return (cookies || []).map((c) => ({
+        name: c.name, value: c.value, domain: c.domain, path: c.path,
+        expires: c.session || c.expires === undefined ? -1 : c.expires,
+        httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite: c.sameSite || "Lax",
+        ...(c.partitionKey ? { partitionKey: typeof c.partitionKey === "string" ? c.partitionKey : c.partitionKey.topLevelSite } : {}),
+      }))
+    },
     addCookies() { unsupported("context.addCookies()", "cookies stay in the user's browser") },
     clearCookies() { unsupported("context.clearCookies()", "cookies stay in the user's browser") },
     storageState() { unsupported("context.storageState()", "cookies and storage stay in the user's browser") },

@@ -277,6 +277,10 @@ async fn pairs_with_a_token_and_routes_cdp_per_tab_and_child_session() {
 
     events.send(json!({ "method": "debugger.event", "params": { "tabId": 7, "method": "Page.frameNavigated", "params": { "frame": { "id": "T7", "url": "https://example.com/" } } } })).unwrap();
     eventually("the url to update", || relay.st().tabs.get(&7).is_some_and(|t| t.url == "https://example.com/")).await;
+    // On example.com, the tab's cookie read (context.cookies() sends this) keeps example.com's and passes the urls on.
+    let scoped = cdp.send("Network.getCookies", json!({ "urls": ["https://example.com/a"] }), None).await.unwrap();
+    assert_eq!(scoped["cookies"], json!([{ "domain": "example.com" }]), "bank.com's cookie is dropped");
+    assert_eq!(seen.cdp("Network.getCookies").last().unwrap()["params"]["params"]["urls"], json!(["https://example.com/a"]));
 
     let gone = cdp.send("Broken.method", json!({}), None).await.unwrap_err();
     assert!(matches!(gone, CdpError::TargetClosed));
@@ -1469,6 +1473,12 @@ async fn a_chosen_id_is_get_or_create_and_listed_with_the_callers_id() {
     assert_eq!(again["existed"], true);
     assert_eq!(seen.commands("tabs.create").len(), 1, "no second tab for one id");
     assert!(seen.cdp("Page.navigate").is_empty(), "an existing tab is returned without navigating it");
+    // Named with its own browser it is the same tab; named with another browser it is refused, not reused.
+    let same = tool(&relay, "tabs", json!({ "action": "new", "id": "work-mail", "browser": "test-chrome" })).await;
+    assert!(!same.is_error, "{}", tool_text(&same));
+    let other = tool(&relay, "tabs", json!({ "action": "new", "id": "work-mail", "browser": "patty", "keepOpen": true })).await;
+    assert!(other.is_error && tool_text(&other).contains("is in browser test-chrome"), "{}", tool_text(&other));
+    assert_eq!(seen.commands("tabs.create").len(), 1, "a refused id opens nothing");
 
     let listed = text(&serde_json::to_value(tool(&relay, "tabs", json!({})).await).unwrap());
     let entry = &listed["tabs"][0];
@@ -1712,10 +1722,12 @@ async fn chosen_ids_are_unique_across_two_browsers_and_new_takes_the_browser_opt
 
     let named = text(&serde_json::to_value(tool(&relay, "tabs", json!({ "action": "new", "id": "work-mail", "browser": "test-chrome" })).await).unwrap())["tab"].as_i64().unwrap();
     assert_eq!(first_seen.commands("tabs.create").len(), 1);
-    let same = text(&serde_json::to_value(tool(&relay, "tabs", json!({ "action": "new", "id": "work-mail", "browser": "test-chrome-2", "url": "https://example.com/" })).await).unwrap());
-    assert_eq!(same["tab"], named, "one id is one tab, whichever browser is named");
-    assert_eq!(same["existed"], true);
+    // One id is one tab: named with another browser (`--profile` on the CLI), it is refused rather than reused.
+    let refused = tool(&relay, "tabs", json!({ "action": "new", "id": "work-mail", "browser": "test-chrome-2", "url": "https://example.com/" })).await;
+    assert!(refused.is_error && tool_text(&refused).contains("is in browser test-chrome"), "{}", tool_text(&refused));
     assert_eq!(second_seen.commands("tabs.create").len(), 0);
+    let same = text(&serde_json::to_value(tool(&relay, "tabs", json!({ "action": "new", "id": "work-mail" })).await).unwrap());
+    assert_eq!((same["tab"].as_i64(), same["existed"].as_bool()), (Some(named), Some(true)), "without a browser the id finds its tab");
     let other = text(&serde_json::to_value(tool(&relay, "tabs", json!({ "action": "new", "id": "second-id", "browser": "test-chrome-2" })).await).unwrap());
     assert_ne!(other["tab"], named);
     assert_eq!(second_seen.commands("tabs.create").len(), 1);

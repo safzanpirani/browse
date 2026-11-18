@@ -205,13 +205,35 @@ fn detach_flags(command: &mut Command, breakaway: bool) {
     command.creation_flags(flags);
 }
 
+/// Set by the browse-remote launcher on ampere: this CLI reaches the Mac's relay through an ssh tunnel.
+pub const TUNNEL_VARIABLE: &str = "OPENCODE_BROWSER_TUNNEL";
+
+/// The OpenCode-Browser-Client-Pid value: this process, so the relay stops the calls of a process that is gone. Through
+/// the tunnel the pid is another computer's, which the relay would find dead and cancel its calls, so none is sent.
+fn client_pid(tunnel: bool) -> Option<String> {
+    (!tunnel).then(|| std::process::id().to_string())
+}
+
 fn send(method: &str, path: &str, extra: &[(&str, &str)], body: Option<&[u8]>, timeout: Option<Duration>) -> Result<http::Response, http::Error> {
     let auth = format!("Bearer {}", relay_api::token().unwrap_or_default());
-    // The relay stops the calls of a process that is gone.
-    let pid = std::process::id().to_string();
-    let mut headers = vec![("Authorization", auth.as_str()), ("OpenCode-Browser-Client-Pid", pid.as_str())];
+    let pid = client_pid(std::env::var(TUNNEL_VARIABLE).is_ok_and(|v| v == "1"));
+    let mut headers = vec![("Authorization", auth.as_str())];
+    if let Some(pid) = &pid {
+        headers.push(("OpenCode-Browser-Client-Pid", pid.as_str()));
+    }
     headers.extend_from_slice(extra);
     http::request(&relay_api::endpoint(), method, path, &headers, body, timeout)
+}
+
+/// A tool call to the relay that runs now, for readers (`find`) that must never start, replace or retry one: no
+/// ensure(), one request, and any failure is an error.
+pub fn call_running(request: &ToolCallRequest) -> anyhow::Result<ToolOutput> {
+    let body = serde_json::to_vec(request)?;
+    let response = send("POST", "/tools/call", &[], Some(&body), Some(Duration::from_secs(30))).map_err(|error| anyhow!("the browse relay at {} failed: {error}", relay_api::endpoint()))?;
+    if !(200..300).contains(&response.status) {
+        bail!("relay answered {}", response.status);
+    }
+    Ok(serde_json::from_slice(&response.body)?)
 }
 
 /// An authorized request to the relay. A relay that is gone (restarted for an update, crashed) is started again and
@@ -331,3 +353,12 @@ pub fn specs(client: Option<&str>) -> Vec<ToolSpec> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_tunnel_sends_no_client_pid() {
+        assert_eq!(super::client_pid(false), Some(std::process::id().to_string()));
+        assert_eq!(super::client_pid(true), None);
+    }
+}

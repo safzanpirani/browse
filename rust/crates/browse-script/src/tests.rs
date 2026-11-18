@@ -25,7 +25,7 @@ impl Browser for FakeBrowser {
         Ok(())
     }
     async fn cdp(&self, _: TabId) -> anyhow::Result<Arc<dyn Cdp>> {
-        anyhow::bail!("no cdp here")
+        Ok(Arc::new(CookieCdp))
     }
     async fn state(&self, tab: TabId) -> anyhow::Result<Arc<TabState>> {
         Ok(self.states.lock().unwrap().entry(tab).or_default().clone())
@@ -87,6 +87,40 @@ async fn err(code: &str) -> String {
     let (text, output) = run_in(&context(), json!({ "code": code })).await;
     assert!(output.is_error, "{code} should fail: {text}");
     text
+}
+
+/// A tab's CDP that answers only Network.getCookies: a session cookie, a partitioned one, and one echoing the urls asked.
+struct CookieCdp;
+
+#[async_trait]
+impl Cdp for CookieCdp {
+    async fn send(&self, method: &str, params: Value, _: Option<&str>) -> Result<Value, browse_core::CdpError> {
+        if method != "Network.getCookies" {
+            return Err(browse_core::CdpError::Protocol(format!("{method} isn't faked")));
+        }
+        Ok(json!({ "cookies": [
+            { "name": "sid", "value": "s", "domain": ".example.com", "path": "/", "expires": -1, "session": true, "httpOnly": true, "secure": true },
+            { "name": "chip", "value": "c", "domain": "example.com", "path": "/", "expires": 1900000000.0, "session": false, "secure": true, "sameSite": "None", "partitionKey": { "topLevelSite": "https://example.com", "hasCrossSiteAncestor": false } },
+            { "name": "asked", "value": params["urls"].to_string(), "domain": "example.com", "path": "/", "session": true },
+        ] }))
+    }
+    fn events(&self) -> tokio::sync::broadcast::Receiver<browse_core::CdpEvent> {
+        tokio::sync::broadcast::channel(1).1
+    }
+}
+
+#[tokio::test]
+async fn context_cookies_reads_the_tabs_cookies_in_playwrights_shape() {
+    let code = r#"const all = await context.cookies(); const some = await context.cookies("https://example.com/a"); return { all, asked: some.find((c) => c.name === "asked").value }"#;
+    let (text, output) = run_in(&context(), json!({ "code": code, "tab": 7 })).await;
+    assert!(!output.is_error, "{text}");
+    let value: Value = serde_json::from_str(text.split("\n\n").nth(1).unwrap()).unwrap();
+    assert_eq!(value["all"][0], json!({ "name": "sid", "value": "s", "domain": ".example.com", "path": "/", "expires": -1, "httpOnly": true, "secure": true, "sameSite": "Lax" }));
+    assert_eq!(value["all"][1]["partitionKey"], "https://example.com");
+    assert_eq!(value["all"][1]["expires"].as_f64(), Some(1900000000.0));
+    assert_eq!(value["asked"], r#"["https://example.com/a"]"#, "the urls go to Network.getCookies");
+    // Without a tab there is nothing to read cookies from.
+    assert!(err("return await context.cookies()").await.contains("tab"));
 }
 
 #[tokio::test]
