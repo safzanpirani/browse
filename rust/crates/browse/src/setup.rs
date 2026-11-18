@@ -499,6 +499,9 @@ pub fn status(args: &[String]) -> anyhow::Result<i32> {
             configured.iter().map(|(name, file)| format!("{} ({})", crate::agents::label(name), tilde(file))).collect::<Vec<_>>().join(", ")
         }
     );
+    if let Some(line) = crate::omp::status() {
+        println!("{line}");
+    }
     println!("Updates:   {}", update::describe());
     println!("Files:     {}", relay_api::browse_files().iter().map(|p| tilde(p)).collect::<Vec<_>>().join(", "));
     println!("Logs:      {}", tilde(&relay_api::paths().state.join("logs")));

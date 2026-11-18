@@ -33,6 +33,12 @@ struct Flags {
     no_modify_path: bool,
     remote: bool,
     opencode: Option<PathBuf>,
+    /// `--client omp`: write omp's launcher and skill (omp.rs).
+    omp: bool,
+    /// With omp: also add the MCP server to omp's mcp.json.
+    mcp: bool,
+    bin_dir: Option<PathBuf>,
+    skills_dir: Option<PathBuf>,
 }
 
 fn parse(args: &[String]) -> anyhow::Result<Flags> {
@@ -79,7 +85,25 @@ fn parse(args: &[String]) -> anyhow::Result<Flags> {
                 flags.wait_seconds = Some(seconds);
             }
             "--opencode" => flags.opencode = Some(PathBuf::from(value(arg)?)),
+            "--client" => match value(arg)?.as_str() {
+                "omp" => flags.omp = true,
+                other => bail!("--client takes omp, not {other:?}; other agents are --agent <name>"),
+            },
+            "--mcp" => flags.mcp = true,
+            "--bin-dir" => flags.bin_dir = Some(PathBuf::from(value(arg)?)),
+            "--skills-dir" => flags.skills_dir = Some(PathBuf::from(value(arg)?)),
             other => bail!("Unknown option {other} for install. Run `browse --help`."),
+        }
+    }
+    if (flags.mcp || flags.bin_dir.is_some() || flags.skills_dir.is_some()) && !flags.omp {
+        bail!("--mcp, --bin-dir and --skills-dir go with --client omp");
+    }
+    // omp alone: its MCP server only with --mcp, and no other agent unless named.
+    if flags.omp {
+        if flags.mcp && !flags.requested.contains(&"omp") {
+            flags.requested.push("omp");
+        } else if !flags.mcp && flags.requested.is_empty() && !flags.all && !flags.yes {
+            flags.none = true;
         }
     }
     if flags.none && (flags.all || !flags.requested.is_empty()) {
@@ -313,6 +337,15 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
         println!("{} is running this, so browse is set up for {}.", agents::label(caller), agents::label(caller));
     }
     let entry = place(&flags)?;
+    if flags.omp {
+        let browsers: Vec<(String, String)> = browse_relay::pairing::read_browser_pairings(&relay_api::paths())
+            .into_values()
+            .filter_map(|pairing| Some((pairing.id?, pairing.name.unwrap_or_default())))
+            .collect();
+        for line in crate::omp::install(&crate::omp::paths(flags.bin_dir.as_deref(), flags.skills_dir.as_deref()), &entry, &browsers)? {
+            println!("{line}");
+        }
+    }
     let command = vec![entry.to_string_lossy().into_owned(), "mcp".to_owned()];
     restart_outdated_relay();
 
@@ -384,7 +417,7 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
         receipts.retain(|r| r["name"].as_str() != Some(location.name));
         receipts.push(json!({ "name": location.name, "file": location.file, "entry": entry }));
     }
-    if selected.is_empty() {
+    if selected.is_empty() && !(flags.omp && !flags.mcp) {
         let intro = if flags.none || ask { "Add browse to your agent as an MCP server (stdio):" } else { "No agent was set up: couldn't tell which agent is running this, and OpenCode isn't installed. Add browse to your agent as an MCP server (stdio):" };
         println!("\n{intro}");
         for line in agents::manual_entry(&command).lines() {
@@ -433,8 +466,17 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
 /// `browse uninstall`: removes browse from every agent config where an install put it, stops the relay, and deletes
 /// the executable this install placed and browse's files. A package manager's install is left to that manager.
 pub fn uninstall(args: &[String]) -> anyhow::Result<i32> {
-    if let Some(other) = args.first() {
-        bail!("Unknown option {other} for uninstall. Run `browse --help`.");
+    let omp_only = match args {
+        [] => false,
+        [flag, client] if flag == "--client" && client == "omp" => true,
+        [other, ..] => bail!("Unknown option {other} for uninstall. Run `browse --help`."),
+    };
+    // `--client omp` removes only what install wrote for omp; browse stays for the other agents.
+    for line in crate::omp::uninstall() {
+        println!("{line}");
+    }
+    if omp_only {
+        return Ok(0);
     }
     let mut status = 0;
     match relay::stop() {
@@ -546,6 +588,21 @@ mod tests {
         assert!(parse(&args(&["--agent", "*"])).unwrap().all);
         assert!(parse(&args(&["--agent", "none"])).unwrap().none);
         assert_eq!(parse(&args(&["--wait-seconds", "5"])).unwrap().wait_seconds, Some(5));
+    }
+
+    #[test]
+    fn omp_flags() {
+        let alone = parse(&args(&["--client", "omp"])).unwrap();
+        assert!(alone.omp && alone.none && alone.requested.is_empty());
+        let mcp = parse(&args(&["--client", "omp", "--mcp", "--bin-dir", "/b"])).unwrap();
+        assert!(!mcp.none);
+        assert_eq!(mcp.requested, ["omp"]);
+        assert_eq!(mcp.bin_dir.as_deref(), Some(Path::new("/b")));
+        let more = parse(&args(&["--client", "omp", "-a", "claude"])).unwrap();
+        assert!(!more.none);
+        assert_eq!(more.requested, ["claude"]);
+        assert!(parse(&args(&["--client", "cursor"])).is_err());
+        assert!(parse(&args(&["--mcp"])).is_err());
     }
 
     #[test]

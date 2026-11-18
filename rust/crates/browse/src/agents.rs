@@ -45,6 +45,7 @@ pub const AGENTS: &[(&str, &str)] = &[
     ("vibe", "Mistral Vibe"),
     ("qoder", "Qoder CLI"),
     ("pi", "Pi"),
+    ("omp", "oh-my-pi"),
     ("workbuddy", "WorkBuddy"),
     ("trae-cn", "Trae CN"),
 ];
@@ -215,6 +216,7 @@ pub fn locations(opencode_config: &Path, opencode_binary: Option<&Path>) -> Vec<
         loc("vibe", env("VIBE_HOME").unwrap_or_else(|| at(".vibe")).join("config.toml"), Some("vibe"), None, None),
         loc("qoder", at(".qoder/settings.json"), Some("qoder"), Some("Qoder"), None),
         loc("pi", env("PI_CODING_AGENT_DIR").unwrap_or_else(|| at(".pi/agent")).join("mcp.json"), Some("pi"), None, None),
+        loc("omp", env("OPENCODE_BROWSER_OMP_DIR").unwrap_or_else(|| at(".omp/agent")).join("mcp.json"), Some("omp"), None, None),
         loc("workbuddy", at(".workbuddy/mcp.json"), None, None, None),
         loc("trae-cn", support.join("Trae CN/User/mcp.json"), None, Some("Trae CN"), None),
     ]

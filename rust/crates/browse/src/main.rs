@@ -9,6 +9,7 @@ mod jsonc;
 mod legacy;
 mod mcp;
 mod method;
+mod omp;
 mod picker;
 mod profile;
 mod protocol;
@@ -64,6 +65,9 @@ SETUP
     --no-wait                 Don't wait for the extension to connect
     --wait-seconds <seconds>  How long to wait (default 180 in a terminal, 90 otherwise)
     --no-modify-path          Don't add browse to PATH
+    --client omp              Set up omp: a `browse` launcher for this build (--bin-dir) and the browse skill
+                              (--skills-dir); --mcp also adds the MCP server to omp's mcp.json. Without --agent,
+                              only omp is set up
   extension                   Where to get the extension
   pair [--wait-seconds <s>]   Print a one-time pairing code and wait for the browser that redeems it
     --list                    Show paired browsers
@@ -73,7 +77,8 @@ SETUP
   update [--check]            Update now, or only check
     --mode <on|notify|off>    Automatic updates (OPENCODE_BROWSER_AUTO_UPDATE overrides)
   status [--json]             Setup, relay and extension state
-  uninstall                   Remove browse from your agents, stop the relay and delete its files
+  uninstall                   Remove browse from your agents, stop the relay and delete its files; --client omp
+                              removes only omp's launcher and skill
   version                     Print the version
 
 RUNNING
