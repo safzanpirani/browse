@@ -69,6 +69,26 @@ until the user clicks Continue. Use it for logins, 2FA, captchas and payments; n
 - `browse console start|read|stop --tab 12`, `browse recording start|stop --tab 12` (a Matroska file).
 - `browse screenshot_diff --tab 12` compares against a baseline.
 
+## Habits that save turns
+
+- Run `browse find <site>` before opening anything: the user may already have lent a signed-in tab. A tab is usable
+  only after the user clicks the browse toolbar button on it; if nothing matches, open the site in the profile that
+  is signed in, or ask the user to lend their tab.
+- Batch every step you can already name into one execute and end with what changed (`snapshot({ delta: true })`).
+  Start a new call only when you need to see UI you haven't seen yet.
+- Never sleep. Wait for what you expect (`locator.waitFor()`, `page.waitForURL()`), not `waitForTimeout()`.
+- Give actions short timeouts in dynamic UI: `click({ timeout: 5000 })`. The 30 s default costs 30 s per miss.
+- Return small values (counts, URLs, `.slice(0, 3000)` of text), and keep each execute under about a minute.
+- Prefer an in-page request in a signed-in tab (`page.evaluate(() => fetch(...))`) to opening a page. Keep tokens in
+  the page and return only the fields you need.
+- Search page text with word boundaries (`\bargon\b`; `argon` matched "jargon"). A label missing from the scripts
+  may arrive by RPC; check a network capture before calling it absent.
+- Use one tab per run and close it when done (`browse tabs close --tab <id>`), or open it with `--group <task>` and
+  close the group. A watcher that runs longer opens its tab with `--keepOpen`, or uses a tab the user lent.
+- Human-like input paces clicks and keys (a mouse move takes up to about a second); a script that must be fast runs
+  against a relay started with `OPENCODE_BROWSER_HUMAN_INPUT=0`.
+- A watcher that depends on a tab stops when the Mac sleeps. It fails closed and says so, never pings.
+
 ## Settings
 
 `browse --profile work settings` reads that browser's settings; `browse --profile work settings --json

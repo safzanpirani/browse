@@ -29,7 +29,7 @@ pub struct Paths {
     pub skill: PathBuf,
 }
 
-fn manifest_file() -> PathBuf {
+pub fn manifest_file() -> PathBuf {
     relay_api::paths().data.join("omp.json")
 }
 
@@ -116,7 +116,7 @@ fn write_owned(file: &Path, text: &str, executable: bool) -> anyhow::Result<&'st
 
 /// Installs the launcher (unless `executable` is already at its path) and the skill. Refuses, having written
 /// nothing, when either file exists and isn't this install's. Returns the lines to print.
-pub fn install(paths: &Paths, executable: &Path, browsers: &[(String, String)]) -> anyhow::Result<Vec<String>> {
+pub fn install(paths: &Paths, executable: &Path, browsers: &[(String, String)], manifest_file: &Path) -> anyhow::Result<Vec<String>> {
     let same = |a: &Path, b: &Path| std::fs::canonicalize(a).ok().is_some_and(|a| std::fs::canonicalize(b).ok() == Some(a));
     let launcher = !same(&paths.launcher, executable);
     let mut refused: Vec<&Path> = Vec::new();
@@ -139,11 +139,32 @@ pub fn install(paths: &Paths, executable: &Path, browsers: &[(String, String)]) 
         let done = write_owned(&paths.launcher, &launcher_script(executable), true)?;
         lines.push(format!("✓ omp launcher {done}: {} runs {}", tilde(&paths.launcher), executable.display()));
     }
-    let done = write_owned(&paths.skill, &skill(browsers), false)?;
+    // A name someone edited in the installed table ("safzan (Helium, his main personal browser …)") stays.
+    let kept = table_names(&paths.skill);
+    let browsers: Vec<(String, String)> = browsers.iter().map(|(id, name)| (id.clone(), kept.iter().find(|(k, _)| k == id).map_or_else(|| name.clone(), |(_, n)| n.clone()))).collect();
+    let done = write_owned(&paths.skill, &skill(&browsers), false)?;
     lines.push(format!("✓ omp skill {done}: {}", tilde(&paths.skill)));
     let manifest = json!({ "launcher": paths.launcher, "skill": paths.skill, "launcherWritten": launcher });
-    crate::update::write_private(&manifest_file(), format!("{manifest:#}\n").as_bytes())?;
+    crate::update::write_private(manifest_file, format!("{manifest:#}\n").as_bytes())?;
     Ok(lines)
+}
+
+/// The `| id | name |` rows of the browser table in an installed skill this install owns (the TypeScript fork's
+/// included, which used the same table).
+fn table_names(file: &Path) -> Vec<(String, String)> {
+    if owner(file) != Owner::Ours {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(file) else { return Vec::new() };
+    text.lines()
+        .skip_while(|line| !line.starts_with("| --profile |"))
+        .skip(2)
+        .take_while(|line| line.starts_with('|'))
+        .filter_map(|line| {
+            let (id, rest) = line.strip_prefix("| ")?.split_once(" | ")?;
+            Some((id.trim().to_owned(), rest.strip_suffix(" |")?.trim().replace("\\|", "|")))
+        })
+        .collect()
 }
 
 /// Removes what install recorded writing (else what it would write at the defaults), each only with its marker.
@@ -205,18 +226,37 @@ mod tests {
         // The TypeScript fork's launcher is replaced in place.
         std::fs::create_dir_all(paths.launcher.parent().unwrap()).unwrap();
         std::fs::write(&paths.launcher, format!("#!/bin/sh\n# {LEGACY_MARKER}\nexec node cli.mjs \"$@\"\n")).unwrap();
-        let lines = install(&paths, &exe, &[]).unwrap();
+        let manifest = dir.join("omp.json");
+        let lines = install(&paths, &exe, &[], &manifest).unwrap();
         assert!(lines[0].contains("updated") && lines[1].contains("added"), "{lines:?}");
         assert_eq!(std::fs::read_to_string(&paths.launcher).unwrap(), launcher_script(&exe));
         assert_eq!(owner(&paths.skill), Owner::Ours);
-        assert!(install(&paths, &exe, &[]).unwrap().iter().all(|l| l.contains("unchanged")));
+        assert!(install(&paths, &exe, &[], &manifest).unwrap().iter().all(|l| l.contains("unchanged")));
         std::fs::write(&paths.skill, "someone's skill").unwrap();
-        let error = install(&paths, &exe, &[]).unwrap_err().to_string();
+        let error = install(&paths, &exe, &[], &manifest).unwrap_err().to_string();
         assert!(error.contains("won't overwrite") && error.contains("SKILL.md"), "{error}");
         // A build that is the launcher's own file gets no launcher.
         std::fs::remove_file(&paths.skill).unwrap();
-        let lines = install(&paths, &paths.launcher, &[]).unwrap();
+        let lines = install(&paths, &paths.launcher, &[], &manifest).unwrap();
         assert_eq!(lines.len(), 1, "{lines:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_in_the_installed_table_survive_a_reinstall() {
+        let dir = scratch("notes");
+        let paths = Paths { launcher: dir.join("bin/browse"), skill: dir.join("skills/browse/SKILL.md") };
+        std::fs::create_dir_all(paths.skill.parent().unwrap()).unwrap();
+        let installed = format!(
+            "---\nname: browse\n---\n<!-- {LEGACY_MARKER} -->\n\n| --profile | Browser name |\n|---|---|\n| safzan | safzan (Helium, his main personal browser since 2026-11-13) |\n| work | work |\n\nmore\n"
+        );
+        std::fs::write(&paths.skill, installed).unwrap();
+        let browsers = [("safzan".to_owned(), "safzan".to_owned()), ("work".to_owned(), "Work".to_owned()), ("an".to_owned(), "an".to_owned())];
+        install(&paths, &paths.launcher, &browsers, &dir.join("omp.json")).unwrap();
+        let text = std::fs::read_to_string(&paths.skill).unwrap();
+        assert!(text.contains("| safzan | safzan (Helium, his main personal browser since 2026-11-13) |"), "{text}");
+        assert!(text.contains("| work | work |") && text.contains("| an | an |"), "{text}");
+        assert!(text.contains(MARKER) && !text.contains(LEGACY_MARKER));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

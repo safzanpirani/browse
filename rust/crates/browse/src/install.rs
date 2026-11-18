@@ -342,7 +342,7 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
             .into_values()
             .filter_map(|pairing| Some((pairing.id?, pairing.name.unwrap_or_default())))
             .collect();
-        for line in crate::omp::install(&crate::omp::paths(flags.bin_dir.as_deref(), flags.skills_dir.as_deref()), &entry, &browsers)? {
+        for line in crate::omp::install(&crate::omp::paths(flags.bin_dir.as_deref(), flags.skills_dir.as_deref()), &entry, &browsers, &crate::omp::manifest_file())? {
             println!("{line}");
         }
     }
