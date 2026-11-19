@@ -256,6 +256,20 @@ pub fn pairing_proof(token: &str, role: &str, port: u16, own_nonce: &str, peer_n
     b64url(&hmac(token.as_bytes(), &[message.as_bytes()]))
 }
 
+/// The relay's answer to `GET /version?challenge=<nonce>`: HMAC(relay token, "opencode-browser-relay-identity-v1" |
+/// 127.0.0.1:port | instanceId | nonce). A client that holds the relay token checks it before sending the token, so a
+/// listener that only copies the relay's public `/version` (or forwards the challenge to a relay on another port)
+/// never gets it. The token never leaves either side.
+pub fn relay_identity_proof(relay_token: &str, port: u16, instance_id: &str, nonce: &str) -> String {
+    let message = format!("opencode-browser-relay-identity-v1|127.0.0.1:{port}|{instance_id}|{nonce}");
+    b64url(&hmac(relay_token.as_bytes(), &[message.as_bytes()]))
+}
+
+/// A `/version` challenge the relay answers: 16 to 128 URL-safe characters.
+pub fn valid_identity_challenge(nonce: &str) -> bool {
+    (16..=128).contains(&nonce.len()) && nonce.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 pub struct EcdhExchange {
     pub public_key: String,
     pub secret: [u8; 32],

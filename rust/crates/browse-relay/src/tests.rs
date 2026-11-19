@@ -499,6 +499,28 @@ async fn serves_the_tool_api_behind_the_token() {
     assert_eq!(text(&tabs), json!({ "tabs": [] }));
 }
 
+/// Round 3: `/version?challenge=` answers with a proof of the relay token bound to the port it really listens on (a
+/// relay started on port 0 binds a real one) and its instance id; no challenge, or a malformed one, gets no proof.
+#[tokio::test]
+async fn version_proves_the_token_for_its_port_and_instance() {
+    let h = harness().await;
+    let port = h.handle.port();
+    assert_ne!(port, 0);
+    let token = h.handle.token().to_string();
+    let nonce = "0123456789abcdef-_ABCDEF";
+    let (status, version) = http(port, "GET", &format!("/version?challenge={nonce}"), None, None).await;
+    assert_eq!(status, 200);
+    let instance = version["instanceId"].as_str().unwrap();
+    assert_eq!(version["proof"], json!(pairing::relay_identity_proof(&token, port, instance, nonce)));
+    assert_ne!(version["proof"], json!(pairing::relay_identity_proof(&token, port.wrapping_add(1), instance, nonce)));
+    assert_ne!(version["proof"], json!(pairing::relay_identity_proof("another-token", port, instance, nonce)));
+    for path in ["/version".to_owned(), "/version?challenge=short".to_owned(), format!("/version?challenge={nonce}%21")] {
+        let (status, version) = http(port, "GET", &path, None, None).await;
+        assert_eq!(status, 200);
+        assert!(version.get("proof").is_none(), "{path}: {version}");
+    }
+}
+
 /// The relay picks a client's tools and instructions by the name the MCP proxy forwards.
 #[tokio::test]
 async fn the_client_name_decides_tools_and_instructions() {

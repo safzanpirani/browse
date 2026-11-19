@@ -415,6 +415,12 @@ async fn answer(relay: Arc<Relay>, peer: SocketAddr, request: &mut Request<Incom
         if probing {
             body["installWaiting"] = true.into();
         }
+        // A client about to send the relay token (`browse find`) proves this is the relay that holds it, on this port.
+        if let Some((_, nonce)) = url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes()).find(|(k, _)| k == "challenge")
+            && crate::pairing::valid_identity_challenge(&nonce)
+        {
+            body["proof"] = crate::pairing::relay_identity_proof(&relay.token, relay.port, &relay.instance_id, &nonce).into();
+        }
         return untouched(json_response(StatusCode::OK, &body));
     }
     // A relay that is stopping for an update must not start new work: answer before the tool would wait on a browser

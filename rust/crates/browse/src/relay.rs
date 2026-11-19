@@ -257,15 +257,23 @@ pub fn call_observed(instance: &str, requests: &[ToolCallRequest]) -> anyhow::Re
     observe(&relay_api::endpoint(), &token, client_pid(tunnel()).as_deref(), instance, requests)
 }
 
-/// One connection that asks `/version` first and sends `requests` only if the answer is the Rust relay `instance`: a
-/// connection stays with the process that accepted it, so no request (nor the token) can reach a relay that took the
-/// port after the check. The last request closes the connection; any failure is an error and nothing is retried.
+/// One connection that asks `/version` first and sends `requests` only if the answer is the Rust relay `instance` and
+/// proves it holds `token` for this port (pairing::relay_identity_proof of a fresh nonce), so a listener that copies
+/// the relay's public `/version` never gets the token. A connection stays with the process that accepted it, so no
+/// request can reach a relay that took the port after the check. The last request closes the connection; any failure
+/// is an error and nothing is retried.
 fn observe(endpoint: &str, token: &str, pid: Option<&str>, instance: &str, requests: &[ToolCallRequest]) -> anyhow::Result<Vec<ToolOutput>> {
     let failed = |error: http::Error| anyhow!("the browse relay at {endpoint} failed: {error}");
+    let port = endpoint.trim_end_matches('/').rsplit(':').next().and_then(|port| port.parse::<u16>().ok()).ok_or_else(|| anyhow!("{endpoint} names no port"))?;
+    let nonce = format!("{:016x}{:016x}", crate::session::random_u64(), crate::session::random_u64());
     let mut connection = http::Connection::open(endpoint).map_err(failed)?;
-    let version = connection.send("GET", "/version", &[], None, Some(Duration::from_secs(5)), requests.is_empty()).map_err(failed)?;
+    let version = connection.send("GET", &format!("/version?challenge={nonce}"), &[], None, Some(Duration::from_secs(5)), requests.is_empty()).map_err(failed)?;
     let verified = match answer(version.status, &version.body) {
-        Answer::Browse(version) => !crate::legacy::is_legacy(&version) && version.get("instanceId").and_then(Value::as_str) == Some(instance),
+        Answer::Browse(version) => {
+            !crate::legacy::is_legacy(&version)
+                && version.get("instanceId").and_then(Value::as_str) == Some(instance)
+                && version.get("proof").and_then(Value::as_str) == Some(browse_relay::pairing::relay_identity_proof(token, port, instance, &nonce).as_str())
+        }
         Answer::Starting | Answer::Other => false,
     };
     if instance.is_empty() || !verified {
@@ -455,12 +463,14 @@ mod tests {
     }
 
     /// A relay stand-in on one connection: answers `/version` with `version` and each tool call with an empty tab list.
-    /// The thread returns each request it read ("GET /version", "POST /tools/call Bearer tok"), and "second connection"
-    /// if anything connected again.
-    fn fake_relay(version: &'static [u8]) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    /// With `token`, it answers a `/version` challenge the way a relay holding that token does; without, it only copies
+    /// the public answer. The thread returns each request it read ("GET /version", "POST /tools/call Bearer tok"),
+    /// and "second connection" if anything connected again.
+    fn fake_relay(version: &'static [u8], token: Option<&'static str>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = format!("http://127.0.0.1:{port}");
         let thread = std::thread::spawn(move || {
             let mut seen = Vec::new();
             let (stream, _) = listener.accept().unwrap();
@@ -472,6 +482,10 @@ mod tests {
                     break;
                 }
                 let request: Vec<&str> = line.split_whitespace().take(2).collect();
+                let (path, challenge) = request.get(1).map_or(("", None), |target| match target.split_once("?challenge=") {
+                    Some((path, nonce)) => (path, Some(nonce.to_owned())),
+                    None => (target, None),
+                });
                 let (mut length, mut close, mut auth) = (0, false, String::new());
                 loop {
                     let mut header = String::new();
@@ -485,10 +499,18 @@ mod tests {
                     }
                 }
                 reader.read_exact(&mut vec![0; length]).unwrap();
-                seen.push(format!("{}{auth}", request.join(" ")));
-                let reply: &[u8] = if request.get(1) == Some(&"/version") { version } else { br#"{"content":[{"type":"text","text":"{\"tabs\":[]}"}]}"# };
-                write!(writer, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", reply.len()).unwrap();
-                writer.write_all(reply).unwrap();
+                seen.push(format!("{} {path}{auth}", request[0]));
+                let reply = if path == "/version" {
+                    let mut body: Value = serde_json::from_slice(version).unwrap();
+                    if let (Some(token), Some(nonce)) = (token, &challenge) {
+                        let instance = body["instanceId"].as_str().unwrap_or_default().to_owned();
+                        body["proof"] = browse_relay::pairing::relay_identity_proof(token, port, &instance, nonce).into();
+                    }
+                    body.to_string()
+                } else {
+                    r#"{"content":[{"type":"text","text":"{\"tabs\":[]}"}]}"#.to_owned()
+                };
+                write!(writer, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}", reply.len()).unwrap();
                 if close {
                     break;
                 }
@@ -506,11 +528,13 @@ mod tests {
         [ToolCallRequest { name: "status".into(), arguments: serde_json::json!({}) }, ToolCallRequest { name: "tabs".into(), arguments: serde_json::json!({ "action": "list" }) }]
     }
 
-    /// S2: find's tool calls go on the connection whose `/version` named the probed Rust instance.
+    const RUST_INSTANCE: &str = "0f4a2c11-8b7e-4b4d-9c1e-1a2b3c4d5e6f";
+
+    /// S2: find's tool calls go on the connection whose `/version` named the probed Rust instance and proved the token.
     #[test]
     fn observe_sends_its_calls_to_the_probed_instance_only() {
-        let (endpoint, relay) = fake_relay(RUST_BROWSE);
-        let outputs = observe(&endpoint, "tok", None, "0f4a2c11-8b7e-4b4d-9c1e-1a2b3c4d5e6f", &reads()).unwrap();
+        let (endpoint, relay) = fake_relay(RUST_BROWSE, Some("tok"));
+        let outputs = observe(&endpoint, "tok", None, RUST_INSTANCE, &reads()).unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(relay.join().unwrap(), ["GET /version", "POST /tools/call Bearer tok", "POST /tools/call Bearer tok"]);
     }
@@ -518,17 +542,29 @@ mod tests {
     /// S2: another relay instance on the port, or a TypeScript relay, gets the `/version` read and nothing else (no token).
     #[test]
     fn observe_sends_nothing_to_a_relay_that_took_the_port() {
-        let (endpoint, relay) = fake_relay(RUST_BROWSE);
+        let (endpoint, relay) = fake_relay(RUST_BROWSE, Some("tok"));
         let error = observe(&endpoint, "tok", None, "a-relay-that-stopped", &reads()).unwrap_err();
         assert_eq!(error.to_string(), CHANGED);
         assert_eq!(relay.join().unwrap(), ["GET /version"]);
         // The TypeScript relay never says runtime "rust", even with the probed instanceId.
-        let (endpoint, relay) = fake_relay(OLD_BROWSE);
+        let (endpoint, relay) = fake_relay(OLD_BROWSE, Some("tok"));
         assert!(observe(&endpoint, "tok", None, "b1d0c7f0-2f6a-4f43-9d0b-6a1d0f5e8c11", &reads()).is_err());
         assert_eq!(relay.join().unwrap(), ["GET /version"]);
         // A probe without an instanceId binds to nothing.
-        let (endpoint, relay) = fake_relay(RUST_BROWSE);
+        let (endpoint, relay) = fake_relay(RUST_BROWSE, Some("tok"));
         assert!(observe(&endpoint, "tok", None, "", &reads()).is_err());
         assert_eq!(relay.join().unwrap(), ["GET /version"]);
+    }
+
+    /// Round 3: a listener that copies the relay's public `/version` (same instanceId, runtime rust) but can't prove it
+    /// holds the relay token gets no token: no proof, or a proof made with another token, ends the read.
+    #[test]
+    fn observe_sends_no_token_to_a_listener_that_only_copies_version() {
+        for impostor in [None, Some("another-token")] {
+            let (endpoint, relay) = fake_relay(RUST_BROWSE, impostor);
+            let error = observe(&endpoint, "tok", None, RUST_INSTANCE, &reads()).unwrap_err();
+            assert_eq!(error.to_string(), CHANGED);
+            assert_eq!(relay.join().unwrap(), ["GET /version"], "{impostor:?}");
+        }
     }
 }
