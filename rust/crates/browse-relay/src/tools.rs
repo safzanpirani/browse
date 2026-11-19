@@ -78,11 +78,13 @@ impl Tool for TabsTool {
                 if let Some(id) = &chosen {
                     let existing = relay.st().tab_by_chosen(id);
                     if let Some(tab) = existing {
-                        // An id names one tab in one browser: asked for in another browser, it isn't that tab.
+                        // An id names one tab in one browser: asked for in another browser, it isn't that tab. The
+                        // browser resolves id first, as opening a tab does, so a name that is another browser's id
+                        // means that browser.
                         if let Some(wanted) = string(&args, "browser").map(|b| b.trim().to_lowercase()).filter(|b| !b.is_empty()) {
                             let st = relay.st();
                             let link = st.tabs.get(&tab).and_then(|entry| st.link(&entry.link_key));
-                            if !link.as_ref().is_some_and(|l| l.id == wanted || l.name.to_lowercase() == wanted) {
+                            if !link.as_ref().is_some_and(|l| st.link_by_name(&wanted).is_some_and(|named| named.key == l.key)) {
                                 let owner = link.map_or_else(|| "another browser".to_owned(), |l| format!("browser {}", l.id));
                                 bail!("Tab {id} is in {owner}, not {wanted}. Close it (`tabs close --tab {id}`) or choose another id.");
                             }

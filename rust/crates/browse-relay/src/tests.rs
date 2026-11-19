@@ -1959,6 +1959,36 @@ async fn chosen_ids_are_unique_across_two_browsers_and_new_takes_the_browser_opt
     assert_eq!(second_seen.commands("tabs.create").len(), 1);
 }
 
+/// S7: reusing a chosen id resolves `browser` id first, as opening a tab does. When one browser's display name is
+/// another browser's id, that string means the browser with the id, so the first browser's tab is refused, not reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chosen_id_resolves_its_browser_by_id_before_name() {
+    let h = harness().await;
+    let port = h.handle.port();
+    let relay = h.handle.relay.clone();
+    // Both fake extensions say "Test Chrome"; the second browser's id is that same string.
+    relay.st().known.insert("profile-one".into(), crate::relay::KnownBrowser { id: "one".into(), name: "Test Chrome".into() });
+    relay.st().known.insert("profile-two".into(), crate::relay::KnownBrowser { id: "test chrome".into(), name: "Test Chrome".into() });
+    let first_socket = pair_with_token(port, &h.paths, "profile-one").await;
+    let (first_seen, first_events) = fake_extension(first_socket, 500);
+    first_events.send(json!({ "method": "ready" })).unwrap();
+    assert!(relay.wait_until(Duration::from_secs(5), |st| st.links.iter().any(|l| l.connected())).await);
+    let second_socket = pair_with_token(port, &h.paths, "profile-two").await;
+    let (second_seen, second_events) = fake_extension(second_socket, 600);
+    second_events.send(json!({ "method": "ready" })).unwrap();
+    relay.wait_until(Duration::from_secs(10), |st| st.links.iter().filter(|l| l.connected()).count() == 2).await;
+    let browsers: Vec<String> = relay.st().links.iter().map(|l| l.id.clone()).collect();
+    assert!(browsers.contains(&"one".to_string()) && browsers.contains(&"test chrome".to_string()), "{browsers:?}");
+
+    let named = text(&serde_json::to_value(tool(&relay, "tabs", json!({ "action": "new", "id": "work-mail", "browser": "one" })).await).unwrap())["tab"].as_i64().unwrap();
+    assert_eq!(first_seen.commands("tabs.create").len(), 1);
+    let refused = tool(&relay, "tabs", json!({ "action": "new", "id": "work-mail", "browser": "Test Chrome" })).await;
+    assert!(refused.is_error && tool_text(&refused).contains("is in browser one"), "{}", tool_text(&refused));
+    let same = text(&serde_json::to_value(tool(&relay, "tabs", json!({ "action": "new", "id": "work-mail", "browser": "ONE" })).await).unwrap());
+    assert_eq!((same["tab"].as_i64(), same["existed"].as_bool()), (Some(named), Some(true)), "its own id finds the tab");
+    assert_eq!(second_seen.commands("tabs.create").len(), 0);
+}
+
 /// Playwriter 0.12.0's relay answers /version with version, pid, instanceId and activeExecutes. It holds a port but is
 /// not browse: a start must step to the next candidate instead of refusing the port as a relay's.
 #[tokio::test]
