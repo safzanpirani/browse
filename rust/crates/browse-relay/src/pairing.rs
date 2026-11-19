@@ -256,13 +256,29 @@ pub fn pairing_proof(token: &str, role: &str, port: u16, own_nonce: &str, peer_n
     b64url(&hmac(token.as_bytes(), &[message.as_bytes()]))
 }
 
+fn relay_identity_message(port: u16, instance_id: &str, nonce: &str) -> String {
+    format!("opencode-browser-relay-identity-v1|127.0.0.1:{port}|{instance_id}|{nonce}")
+}
+
 /// The relay's answer to `GET /version?challenge=<nonce>`: HMAC(relay token, "opencode-browser-relay-identity-v1" |
 /// 127.0.0.1:port | instanceId | nonce). A client that holds the relay token checks it before sending the token, so a
 /// listener that only copies the relay's public `/version` (or forwards the challenge to a relay on another port)
 /// never gets it. The token never leaves either side.
 pub fn relay_identity_proof(relay_token: &str, port: u16, instance_id: &str, nonce: &str) -> String {
-    let message = format!("opencode-browser-relay-identity-v1|127.0.0.1:{port}|{instance_id}|{nonce}");
-    b64url(&hmac(relay_token.as_bytes(), &[message.as_bytes()]))
+    b64url(&hmac(relay_token.as_bytes(), &[relay_identity_message(port, instance_id, nonce).as_bytes()]))
+}
+
+/// Whether `proof` is relay_identity_proof for these inputs, compared in constant time.
+pub fn verify_relay_identity_proof(relay_token: &str, port: u16, instance_id: &str, nonce: &str, proof: &str) -> bool {
+    let Some(proof) = from_b64url(proof) else { return false };
+    let mut mac = HmacSha256::new_from_slice(relay_token.as_bytes()).expect("HMAC takes any key length");
+    mac.update(relay_identity_message(port, instance_id, nonce).as_bytes());
+    mac.verify_slice(&proof).is_ok()
+}
+
+/// A fresh `/version` challenge from the OS random source: 32 URL-safe characters.
+pub fn identity_challenge() -> String {
+    b64url(&random_bytes::<24>())
 }
 
 /// A `/version` challenge the relay answers: 16 to 128 URL-safe characters.
@@ -403,5 +419,22 @@ mod tests {
             assert_eq!(pairings.get(&key).map(|p| p.token.as_str()), Some(token.as_str()), "{key} was lost");
         }
         let _ = std::fs::remove_dir_all(&paths.data);
+    }
+
+    /// Round 4: the identity proof verifies only for the same token, port, instance and nonce (a constant-time MAC check
+    /// of the decoded bytes), and challenges are fresh, valid OS-random nonces.
+    #[test]
+    fn identity_proofs_verify_exactly_and_challenges_are_fresh() {
+        let nonce = identity_challenge();
+        assert!(valid_identity_challenge(&nonce) && nonce.len() == 32, "{nonce}");
+        assert_ne!(nonce, identity_challenge());
+        let proof = relay_identity_proof("tok", 19988, "inst", &nonce);
+        assert!(verify_relay_identity_proof("tok", 19988, "inst", &nonce, &proof));
+        assert!(!verify_relay_identity_proof("other", 19988, "inst", &nonce, &proof));
+        assert!(!verify_relay_identity_proof("tok", 19989, "inst", &nonce, &proof));
+        assert!(!verify_relay_identity_proof("tok", 19988, "other", &nonce, &proof));
+        assert!(!verify_relay_identity_proof("tok", 19988, "inst", &identity_challenge(), &proof));
+        assert!(!verify_relay_identity_proof("tok", 19988, "inst", &nonce, &proof[..proof.len() - 2]));
+        assert!(!verify_relay_identity_proof("tok", 19988, "inst", &nonce, "not base64!"));
     }
 }

@@ -265,14 +265,14 @@ pub fn call_observed(instance: &str, requests: &[ToolCallRequest]) -> anyhow::Re
 fn observe(endpoint: &str, token: &str, pid: Option<&str>, instance: &str, requests: &[ToolCallRequest]) -> anyhow::Result<Vec<ToolOutput>> {
     let failed = |error: http::Error| anyhow!("the browse relay at {endpoint} failed: {error}");
     let port = endpoint.trim_end_matches('/').rsplit(':').next().and_then(|port| port.parse::<u16>().ok()).ok_or_else(|| anyhow!("{endpoint} names no port"))?;
-    let nonce = format!("{:016x}{:016x}", crate::session::random_u64(), crate::session::random_u64());
+    let nonce = browse_relay::pairing::identity_challenge();
     let mut connection = http::Connection::open(endpoint).map_err(failed)?;
     let version = connection.send("GET", &format!("/version?challenge={nonce}"), &[], None, Some(Duration::from_secs(5)), requests.is_empty()).map_err(failed)?;
     let verified = match answer(version.status, &version.body) {
         Answer::Browse(version) => {
             !crate::legacy::is_legacy(&version)
                 && version.get("instanceId").and_then(Value::as_str) == Some(instance)
-                && version.get("proof").and_then(Value::as_str) == Some(browse_relay::pairing::relay_identity_proof(token, port, instance, &nonce).as_str())
+                && version.get("proof").and_then(Value::as_str).is_some_and(|proof| browse_relay::pairing::verify_relay_identity_proof(token, port, instance, &nonce, proof))
         }
         Answer::Starting | Answer::Other => false,
     };
