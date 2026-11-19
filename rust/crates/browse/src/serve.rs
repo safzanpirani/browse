@@ -39,6 +39,8 @@ fn quiet() -> Duration {
 
 pub fn run() -> anyhow::Result<i32> {
     let spawned = std::env::var("OPENCODE_BROWSER_MANAGED_RELAY").as_deref() == Ok("1");
+    // While this executable's path still leads to its install: an update can move it aside (update::install).
+    update::install();
     let quiet = quiet();
     let options = ServeOptions {
         version: VERSION.into(),
