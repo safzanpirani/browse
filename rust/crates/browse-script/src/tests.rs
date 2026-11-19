@@ -37,7 +37,7 @@ impl Cdp for FakeCdp {
 #[derive(Default)]
 struct FakeBrowser {
     states: std::sync::Mutex<std::collections::HashMap<TabId, Arc<TabState>>>,
-    /// Some for a test that records CDP sends; the plain context fakes cookie reads.
+    /// Some for a test that needs CDP; the plain context refuses it as before.
     recorder: Option<Arc<Recorder>>,
 }
 
@@ -53,9 +53,17 @@ impl Browser for FakeBrowser {
         Ok(())
     }
     async fn cdp(&self, tab: TabId) -> anyhow::Result<Arc<dyn Cdp>> {
-        // The plain context fakes cookie reads; a test that records CDP sends gets the recorder.
-        let Some(recorder) = &self.recorder else { return Ok(Arc::new(CookieCdp)) };
+        let Some(recorder) = &self.recorder else { anyhow::bail!("no cdp here") };
         Ok(Arc::new(FakeCdp { tab, recorder: recorder.clone() }))
+    }
+    /// A session cookie, two partitioned ones (same top-level site, one cross-site), and one echoing the tab and urls.
+    async fn cookies(&self, tab: TabId, urls: &[String]) -> anyhow::Result<Value> {
+        Ok(json!([
+            { "name": "sid", "value": "s", "domain": ".example.com", "path": "/", "expires": -1, "session": true, "httpOnly": true, "secure": true },
+            { "name": "chip", "value": "c", "domain": "example.com", "path": "/", "expires": 1900000000.0, "session": false, "secure": true, "sameSite": "None", "partitionKey": { "topLevelSite": "https://example.com", "hasCrossSiteAncestor": false } },
+            { "name": "chip", "value": "x", "domain": "example.com", "path": "/", "session": true, "partitionKey": { "topLevelSite": "https://example.com", "hasCrossSiteAncestor": true } },
+            { "name": "asked", "value": json!({ "tab": tab, "urls": urls }).to_string(), "domain": "example.com", "path": "/", "session": true },
+        ]))
     }
     async fn state(&self, tab: TabId) -> anyhow::Result<Arc<TabState>> {
         Ok(self.states.lock().unwrap().entry(tab).or_default().clone())
@@ -87,6 +95,8 @@ impl Tool for Fake {
             "outline" => ToolOutput::text("- heading \"Save\" [ref=e1]\n… [truncated: the result is 5 characters; the page said this"),
             // Without a tab, navigate opens tab 7 (in the browser the call names, echoed back).
             "navigate" => ToolOutput::text(json!({ "tab": args.get("tab").cloned().unwrap_or(json!(7)), "url": args["url"], "title": "T", "status": 200, "navigated": true, "browser": args.get("browser") }).to_string()),
+            // `tabs new` opens tab 9.
+            "tabs" => ToolOutput::text(json!({ "tab": 9 }).to_string()),
             "handoff" => {
                 tokio::time::sleep(Duration::from_millis(args["ms"].as_u64().unwrap_or(0))).await;
                 ToolOutput::text(json!({ "outcome": "continued" }).to_string())
@@ -107,7 +117,7 @@ fn recorded_context() -> (ToolContext, Arc<Recorder>) {
 }
 
 fn execute() -> Arc<dyn Tool> {
-    let fakes: Vec<Arc<dyn Tool>> = ["echo", "fail", "picture", "navigate", "handoff", "cut", "outline"].into_iter().map(|n| Arc::new(Fake(n)) as Arc<dyn Tool>).collect();
+    let fakes: Vec<Arc<dyn Tool>> = ["echo", "fail", "picture", "navigate", "handoff", "cut", "outline", "tabs"].into_iter().map(|n| Arc::new(Fake(n)) as Arc<dyn Tool>).collect();
     crate::tools(&fakes).remove(0)
 }
 
@@ -129,26 +139,6 @@ async fn err(code: &str) -> String {
     text
 }
 
-/// A tab's CDP that answers only Network.getCookies: a session cookie, a partitioned one, and one echoing the urls asked.
-struct CookieCdp;
-
-#[async_trait]
-impl Cdp for CookieCdp {
-    async fn send(&self, method: &str, params: Value, _: Option<&str>) -> Result<Value, browse_core::CdpError> {
-        if method != "Network.getCookies" {
-            return Err(browse_core::CdpError::Protocol(format!("{method} isn't faked")));
-        }
-        Ok(json!({ "cookies": [
-            { "name": "sid", "value": "s", "domain": ".example.com", "path": "/", "expires": -1, "session": true, "httpOnly": true, "secure": true },
-            { "name": "chip", "value": "c", "domain": "example.com", "path": "/", "expires": 1900000000.0, "session": false, "secure": true, "sameSite": "None", "partitionKey": { "topLevelSite": "https://example.com", "hasCrossSiteAncestor": false } },
-            { "name": "asked", "value": params["urls"].to_string(), "domain": "example.com", "path": "/", "session": true },
-        ] }))
-    }
-    fn events(&self) -> tokio::sync::broadcast::Receiver<browse_core::CdpEvent> {
-        tokio::sync::broadcast::channel(1).1
-    }
-}
-
 #[tokio::test]
 async fn context_cookies_reads_the_tabs_cookies_in_playwrights_shape() {
     let code = r#"const all = await context.cookies(); const some = await context.cookies("https://example.com/a"); return { all, asked: some.find((c) => c.name === "asked").value }"#;
@@ -158,9 +148,20 @@ async fn context_cookies_reads_the_tabs_cookies_in_playwrights_shape() {
     assert_eq!(value["all"][0], json!({ "name": "sid", "value": "s", "domain": ".example.com", "path": "/", "expires": -1, "httpOnly": true, "secure": true, "sameSite": "Lax" }));
     assert_eq!(value["all"][1]["partitionKey"], "https://example.com");
     assert_eq!(value["all"][1]["expires"].as_f64(), Some(1900000000.0));
-    assert_eq!(value["asked"], r#"["https://example.com/a"]"#, "the urls go to Network.getCookies");
+    // S13: two partitions of one top-level site stay apart by Chromium's cross-site flag, as Playwright keeps it.
+    assert_eq!((value["all"][1]["_crHasCrossSiteAncestor"].clone(), value["all"][2]["_crHasCrossSiteAncestor"].clone()), (json!(false), json!(true)));
+    assert_eq!(value["asked"], json!({ "tab": 7, "urls": ["https://example.com/a"] }).to_string(), "the urls go to the tab's browser");
     // Without a tab there is nothing to read cookies from.
     assert!(err("return await context.cookies()").await.contains("tab"));
+}
+
+/// S12: `page.context().cookies()` reads that page's tab, not the execute's default page.
+#[tokio::test]
+async fn a_pages_context_reads_that_pages_cookies() {
+    let code = r#"const page9 = await context.newPage(); const asked = (list) => JSON.parse(list.find((c) => c.name === "asked").value).tab; return [asked(await page9.context().cookies()), asked(await page.context().cookies()), asked(await context.cookies())]"#;
+    let (text, output) = run_in(&context(), json!({ "code": code, "tab": 7 })).await;
+    assert!(!output.is_error, "{text}");
+    assert!(text.lines().any(|line| line == "[9,7,7]"), "{text}");
 }
 
 #[tokio::test]

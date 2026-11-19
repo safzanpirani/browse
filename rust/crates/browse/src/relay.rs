@@ -232,9 +232,13 @@ fn client_pid(tunnel: bool) -> Option<String> {
     (!tunnel).then(|| std::process::id().to_string())
 }
 
+fn tunnel() -> bool {
+    std::env::var(TUNNEL_VARIABLE).is_ok_and(|v| v == "1")
+}
+
 fn send(method: &str, path: &str, extra: &[(&str, &str)], body: Option<&[u8]>, timeout: Option<Duration>) -> Result<http::Response, http::Error> {
     let auth = format!("Bearer {}", relay_api::token().unwrap_or_default());
-    let pid = client_pid(std::env::var(TUNNEL_VARIABLE).is_ok_and(|v| v == "1"));
+    let pid = client_pid(tunnel());
     let mut headers = vec![("Authorization", auth.as_str())];
     if let Some(pid) = &pid {
         headers.push(("OpenCode-Browser-Client-Pid", pid.as_str()));
@@ -243,15 +247,46 @@ fn send(method: &str, path: &str, extra: &[(&str, &str)], body: Option<&[u8]>, t
     http::request(&relay_api::endpoint(), method, path, &headers, body, timeout)
 }
 
-/// A tool call to the relay that runs now, for readers (`find`) that must never start, replace or retry one: no
-/// ensure(), one request, and any failure is an error.
-pub fn call_running(request: &ToolCallRequest) -> anyhow::Result<ToolOutput> {
-    let body = serde_json::to_vec(request)?;
-    let response = send("POST", "/tools/call", &[], Some(&body), Some(Duration::from_secs(30))).map_err(|error| anyhow!("the browse relay at {} failed: {error}", relay_api::endpoint()))?;
-    if !(200..300).contains(&response.status) {
-        bail!("relay answered {}", response.status);
+/// Said when the relay on the port isn't the Rust relay a reader probed: it stopped, or another took its place.
+pub const CHANGED: &str = "The relay changed while find read it; run find again.";
+
+/// Tool calls for readers (`find`) that must never start, replace or retry a relay, nor create or touch its token: they
+/// go only to the Rust relay whose `/version` named `instance`. See [observe].
+pub fn call_observed(instance: &str, requests: &[ToolCallRequest]) -> anyhow::Result<Vec<ToolOutput>> {
+    let token = browse_relay::secrets::existing_relay_token(&relay_api::paths()).ok_or_else(|| anyhow!("This install has no relay token yet, so find can't read the relay."))?;
+    observe(&relay_api::endpoint(), &token, client_pid(tunnel()).as_deref(), instance, requests)
+}
+
+/// One connection that asks `/version` first and sends `requests` only if the answer is the Rust relay `instance`: a
+/// connection stays with the process that accepted it, so no request (nor the token) can reach a relay that took the
+/// port after the check. The last request closes the connection; any failure is an error and nothing is retried.
+fn observe(endpoint: &str, token: &str, pid: Option<&str>, instance: &str, requests: &[ToolCallRequest]) -> anyhow::Result<Vec<ToolOutput>> {
+    let failed = |error: http::Error| anyhow!("the browse relay at {endpoint} failed: {error}");
+    let mut connection = http::Connection::open(endpoint).map_err(failed)?;
+    let version = connection.send("GET", "/version", &[], None, Some(Duration::from_secs(5)), requests.is_empty()).map_err(failed)?;
+    let verified = match answer(version.status, &version.body) {
+        Answer::Browse(version) => !crate::legacy::is_legacy(&version) && version.get("instanceId").and_then(Value::as_str) == Some(instance),
+        Answer::Starting | Answer::Other => false,
+    };
+    if instance.is_empty() || !verified {
+        bail!(CHANGED);
     }
-    Ok(serde_json::from_slice(&response.body)?)
+    let auth = format!("Bearer {token}");
+    let mut headers = vec![("Authorization", auth.as_str())];
+    if let Some(pid) = pid {
+        headers.push(("OpenCode-Browser-Client-Pid", pid));
+    }
+    let mut outputs = Vec::with_capacity(requests.len());
+    for (index, request) in requests.iter().enumerate() {
+        let body = serde_json::to_vec(request)?;
+        let last = index + 1 == requests.len();
+        let response = connection.send("POST", "/tools/call", &headers, Some(&body), Some(Duration::from_secs(30)), last).map_err(failed)?;
+        if !(200..300).contains(&response.status) {
+            bail!("relay answered {}", response.status);
+        }
+        outputs.push(serde_json::from_slice(&response.body)?);
+    }
+    Ok(outputs)
 }
 
 /// An authorized request to the relay. A relay that is gone (restarted for an update, crashed) is started again and
@@ -417,5 +452,83 @@ mod tests {
         assert!(matches!(answer(503, br#"{"error":"OpenCode Browser relay is starting","code":"relay-starting"}"#), Answer::Starting));
         // Another program's 503 is foreign: it holds the port, so an unpinned relay moves on rather than waiting.
         assert!(matches!(answer(503, br#"{"error":"unavailable"}"#), Answer::Other));
+    }
+
+    /// A relay stand-in on one connection: answers `/version` with `version` and each tool call with an empty tab list.
+    /// The thread returns each request it read ("GET /version", "POST /tools/call Bearer tok"), and "second connection"
+    /// if anything connected again.
+    fn fake_relay(version: &'static [u8]) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let request: Vec<&str> = line.split_whitespace().take(2).collect();
+                let (mut length, mut close, mut auth) = (0, false, String::new());
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let Some((name, value)) = header.trim_end().split_once(':') else { break };
+                    match name.to_ascii_lowercase().as_str() {
+                        "content-length" => length = value.trim().parse().unwrap(),
+                        "connection" => close = value.trim() == "close",
+                        "authorization" => auth = format!(" {}", value.trim()),
+                        _ => {}
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                seen.push(format!("{}{auth}", request.join(" ")));
+                let reply: &[u8] = if request.get(1) == Some(&"/version") { version } else { br#"{"content":[{"type":"text","text":"{\"tabs\":[]}"}]}"# };
+                write!(writer, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", reply.len()).unwrap();
+                writer.write_all(reply).unwrap();
+                if close {
+                    break;
+                }
+            }
+            listener.set_nonblocking(true).unwrap();
+            if listener.accept().is_ok() {
+                seen.push("second connection".into());
+            }
+            seen
+        });
+        (endpoint, thread)
+    }
+
+    fn reads() -> [ToolCallRequest; 2] {
+        [ToolCallRequest { name: "status".into(), arguments: serde_json::json!({}) }, ToolCallRequest { name: "tabs".into(), arguments: serde_json::json!({ "action": "list" }) }]
+    }
+
+    /// S2: find's tool calls go on the connection whose `/version` named the probed Rust instance.
+    #[test]
+    fn observe_sends_its_calls_to_the_probed_instance_only() {
+        let (endpoint, relay) = fake_relay(RUST_BROWSE);
+        let outputs = observe(&endpoint, "tok", None, "0f4a2c11-8b7e-4b4d-9c1e-1a2b3c4d5e6f", &reads()).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(relay.join().unwrap(), ["GET /version", "POST /tools/call Bearer tok", "POST /tools/call Bearer tok"]);
+    }
+
+    /// S2: another relay instance on the port, or a TypeScript relay, gets the `/version` read and nothing else (no token).
+    #[test]
+    fn observe_sends_nothing_to_a_relay_that_took_the_port() {
+        let (endpoint, relay) = fake_relay(RUST_BROWSE);
+        let error = observe(&endpoint, "tok", None, "a-relay-that-stopped", &reads()).unwrap_err();
+        assert_eq!(error.to_string(), CHANGED);
+        assert_eq!(relay.join().unwrap(), ["GET /version"]);
+        // The TypeScript relay never says runtime "rust", even with the probed instanceId.
+        let (endpoint, relay) = fake_relay(OLD_BROWSE);
+        assert!(observe(&endpoint, "tok", None, "b1d0c7f0-2f6a-4f43-9d0b-6a1d0f5e8c11", &reads()).is_err());
+        assert_eq!(relay.join().unwrap(), ["GET /version"]);
+        // A probe without an instanceId binds to nothing.
+        let (endpoint, relay) = fake_relay(RUST_BROWSE);
+        assert!(observe(&endpoint, "tok", None, "", &reads()).is_err());
+        assert_eq!(relay.join().unwrap(), ["GET /version"]);
     }
 }

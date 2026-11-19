@@ -44,6 +44,12 @@ pub fn relay_token(paths: &Paths) -> anyhow::Result<String> {
     read(&file).filter(|t| valid_token(t)).ok_or_else(|| anyhow!("Could not create {}", file.display()))
 }
 
+/// The relay token when this install already has one, for readers that must leave the data root alone (`browse find`):
+/// it never creates the file or changes its mode.
+pub fn existing_relay_token(paths: &Paths) -> Option<String> {
+    std::fs::read_to_string(paths.relay_token()).ok().map(|text| text.trim().to_string()).filter(|t| valid_token(t))
+}
+
 /// Site secrets were removed in browse 0.0.17: delete what earlier versions stored (site secrets, secret profiles).
 pub fn remove_stored_secrets(paths: &Paths) {
     for folder in ["site-secrets", "secrets"] {
@@ -61,6 +67,16 @@ mod tests {
         let first = relay_token(&paths).unwrap();
         assert_eq!(first, relay_token(&paths).unwrap());
         assert_eq!(first.len(), 43);
+        let _ = std::fs::remove_dir_all(&paths.data);
+    }
+
+    #[test]
+    fn the_existing_token_reader_creates_nothing() {
+        let paths = Paths::rooted(std::env::temp_dir().join(format!("browse-relay-existing-token-{}", crate::util::random_hex(6))));
+        assert_eq!(existing_relay_token(&paths), None);
+        assert!(!paths.relay_token().exists(), "reading created the token");
+        let token = relay_token(&paths).unwrap();
+        assert_eq!(existing_relay_token(&paths), Some(token));
         let _ = std::fs::remove_dir_all(&paths.data);
     }
 

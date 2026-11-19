@@ -437,6 +437,9 @@ fn relay_call(scene: &Scene, port: u16, body: &str, extra: &[&str]) -> Command {
 /// once idle, reports the bun install while it does, and restarts on the new binary.
 #[test]
 fn bun_update_moves_the_running_binary_aside_after_a_client_died_mid_call() {
+    if fork_build() {
+        return;
+    }
     let scene = Scene::new("bun-moved");
     let root = scene.home.join(".bun");
     let global = root.join("install/global");

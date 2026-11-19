@@ -127,10 +127,31 @@ pub fn page_hosts(urls: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Whether a cookie set for `domain` may be set for `host` (a domain cookie: the host or a subdomain).
 fn cookie_applies(domain: &str, host: &str) -> bool {
     let domain = domain.to_lowercase();
     let domain = domain.trim_start_matches('.');
     !domain.is_empty() && (host == domain || host.ends_with(&format!(".{domain}")))
+}
+
+/// Whether a cookie Chrome returned is sent to `host`. CDP shows a domain cookie as `.example.com` and a host-only one as
+/// `example.com`, which goes to that exact host only, not to `app.example.com`. A partitioned (CHIPS) cookie counts by
+/// its own domain, so a third-party partition inside the page isn't read.
+fn cookie_sent_to(cookie: &Value, host: &str) -> bool {
+    match cookie_domain(cookie).map(|d| d.to_lowercase()) {
+        Some(domain) if domain.starts_with('.') => cookie_applies(&domain, host),
+        Some(domain) => !domain.is_empty() && domain == host,
+        None => false,
+    }
+}
+
+/// The `urls` a cookie read names that aren't http(s) URLs of `hosts`, the hosts its tab's pages show.
+fn foreign_cookie_urls(params: &Value, hosts: &[String]) -> Vec<String> {
+    let urls = params.get("urls").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    urls.iter()
+        .map(|url| url.as_str().unwrap_or_default().to_string())
+        .filter(|url| !page_hosts(std::slice::from_ref(url)).first().is_some_and(|host| hosts.contains(host)))
+        .collect()
 }
 
 fn cookie_domain(cookie: &Value) -> Option<String> {
@@ -182,6 +203,15 @@ pub fn guard(method: &str, params: &Value, read_only: bool, page_urls: &dyn Fn()
         && let Some(refusal) = foreground_refusal(env_on("OPENCODE_BROWSER_ALLOW_FOREGROUND"))
     {
         return Some(refusal.into());
+    }
+    if COOKIE_READS.contains(&method) && !env_on("OPENCODE_BROWSER_ALLOW_ALL_COOKIES") {
+        let hosts = page_hosts(&page_urls());
+        if let Some(outside) = foreign_cookie_urls(params, &hosts).first() {
+            return Some(format!(
+                "browse blocked {method}: cookies can only be read for the hosts of this tab's pages ({}), not {outside}. Set OPENCODE_BROWSER_ALLOW_ALL_COOKIES=1 on the relay to allow it.",
+                hosts_text(&hosts)
+            ));
+        }
     }
     if matches!(method, "Storage.setCookies" | "Network.setCookies" | "Network.setCookie") && !env_on("OPENCODE_BROWSER_ALLOW_ALL_COOKIES") {
         let cookies: Vec<&Value> = if method == "Network.setCookie" {
@@ -252,16 +282,40 @@ pub fn guard(method: &str, params: &Value, read_only: bool, page_urls: &dyn Fn()
     None
 }
 
-/// Cookie reads keep only the cookies that apply to the tab's page hosts.
-pub fn scope_result(method: &str, mut result: Value, page_urls: &dyn Fn() -> Vec<String>) -> Value {
+/// Cookie reads keep only the cookies Chrome would send to the tab's page hosts.
+pub fn scope_result(method: &str, result: Value, page_urls: &dyn Fn() -> Vec<String>) -> Value {
     if !COOKIE_READS.contains(&method) || env_on("OPENCODE_BROWSER_ALLOW_ALL_COOKIES") {
         return result;
     }
-    let hosts = page_hosts(&page_urls());
+    scope_cookies(result, &page_hosts(&page_urls()))
+}
+
+fn scope_cookies(mut result: Value, hosts: &[String]) -> Value {
     if let Some(cookies) = result.get_mut("cookies").and_then(Value::as_array_mut) {
-        cookies.retain(|cookie| cookie_domain(cookie).is_some_and(|d| hosts.iter().any(|h| cookie_applies(&d, h))));
+        cookies.retain(|cookie| hosts.iter().any(|host| cookie_sent_to(cookie, host)));
     }
     result
+}
+
+/// The Network.getCookies parameters for execute's `context.cookies(urls?)` on a tab whose related pages (same browser)
+/// show `page_urls`: the asked `urls`, all of which must be pages of those hosts, or else those pages themselves. No
+/// relay setting widens this public read (OPENCODE_BROWSER_ALLOW_ALL_COOKIES is for raw CDP); see [scope_cookie_read].
+pub fn cookie_read_params(urls: &[String], page_urls: &[String]) -> Result<Value, String> {
+    let hosts = page_hosts(page_urls);
+    if urls.is_empty() {
+        let pages: Vec<&String> = page_urls.iter().filter(|url| !page_hosts(std::slice::from_ref(url)).is_empty()).collect();
+        return Ok(serde_json::json!({ "urls": pages }));
+    }
+    let asked = serde_json::json!({ "urls": urls });
+    match foreign_cookie_urls(&asked, &hosts).first() {
+        Some(outside) => Err(format!("context.cookies() can only read the cookies of this tab's pages ({}), not {outside}", hosts_text(&hosts))),
+        None => Ok(asked),
+    }
+}
+
+/// The cookies of a [cookie_read_params] read that Chrome would send to the hosts of `page_urls`.
+pub fn scope_cookie_read(result: Value, page_urls: &[String]) -> Value {
+    scope_cookies(result, &page_hosts(page_urls))
 }
 
 /// Browser-internal or other-extension documents chrome.debugger refuses to expose.
@@ -293,7 +347,7 @@ mod tests {
         assert!(guard("Network.setCookie", &json!({"domain": "evil.com"}), false, &urls).is_some());
         assert!(guard("DOMStorage.getDOMStorageItems", &json!({"storageId": {"securityOrigin": "https://app.example.com"}}), false, &urls).is_none());
         assert!(guard("DOMStorage.getDOMStorageItems", &json!({"storageId": {"securityOrigin": "https://bank.com"}}), false, &urls).is_some());
-        let scoped = scope_result("Network.getCookies", json!({"cookies": [{"domain": "example.com"}, {"domain": "bank.com"}]}), &urls);
+        let scoped = scope_result("Network.getCookies", json!({"cookies": [{"domain": ".example.com"}, {"domain": "bank.com"}]}), &urls);
         assert_eq!(scoped["cookies"].as_array().unwrap().len(), 1);
     }
 
@@ -309,6 +363,32 @@ mod tests {
         let scoped = scope_result("Network.getCookies", result, &urls);
         let names: Vec<&str> = scoped["cookies"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
         assert_eq!(names, ["chip"]);
+    }
+
+    /// S5: a host-only cookie goes to its exact host only, and a read can't name urls outside the tab's pages.
+    #[test]
+    fn cookie_reads_keep_host_only_cookies_to_their_host_and_refuse_other_urls() {
+        let pages = vec!["https://app.example.com/x".to_string(), "about:blank".to_string()];
+        let result = || json!({ "cookies": [
+            { "name": "wide", "domain": ".example.com" },
+            { "name": "apex", "domain": "example.com" },
+            { "name": "mine", "domain": "app.example.com" },
+        ] });
+        let names = |scoped: Value| scoped["cookies"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str().map(str::to_string)).collect::<Vec<_>>();
+        assert_eq!(names(scope_cookie_read(result(), &pages)), ["wide", "mine"]);
+        assert_eq!(names(scope_result("Network.getCookies", result(), &|| pages.clone())), ["wide", "mine"]);
+        // context.cookies() without urls asks for the tab's http(s) pages; with urls, only those pages' hosts.
+        assert_eq!(cookie_read_params(&[], &pages).unwrap(), json!({ "urls": ["https://app.example.com/x"] }));
+        assert_eq!(cookie_read_params(&["https://app.example.com/y".into()], &pages).unwrap(), json!({ "urls": ["https://app.example.com/y"] }));
+        for outside in ["https://example.com/", "https://bank.com/", "file:///etc/passwd"] {
+            let refused = cookie_read_params(&["https://app.example.com/".into(), outside.into()], &pages).unwrap_err();
+            assert!(refused.contains(outside), "{refused}");
+        }
+        // Raw CDP reads are refused the same way unless the relay allows all cookies.
+        if std::env::var_os("OPENCODE_BROWSER_ALLOW_ALL_COOKIES").is_none() {
+            assert!(guard("Network.getCookies", &json!({ "urls": ["https://bank.com/"] }), false, &|| pages.clone()).is_some());
+            assert!(guard("Network.getCookies", &json!({ "urls": ["https://app.example.com/"] }), false, &|| pages.clone()).is_none());
+        }
     }
 
     #[test]

@@ -55,6 +55,12 @@ const NON_SECRET_HEADERS: &[&str] = &[
 const NON_SECRET_FIELDS: &[&str] = &["authuser"];
 const COOKIE_ATTRIBUTES: &[&str] =
     &["domain", "path", "expires", "max-age", "samesite", "priority", "partitioned", "secure", "httponly"];
+// How a field name that names a credential ends (`token`, `X-OTP`, `api_key`, `accessToken`, cookie `sessionid`). A
+// secret-looking name that only mentions one (`prompt_tokens`, `session_count`, `cookie_consent`) holds data.
+const CREDENTIAL_ENDINGS: &[&str] = &[
+    "token", "secret", "key", "password", "passwd", "pwd", "passcode", "otp", "pin", "code", "session", "sessionid",
+    "session-id", "session_id", "auth", "authorization", "credential", "credentials", "csrf", "xsrf", "signature", "sig",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
@@ -71,6 +77,13 @@ fn is_secret_field(name: &str) -> bool {
     is_secret_name(name) && !NON_SECRET_FIELDS.iter().any(|field| field.eq_ignore_ascii_case(name))
 }
 
+/// A field, header or cookie named for the credential it holds: its value is redacted wherever it reappears as a
+/// number, however short (the exact-number floor is for values captured under ordinary names, like `theme=1`).
+fn names_credential(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SECRET_HEADERS.contains(&lower.as_str()) || (is_secret_field(&lower) && CREDENTIAL_ENDINGS.iter().any(|end| lower.ends_with(end)))
+}
+
 #[derive(Default)]
 pub struct SecretRedactor {
     known: HashSet<String>,
@@ -79,8 +92,9 @@ pub struct SecretRedactor {
     named_fields: HashSet<String>,
     // Passwords and one-time codes are replaced at any length, unlike short reusable captures.
     always: HashSet<String>,
-    // Credentials a header names outright (Authorization, X-API-Key, X-OTP, ...): replaced as scalars at any length.
-    named_headers: HashSet<String>,
+    // Values held under a name that names a credential (names_credential), from any header, field or cookie: redacted
+    // as numbers at any length.
+    named: HashSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -201,7 +215,8 @@ impl SecretRedactor {
     }
 
     /// Redacts scalars that equal a known value: numbers and booleans of at least MINIMUM_KNOWN_NUMBER_LENGTH
-    /// characters, or any length when they were a password, a one-time code or a credential header's value.
+    /// characters, numbers of any length that a credential-named field held, and any value that was a password or a
+    /// one-time code. A boolean is never a credential, so a credential-named `true` doesn't make every `true` one.
     pub fn redact_scalar(&self, value: &Value) -> Value {
         let text = match value {
             Value::Number(number) => number.to_string(),
@@ -209,7 +224,7 @@ impl SecretRedactor {
             _ => return value.clone(),
         };
         let known = self.always.contains(&text)
-            || self.named_headers.contains(&text)
+            || (value.is_number() && self.named.contains(&text))
             || (text.chars().count() >= MINIMUM_KNOWN_NUMBER_LENGTH && self.known.contains(&text));
         if known { Value::String(REDACTED.into()) } else { value.clone() }
     }
@@ -222,24 +237,20 @@ impl SecretRedactor {
         }
     }
 
+    /// Scrubs `value`, classified by the name it was found under: a credential name exempts it from the number floor,
+    /// a password or one-time-code name makes it redacted everywhere at any length.
     fn scrub(&mut self, value: &str, field: &str) -> String {
         if value.is_empty() {
             return String::new();
         }
         self.known.insert(value.to_string());
+        if names_credential(field) {
+            self.named.insert(value.to_string());
+        }
         if ONE_TIME_FIELD.is_match(field) {
             self.always.insert(value.to_string());
         }
         SENTINEL.to_string()
-    }
-
-    /// A credential header's value: scrubbed under the header's name, so a password or one-time-code header keeps that
-    /// class, and remembered as a credential named outright.
-    fn scrub_header(&mut self, value: &str, header: &str) -> String {
-        if !value.is_empty() {
-            self.named_headers.insert(value.to_string());
-        }
-        self.scrub(value, header)
     }
 
     /// A secret-named URL query or fragment field value, remembered for the body-string pass too.
@@ -326,7 +337,8 @@ impl SecretRedactor {
                         if cookie_value.is_empty() {
                             return part.to_string();
                         }
-                        format!("{cookie_name}={}", self.scrub(cookie_value, ""))
+                        // The cookie's own name classifies it: `otp=1234` is a one-time code, `theme=1` is data.
+                        format!("{cookie_name}={}", self.scrub(cookie_value, cookie_name))
                     })
                     .collect::<Vec<_>>()
                     .join("; ")
@@ -341,11 +353,11 @@ impl SecretRedactor {
                 let scheme = &value[..index];
                 let credential = value[index..].trim_start();
                 if !credential.is_empty() {
-                    return format!("{scheme} {}", self.scrub_header(credential, &lower));
+                    return format!("{scheme} {}", self.scrub(credential, &lower));
                 }
             }
         if SECRET_HEADERS.contains(&lower.as_str()) || is_secret_name(&lower) {
-            return self.scrub_header(value, &lower);
+            return self.scrub(value, &lower);
         }
         value.to_string()
     }
@@ -723,5 +735,37 @@ mod tests {
         assert_eq!(redactor.protect_url("https://mail.google.com/mail/?authuser=2&auth_token=abc"), "https://mail.google.com/mail/?authuser=2&auth_token=[redacted]");
         assert_eq!(redactor.protect_url("https://x.test/#authuser=0&access_token=xyz"), "https://x.test/#authuser=0&access_token=[redacted]");
         assert_eq!(redactor.redact_scalar(&serde_json::json!(2)), serde_json::json!(2));
+    }
+
+    /// S4: a short credential named outright in a JSON body, form, query or fragment is redacted where it comes back as a
+    /// number under an ordinary key; names that only mention a credential (`prompt_tokens`) keep the floor.
+    #[test]
+    fn short_named_credentials_are_redacted_as_numbers_from_any_source() {
+        let mut redactor = SecretRedactor::new();
+        redactor.protect_body(r#"{"token":"1234","prompt_tokens":12,"auth":true}"#, Some("application/json"));
+        redactor.protect_body("api_key=987&page=3", Some("application/x-www-form-urlencoded"));
+        redactor.protect_url("https://x.test/cb?access_token=55#csrf=77");
+        for credential in [1234, 987, 55, 77] {
+            assert_eq!(redactor.redact_scalar(&serde_json::json!(credential)), serde_json::json!(REDACTED), "{credential}");
+        }
+        // Data under names that mention a credential, ordinary fields, and booleans stay.
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(12)), serde_json::json!(12));
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(3)), serde_json::json!(3));
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(true)), serde_json::json!(true));
+    }
+
+    /// S4: a cookie's name classifies its value. `otp=1234` stays a one-time code (redacted in text and as a number at
+    /// any length), `sessionid=42` a credential, and `theme=1` or `cookie_consent=0` ordinary data under the floor.
+    #[test]
+    fn cookie_names_classify_their_values() {
+        let mut redactor = SecretRedactor::new();
+        let protected = redactor.protect_headers(&[header("Cookie", "otp=1234; sessionid=42; theme=1; cookie_consent=0")]);
+        assert_eq!(protected[0].value, "otp=[redacted]; sessionid=[redacted]; theme=[redacted]; cookie_consent=[redacted]");
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(1234)), serde_json::json!(REDACTED));
+        assert_eq!(redactor.redact_text("your code is 1234"), "your code is [redacted]");
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(42)), serde_json::json!(REDACTED));
+        assert_eq!(redactor.redact_text("answer 42"), "answer 42");
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(1)), serde_json::json!(1));
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(0)), serde_json::json!(0));
     }
 }

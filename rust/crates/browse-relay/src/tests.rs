@@ -197,7 +197,7 @@ fn fake_extension_with_urls(socket: Socket, next_tab: i64, urls: TargetUrls) -> 
                         json!({ "targetInfo": { "targetId": format!("T{tab}"), "type": "page", "url": url, "title": "", "attached": true } })
                     }
                     "Runtime.evaluate" => json!({ "result": { "type": "number", "value": 42 } }),
-                    "Network.getCookies" => json!({ "cookies": [{ "domain": "example.com" }, { "domain": "bank.com" }] }),
+                    "Network.getCookies" => json!({ "cookies": [{ "domain": "example.com" }, { "domain": "bank.com" }, { "domain": ".example.com" }] }),
                     "Big.method" => json!({ "result": { "type": "string", "value": "x".repeat(params["params"]["bytes"].as_u64().unwrap_or(0) as usize) } }),
                     "Unattachable.method" => {
                         let _ = replies.send(json!({ "id": id, "error": "Cannot attach to this target." }));
@@ -299,9 +299,9 @@ async fn pairs_with_a_token_and_routes_cdp_per_tab_and_child_session() {
 
     events.send(json!({ "method": "debugger.event", "params": { "tabId": 7, "method": "Page.frameNavigated", "params": { "frame": { "id": "T7", "url": "https://example.com/" } } } })).unwrap();
     eventually("the url to update", || relay.st().tabs.get(&7).is_some_and(|t| t.url == "https://example.com/")).await;
-    // On example.com, the tab's cookie read (context.cookies() sends this) keeps example.com's and passes the urls on.
+    // On example.com, a raw cookie read keeps the cookies example.com gets and passes the urls on.
     let scoped = cdp.send("Network.getCookies", json!({ "urls": ["https://example.com/a"] }), None).await.unwrap();
-    assert_eq!(scoped["cookies"], json!([{ "domain": "example.com" }]), "bank.com's cookie is dropped");
+    assert_eq!(scoped["cookies"], json!([{ "domain": "example.com" }, { "domain": ".example.com" }]), "bank.com's cookie is dropped");
     assert_eq!(seen.cdp("Network.getCookies").last().unwrap()["params"]["params"]["urls"], json!(["https://example.com/a"]));
 
     let gone = cdp.send("Broken.method", json!({}), None).await.unwrap_err();
@@ -314,6 +314,47 @@ async fn pairs_with_a_token_and_routes_cdp_per_tab_and_child_session() {
             _ => continue,
         }
     }
+}
+
+/// S5: context.cookies() (Browser::cookies) reads only hosts of the tab's related pages in its own browser: a group of
+/// the same name in another profile adds nothing, a host-only cookie of the parent domain isn't the subdomain's, and a
+/// url outside those hosts is refused before Chrome is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tab_cookies_stay_in_the_tabs_browser_and_hosts() {
+    let h = harness().await;
+    let port = h.handle.port();
+    let relay = h.handle.relay.clone();
+    let first_socket = pair_with_token(port, &h.paths, "profile-one").await;
+    let (first_seen, first_events) = fake_extension(first_socket, 500);
+    first_events.send(json!({ "method": "ready" })).unwrap();
+    assert!(relay.wait_until(Duration::from_secs(5), |st| st.links.iter().any(|l| l.connected())).await);
+    let second_socket = pair_with_token(port, &h.paths, "profile-two").await;
+    let (second_seen, second_events) = fake_extension(second_socket, 600);
+    second_events.send(json!({ "method": "ready" })).unwrap();
+    assert!(relay.wait_until(Duration::from_secs(10), |st| st.links.iter().filter(|l| l.connected()).count() == 2).await);
+
+    let browser = h.handle.browser();
+    let shop = |name: &str| TabOptions { group: Some("shop".into()), browser: Some(name.into()), ..TabOptions::default() };
+    let mine = browser.open_tab(None, &shop("test-chrome")).await.unwrap().tab;
+    let theirs = browser.open_tab(None, &shop("test-chrome-2")).await.unwrap().tab;
+    let navigated = |tab: i64, url: &str| json!({ "method": "debugger.event", "params": { "tabId": tab, "method": "Page.frameNavigated", "params": { "frame": { "id": format!("T{tab}"), "url": url } } } });
+    first_events.send(navigated(mine, "https://app.example.com/")).unwrap();
+    second_events.send(navigated(theirs, "https://bank.com/")).unwrap();
+    eventually("both urls", || {
+        let st = relay.st();
+        st.tabs.get(&mine).is_some_and(|t| t.url == "https://app.example.com/") && st.tabs.get(&theirs).is_some_and(|t| t.url == "https://bank.com/")
+    })
+    .await;
+
+    // The fake answers example.com (host-only), bank.com and .example.com: app.example.com gets only the domain cookie.
+    let cookies = browser.cookies(mine, &[]).await.unwrap();
+    assert_eq!(cookies, json!([{ "domain": ".example.com" }]));
+    assert_eq!(first_seen.cdp("Network.getCookies").last().unwrap()["params"]["params"]["urls"], json!(["https://app.example.com/"]), "the other profile's shop tab adds no url");
+    let asked = first_seen.cdp("Network.getCookies").len();
+    let refused = browser.cookies(mine, &["https://bank.com/".into()]).await.unwrap_err();
+    assert!(refused.to_string().contains("bank.com"), "{refused}");
+    assert_eq!(first_seen.cdp("Network.getCookies").len(), asked, "a refused read never reaches the browser");
+    assert!(second_seen.cdp("Network.getCookies").is_empty());
 }
 
 #[tokio::test]

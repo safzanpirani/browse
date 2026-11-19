@@ -50,16 +50,9 @@ impl TabCdp {
         }
     }
 
-    /// The pages cookies and storage may be used for: this tab's, its opener's and popups', and its group's.
+    /// The pages cookies and storage may be used for: see [related_page_urls].
     fn page_urls(&self) -> Vec<String> {
-        let st = self.relay.st();
-        let Some(me) = st.tabs.get(&self.tab) else { return Vec::new() };
-        let group = me.options.group.clone();
-        st.tabs
-            .values()
-            .filter(|t| t.id == self.tab || t.opener == Some(self.tab) || me.opener == Some(t.id) || (group.is_some() && t.owner == crate::relay::Owner::Relay && t.options.group == group))
-            .map(|t| t.url.clone())
-            .collect()
+        related_page_urls(&self.relay, self.tab)
     }
 
     /// A background tab's screenshot can wait for a frame that never comes; tiny screenshots nudge it along.
@@ -171,4 +164,31 @@ impl Cdp for TabCdp {
             None => broadcast::channel(1).1,
         }
     }
+}
+
+/// The pages cookies and storage of `tab` may be used for: its own, its opener's and popups', and its group's, all in
+/// the tab's own browser. A group's name is per browser: the same name in another profile adds nothing.
+fn related_page_urls(relay: &Relay, tab: TabId) -> Vec<String> {
+    let st = relay.st();
+    let Some(me) = st.tabs.get(&tab) else { return Vec::new() };
+    let group = me.options.group.clone();
+    st.tabs
+        .values()
+        .filter(|t| t.link_key == me.link_key)
+        .filter(|t| t.id == tab || t.opener == Some(tab) || me.opener == Some(t.id) || (group.is_some() && t.owner == crate::relay::Owner::Relay && t.options.group == group))
+        .map(|t| t.url.clone())
+        .collect()
+}
+
+/// execute's `context.cookies(urls?)` for `tab`: Network.getCookies in the tab's browser for `urls` (or its related
+/// pages), keeping only the cookies Chrome sends to those pages' hosts. The scope is fixed: the relay's
+/// OPENCODE_BROWSER_ALLOW_ALL_COOKIES switch is for raw CDP, not this read.
+pub async fn tab_cookies(relay: &Relay, tab: TabId, urls: &[String]) -> anyhow::Result<Value> {
+    let pages = related_page_urls(relay, tab);
+    let params = crate::guardrails::cookie_read_params(urls, &pages).map_err(anyhow::Error::msg)?;
+    if params["urls"].as_array().is_none_or(Vec::is_empty) {
+        return Ok(json!([]));
+    }
+    let result = relay.debugger(tab, None, "Network.getCookies", params, None).await.map_err(|error| anyhow::anyhow!("{}", cdp_error(error)))?;
+    Ok(crate::guardrails::scope_cookie_read(result, &pages).get("cookies").cloned().unwrap_or_else(|| json!([])))
 }

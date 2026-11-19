@@ -32,30 +32,57 @@ pub fn request(
     body: Option<&[u8]>,
     timeout: Option<Duration>,
 ) -> Result<Response, Error> {
-    let authority = endpoint.trim_start_matches("http://").trim_end_matches('/');
-    let addr = authority
-        .to_socket_addrs()
-        .map_err(Error::Unreachable)?
-        .next()
-        .ok_or_else(|| Error::Unreachable(io::Error::other("no address")))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(Error::Unreachable)?;
-    stream.set_read_timeout(timeout).map_err(Error::Io)?;
-    stream.set_nodelay(true).ok();
-    let body = body.unwrap_or_default();
-    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nAccept: application/json\r\n");
-    for (name, value) in headers {
-        head.push_str(&format!("{name}: {value}\r\n"));
-    }
-    if method != "GET" {
-        head.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", body.len()));
-    }
-    head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body)).map_err(Error::Io)?;
-    read_response(stream).map_err(Error::Io)
+    Connection::open(endpoint)?.send(method, path, headers, body, timeout, true)
 }
 
-fn read_response(stream: TcpStream) -> io::Result<Response> {
-    let mut reader = BufReader::new(stream);
+/// One connection to the relay, kept open between requests: every request on it reaches the process that answered
+/// the first one, so a reader that checked that process's `/version` knows who gets the rest.
+pub struct Connection {
+    authority: String,
+    reader: BufReader<TcpStream>,
+}
+
+impl Connection {
+    pub fn open(endpoint: &str) -> Result<Self, Error> {
+        let authority = endpoint.trim_start_matches("http://").trim_end_matches('/').to_owned();
+        let addr = authority
+            .to_socket_addrs()
+            .map_err(Error::Unreachable)?
+            .next()
+            .ok_or_else(|| Error::Unreachable(io::Error::other("no address")))?;
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(Error::Unreachable)?;
+        stream.set_nodelay(true).ok();
+        Ok(Self { authority, reader: BufReader::new(stream) })
+    }
+
+    /// One request on this connection; `close` asks the server to close it after answering.
+    pub fn send(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        timeout: Option<Duration>,
+        close: bool,
+    ) -> Result<Response, Error> {
+        let stream = self.reader.get_mut();
+        stream.set_read_timeout(timeout).map_err(Error::Io)?;
+        let body = body.unwrap_or_default();
+        let connection = if close { "close" } else { "keep-alive" };
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: {connection}\r\nAccept: application/json\r\n", self.authority);
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        if method != "GET" {
+            head.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", body.len()));
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body)).map_err(Error::Io)?;
+        read_response(&mut self.reader).map_err(Error::Io)
+    }
+}
+
+fn read_response(reader: &mut BufReader<TcpStream>) -> io::Result<Response> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let status = line

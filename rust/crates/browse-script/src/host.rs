@@ -331,15 +331,11 @@ async fn run_async(ctx: ToolContext, tools: Arc<HashMap<String, Arc<dyn Tool>>>,
             Ok(Value::Null)
         }
         "query" => crate::query::run(&ctx, &payload).await.map_err(|e| format!("{e:#}")),
-        // context.cookies(): Network.getCookies on the tab's own CDP connection, so the tab's profile answers and the
-        // relay's guardrails keep only the cookies of the hosts the tab's pages show.
+        // context.cookies(): the tab's browser reads them, limited to the hosts its related pages show (Browser::cookies).
         "cookies" => {
             let tab = tab_argument(&ctx, &payload).map_err(|e| format!("{e:#}"))?;
-            let urls: Vec<Value> = payload["urls"].as_array().map(|list| list.iter().filter(|u| u.is_string()).cloned().collect()).unwrap_or_default();
-            let params = if urls.is_empty() { json!({}) } else { json!({ "urls": urls }) };
-            let cdp = ctx.browser.cdp(tab).await.map_err(|e| format!("{e:#}"))?;
-            let result = cdp.send("Network.getCookies", params, None).await.map_err(|e| format!("context.cookies() failed: {e}"))?;
-            Ok(result.get("cookies").cloned().unwrap_or_else(|| json!([])))
+            let urls: Vec<String> = payload["urls"].as_array().map(|list| list.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+            ctx.browser.cookies(tab, &urls).await.map_err(|e| format!("context.cookies() failed: {e:#}"))
         }
         other => Err(format!("unknown operation {other}")),
     }

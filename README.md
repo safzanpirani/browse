@@ -30,7 +30,11 @@ It works in Chrome, Edge, Brave, Arc, Helium, Vivaldi, Opera and Chromium.
   build and the omp browse skill (`rust/crates/browse/src/omp-skill.md` with the paired browsers' table);
   `browse uninstall --client omp` removes them.
 - Network captures treat `x-goog-authuser` and `authuser` as data, and short known numbers (`1`, `true`) stay data
-  unless they were a password or one-time code. Storage cookie commands use the tab's own profile.
+  unless a field, header or cookie named them a credential (`token`, `X-OTP`, `otp=`), a password or a one-time code.
+- `execute` has `context.cookies(urls?)` (and `page.context().cookies()` for that page's tab): the tab's own
+  profile's cookies, for the hosts of the tab's pages and its opener, popups and group in the same browser only.
+  `OPENCODE_BROWSER_ALLOW_ALL_COOKIES` doesn't widen it. Writing cookies (`addCookies`, `clearCookies`) stays
+  unsupported.
 - `skills/browse-remote`: ampere drives this Mac's relay through one ssh tunnel on the same port, with a Linux build
   of the same browse.
 
@@ -335,7 +339,7 @@ when it starts: it stops after 30 minutes without use, or run `browse restart` f
 
 | Variable | Effect |
 | --- | --- |
-| `OPENCODE_BROWSER_ALLOW_ALL_COOKIES=1` | Let tabs read and write every cookie in the profile |
+| `OPENCODE_BROWSER_ALLOW_ALL_COOKIES=1` | Let the relay's own CDP calls read and write every cookie in the profile (`context.cookies()` stays scoped) |
 | `OPENCODE_BROWSER_ALLOW_ALL_STORAGE=1` | Let tabs use every site's storage, and load resources from any host with your credentials |
 | `OPENCODE_BROWSER_ALLOW_FOREGROUND=1` | Let `page.bringToFront()` in `execute` raise the tab and its window |
 | `OPENCODE_BROWSER_ALLOW_FILE_URLS=1` | Allow `file:` URLs |

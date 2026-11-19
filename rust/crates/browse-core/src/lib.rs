@@ -179,6 +179,12 @@ pub trait Browser: Send + Sync {
     /// ("recording"), keyed per kind. While any key is busy the tab counts as busy, so idle shutdown, idle tab cleanup
     /// and relay restarts wait for it. Called again with `false` when the activity ends for any reason.
     fn set_busy(&self, _tab: TabId, _key: &str, _busy: bool) {}
+    /// execute's `context.cookies(urls?)`: the tab's cookies (CDP's Network.Cookie objects) for `urls`, or for the
+    /// tab's pages when empty, limited to the hosts of the pages related to the tab in its own browser. No relay
+    /// setting widens it.
+    async fn cookies(&self, _tab: TabId, _urls: &[String]) -> anyhow::Result<Value> {
+        anyhow::bail!("this browser can't read cookies")
+    }
 
     /// The tab a tool argument names: a numeric id, or (in a relay that supports them) a caller-chosen id like
     /// `work-mail`. Browsers without chosen ids accept integers only.

@@ -436,6 +436,13 @@ impl Browser for RelayBrowser {
         self.0.run_handoff(tab, message, crate::presentation::DEFAULT_HANDOFF_TIMEOUT).await
     }
 
+    async fn cookies(&self, tab: TabId, urls: &[String]) -> anyhow::Result<Value> {
+        self.0.await_tab(tab).await;
+        self.0.usable_tab(tab)?;
+        self.0.note_call_tab(tab);
+        crate::cdp::tab_cookies(&self.0, tab, urls).await
+    }
+
     fn set_busy(&self, tab: TabId, key: &str, busy: bool) {
         let changed = {
             let mut st = self.0.st();

@@ -49,28 +49,27 @@ fn live() -> Value {
             "tabs": [],
         }),
         relay::Probe::Running(probed) => {
-            // `status` names the browsers; `tabs` lists the tabs with their current titles. Each is one request to the
-            // relay that answered the probe: nothing here starts, replaces or retries a relay.
-            let answer = |name: &str, arguments: Value| {
-                relay::call_running(&ToolCallRequest { name: name.into(), arguments }).ok().and_then(|output| {
-                    output.content.iter().find_map(|content| match content {
-                        Content::Text { text } => serde_json::from_str::<Value>(text).ok(),
-                        Content::Image { .. } => None,
-                    })
+            // `status` names the browsers; `tabs` lists the tabs with their current titles. Both go on one connection
+            // that first finds the relay the probe saw (by instanceId), with the token only if one exists: nothing here
+            // starts, replaces or retries a relay, and a relay that took the port since the probe gets nothing.
+            let instance = probed.get("instanceId").and_then(Value::as_str).unwrap_or_default();
+            let requests = [ToolCallRequest { name: "status".into(), arguments: json!({}) }, ToolCallRequest { name: "tabs".into(), arguments: json!({ "action": "list" }) }];
+            let json_of = |output: &browse_core::ToolOutput| {
+                output.content.iter().find_map(|content| match content {
+                    Content::Text { text } => serde_json::from_str::<Value>(text).ok(),
+                    Content::Image { .. } => None,
                 })
             };
-            let (status, tabs) = (answer("status", json!({})), answer("tabs", json!({ "action": "list" })));
-            // The answers count only if the same relay still runs: another (a TypeScript one, after a restart) may
-            // have taken the port between the requests.
-            let same = |now: &Value| now["pid"] == probed["pid"] && now["version"] == probed["version"];
-            match (status, tabs, relay::probe()) {
-                (Some(status), Some(tabs), relay::Probe::Running(now)) if same(&now) => json!({
-                    "relay": { "running": true, "endpoint": endpoint },
-                    "browsers": status["extension"]["browsers"],
-                    "tabs": tabs["tabs"],
-                }),
-                (_, _, relay::Probe::Running(now)) if !same(&now) => down("The relay changed while find read it; run find again.".into()),
-                _ => down("The relay didn't answer status and tabs.".into()),
+            match relay::call_observed(instance, &requests) {
+                Ok(outputs) => match (outputs.first().and_then(json_of), outputs.get(1).and_then(json_of)) {
+                    (Some(status), Some(tabs)) => json!({
+                        "relay": { "running": true, "endpoint": endpoint },
+                        "browsers": status["extension"]["browsers"],
+                        "tabs": tabs["tabs"],
+                    }),
+                    _ => down("The relay didn't answer status and tabs.".into()),
+                },
+                Err(error) => down(format!("{error:#}")),
             }
         }
     }

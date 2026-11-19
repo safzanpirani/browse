@@ -417,7 +417,8 @@
     _query(selector, fn, arg) { return hostAsync("query", { selector, function: fn, arg: arg ?? {}, tab: this._args({}).tab }) }
     toString() { return `Page(${this._hasTab() ? `tab ${this._tab}` : "no tab yet"})` }
 
-    context() { return contextObject }
+    /** The context, with cookies() reading this page's tab (another page's profile can differ from the default page's). */
+    context() { return this === defaultPage ? contextObject : Object.assign(Object.create(contextObject), { cookies: (urls) => cookiesOf(this, urls) }) }
     mainFrame() { return this }
     frames() { return [this] }
     isClosed() {
@@ -628,6 +629,24 @@
   }
   defaultPage = config.tab === null || config.tab === undefined ? new Page(undefined) : pageFor(config.tab)
 
+  /** The cookies of `page`'s tab, for `urls` or its pages'; the relay keeps only those of the hosts its related pages show. */
+  async function cookiesOf(page, urls) {
+    const list = urls === undefined ? [] : (Array.isArray(urls) ? urls : [urls]).map(String)
+    const cookies = await hostAsync("cookies", page._args({ urls: list }))
+    return (cookies || []).map((c) => {
+      const partition = c.partitionKey == null ? {}
+        : typeof c.partitionKey === "string" ? { partitionKey: c.partitionKey }
+        // Playwright keeps Chromium's cross-site flag beside the top-level site: two CHIPS partitions can share a site.
+        : { partitionKey: c.partitionKey.topLevelSite, _crHasCrossSiteAncestor: !!c.partitionKey.hasCrossSiteAncestor }
+      return {
+        name: c.name, value: c.value, domain: c.domain, path: c.path,
+        expires: c.session || c.expires === undefined ? -1 : c.expires,
+        httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite: c.sameSite || "Lax",
+        ...partition,
+      }
+    })
+  }
+
   const contextObject = {
     async newPage() {
       const opened = await tool("tabs", { action: "new" })
@@ -642,17 +661,8 @@
     },
     browser() { return browserObject },
     async close() { warn("context.close() does nothing: the browser is the user's. Close tabs you opened with page.close()") },
-    /** The cookies of `page`'s tab (its profile), for `urls` or the page's own; the relay keeps only those of the hosts its pages show. */
-    async cookies(urls) {
-      const list = urls === undefined ? [] : (Array.isArray(urls) ? urls : [urls]).map(String)
-      const cookies = await hostAsync("cookies", defaultPage._args({ urls: list }))
-      return (cookies || []).map((c) => ({
-        name: c.name, value: c.value, domain: c.domain, path: c.path,
-        expires: c.session || c.expires === undefined ? -1 : c.expires,
-        httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite: c.sameSite || "Lax",
-        ...(c.partitionKey ? { partitionKey: typeof c.partitionKey === "string" ? c.partitionKey : c.partitionKey.topLevelSite } : {}),
-      }))
-    },
+    /** The cookies of the default page's tab (its profile), for `urls` or its pages'; see cookiesOf. */
+    cookies(urls) { return cookiesOf(defaultPage, urls) },
     addCookies() { unsupported("context.addCookies()", "cookies stay in the user's browser") },
     clearCookies() { unsupported("context.clearCookies()", "cookies stay in the user's browser") },
     storageState() { unsupported("context.storageState()", "cookies and storage stay in the user's browser") },
