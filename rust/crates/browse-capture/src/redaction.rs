@@ -84,6 +84,20 @@ fn names_credential(name: &str) -> bool {
     SECRET_HEADERS.contains(&lower.as_str()) || (is_secret_field(&lower) && CREDENTIAL_ENDINGS.iter().any(|end| lower.ends_with(end)))
 }
 
+/// A header named for a credential, also when a suffix or version follows the credential word (`X-Auth-Token-V2`,
+/// `X-Api-Key.2`): any `-`, `_` or `.` separated part may end in it. Body and form fields keep the whole-name rule, so
+/// `session_count` there stays data.
+fn header_names_credential(lower: &str) -> bool {
+    names_credential(lower)
+        || (is_secret_name(lower) && lower.split(['-', '_', '.']).any(|part| CREDENTIAL_ENDINGS.iter().any(|end| part.ends_with(end))))
+}
+
+/// A value without one pair of surrounding double quotes (`otp="1234"` holds `1234`): the bare credential is what
+/// reappears in JSON numbers and prose.
+fn unquote(value: &str) -> &str {
+    value.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).unwrap_or(value)
+}
+
 #[derive(Default)]
 pub struct SecretRedactor {
     known: HashSet<String>,
@@ -240,17 +254,24 @@ impl SecretRedactor {
     /// Scrubs `value`, classified by the name it was found under: a credential name exempts it from the number floor,
     /// a password or one-time-code name makes it redacted everywhere at any length.
     fn scrub(&mut self, value: &str, field: &str) -> String {
+        self.remember(value, names_credential(field), ONE_TIME_FIELD.is_match(field));
+        if value.is_empty() { String::new() } else { SENTINEL.to_string() }
+    }
+
+    /// Remembers a scrubbed value without its surrounding quotes: `named` exempts it from the number floor, `always`
+    /// redacts it everywhere at any length.
+    fn remember(&mut self, value: &str, named: bool, always: bool) {
+        let value = unquote(value);
         if value.is_empty() {
-            return String::new();
+            return;
         }
         self.known.insert(value.to_string());
-        if names_credential(field) {
+        if named {
             self.named.insert(value.to_string());
         }
-        if ONE_TIME_FIELD.is_match(field) {
+        if always {
             self.always.insert(value.to_string());
         }
-        SENTINEL.to_string()
     }
 
     /// A secret-named URL query or fragment field value, remembered for the body-string pass too.
@@ -357,7 +378,11 @@ impl SecretRedactor {
                 }
             }
         if SECRET_HEADERS.contains(&lower.as_str()) || is_secret_name(&lower) {
-            return self.scrub(value, &lower);
+            let scrubbed = self.scrub(value, &lower);
+            if header_names_credential(&lower) {
+                self.remember(value, true, false);
+            }
+            return scrubbed;
         }
         value.to_string()
     }
@@ -767,5 +792,31 @@ mod tests {
         assert_eq!(redactor.redact_text("answer 42"), "answer 42");
         assert_eq!(redactor.redact_scalar(&serde_json::json!(1)), serde_json::json!(1));
         assert_eq!(redactor.redact_scalar(&serde_json::json!(0)), serde_json::json!(0));
+    }
+
+    /// Round 3: a quoted cookie value is remembered without its quotes, so `otp="1234"` also catches a bare `1234` in
+    /// prose and as a JSON number, and a quoted credential cookie (`sessionid="42"`) as a number.
+    #[test]
+    fn quoted_cookie_values_are_remembered_bare() {
+        let mut redactor = SecretRedactor::new();
+        let protected = redactor.protect_headers(&[header("Cookie", r#"otp="1234"; sessionid="42""#)]);
+        assert_eq!(protected[0].value, "otp=[redacted]; sessionid=[redacted]");
+        assert_eq!(redactor.redact_text("your code is 1234"), "your code is [redacted]");
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(1234)), serde_json::json!(REDACTED));
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(42)), serde_json::json!(REDACTED));
+    }
+
+    /// Round 3: a credential header with a suffix or version after the credential word (`X-Auth-Token-V2`,
+    /// `X-Api-Key.2`) names its value, so a short numeric echo is redacted; ordinary small numbers stay data.
+    #[test]
+    fn versioned_credential_headers_name_their_values() {
+        let mut redactor = SecretRedactor::new();
+        let protected = redactor.protect_headers(&[header("X-Auth-Token-V2", "4242"), header("X-Api-Key.2", "77"), header("X-Request-Id", "5")]);
+        assert_eq!(protected[0].value, REDACTED);
+        assert_eq!(protected[1].value, REDACTED);
+        assert_eq!(protected[2].value, "5");
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(4242)), serde_json::json!(REDACTED));
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(77)), serde_json::json!(REDACTED));
+        assert_eq!(redactor.redact_scalar(&serde_json::json!(5)), serde_json::json!(5));
     }
 }
