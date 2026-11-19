@@ -96,3 +96,42 @@ fn uninstall_leaves_no_browse_files_behind_the_relay() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// S9: `install --client omp --mcp` writes omp's MCP entry to one config and records that file; a reinstall after
+/// omp's config moved (OPENCODE_BROWSER_OMP_DIR) keeps using the recorded file, and `uninstall --client omp` removes
+/// the entry from it, so no entry is stranded where uninstall doesn't look.
+#[test]
+fn omp_install_and_uninstall_use_the_recorded_mcp_config() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let home = std::env::temp_dir().join(format!("browse-omp-mcp-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let paths = Paths::rooted(home.join("browse-home"));
+    let port = free_port();
+    let _relay = Guard(browse(&home, port).arg("serve").stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("browse serve starts"));
+    wait_for("the relay", Duration::from_secs(15), || paths.relay_state(port).is_file());
+
+    let (first, moved) = (home.join("omp-first"), home.join("omp-moved"));
+    let run = |omp_dir: &Path, args: &[&str]| {
+        let output = browse(&home, port).env("OPENCODE_BROWSER_OMP_DIR", omp_dir).args(args).output().expect("browse runs");
+        assert!(output.status.success(), "{args:?} failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    };
+    let browse_entry = |file: &Path| -> serde_json::Value {
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        config["mcpServers"]["browse"].clone()
+    };
+    let install = ["install", "--client", "omp", "--mcp", "--no-wait", "--no-open"];
+    run(&first, &install);
+    assert!(browse_entry(&first.join("mcp.json")).is_object(), "the first install writes omp's entry");
+
+    run(&moved, &install);
+    assert!(!moved.join("mcp.json").exists(), "a reinstall keeps writing the recorded config");
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(paths.data.join("omp.json")).unwrap()).unwrap();
+    assert_eq!(manifest["mcpConfig"].as_str().map(Path::new), Some(first.join("mcp.json").as_path()));
+    assert!(browse_entry(&first.join("mcp.json")).is_object());
+
+    run(&moved, &["uninstall", "--client", "omp"]);
+    assert!(browse_entry(&first.join("mcp.json")).is_null(), "uninstall removes the entry from the recorded config");
+    assert!(!moved.join("mcp.json").exists());
+
+    let _ = std::fs::remove_dir_all(&home);
+}

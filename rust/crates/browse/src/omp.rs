@@ -39,12 +39,17 @@ fn recorded() -> Option<Paths> {
     Some(Paths { launcher: value["launcher"].as_str()?.into(), skill: value["skill"].as_str()?.into() })
 }
 
-/// omp's mcp.json: the one an earlier install recorded, else where omp keeps it (agents.rs).
+/// omp's mcp.json: the one an earlier install recorded, else where omp keeps it (agents.rs). Install writes its MCP
+/// entry here and records it, and uninstall removes it from here, so the two never pick different files.
 pub fn mcp_location() -> crate::agents::Location {
-    let recorded = std::fs::read(manifest_file()).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v["mcpConfig"].as_str().map(PathBuf::from));
-    let default = crate::agents::locations(&crate::setup::opencode_config(), None).into_iter().find(|l| l.name == "omp").map(|l| l.file);
-    let file = recorded.or(default).unwrap_or_else(|| crate::setup::home().join(".omp").join("agent").join("mcp.json"));
-    crate::agents::Location { name: "omp", file, installed: true }
+    let discovered = crate::agents::locations(&crate::setup::opencode_config(), None).into_iter().find(|l| l.name == "omp").map(|l| l.file);
+    crate::agents::Location { name: "omp", file: mcp_file(&manifest_file(), discovered), installed: true }
+}
+
+/// The MCP config `manifest` recorded, else `discovered` (where omp keeps it now), else omp's default.
+fn mcp_file(manifest: &Path, discovered: Option<PathBuf>) -> PathBuf {
+    let recorded = std::fs::read(manifest).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v["mcpConfig"].as_str().map(PathBuf::from));
+    recorded.or(discovered).unwrap_or_else(|| crate::setup::home().join(".omp").join("agent").join("mcp.json"))
 }
 
 /// Where install writes: `--bin-dir`/`--skills-dir`, else the environment, else where an earlier install wrote, else

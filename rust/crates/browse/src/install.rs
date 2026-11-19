@@ -338,6 +338,9 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
     }
     let entry = place(&flags)?;
     let command = vec![entry.to_string_lossy().into_owned(), "mcp".to_owned()];
+    // omp's mcp.json, resolved once: the agent step writes browse's entry there, the omp manifest records it, and
+    // uninstall removes it from the file recorded, so a newly discovered config never strands the old entry.
+    let omp_mcp = crate::omp::mcp_location();
     if flags.omp {
         let browsers: Vec<(String, String)> = browse_relay::pairing::read_browser_pairings(&relay_api::paths())
             .into_values()
@@ -345,17 +348,16 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
             .collect();
         // omp's MCP entry: written by the agent step below with --mcp; without it, an entry an earlier omp install
         // wrote (the TypeScript fork's included) is pointed at this build, so it never runs a runtime that's gone.
-        let mcp = crate::omp::mcp_location();
-        let kept = !flags.mcp && agents::has_marked_entry(&mcp.file);
-        let recorded = if flags.mcp { agents::locations(&setup::opencode_config(), None).into_iter().find(|l| l.name == "omp").map(|l| l.file) } else { kept.then(|| mcp.file.clone()) };
-        for line in crate::omp::install(&crate::omp::paths(flags.bin_dir.as_deref(), flags.skills_dir.as_deref()), &entry, &browsers, &crate::omp::manifest_file(), recorded.as_deref())? {
+        let kept = !flags.mcp && agents::has_marked_entry(&omp_mcp.file);
+        let recorded = (flags.mcp || kept).then_some(omp_mcp.file.as_path());
+        for line in crate::omp::install(&crate::omp::paths(flags.bin_dir.as_deref(), flags.skills_dir.as_deref()), &entry, &browsers, &crate::omp::manifest_file(), recorded)? {
             println!("{line}");
         }
         if kept {
-            match agents::edit(&mcp, &command, false) {
-                Ok(Edit::Updated) => println!("✓ Updated browse in omp ({})", tilde(&mcp.file)),
+            match agents::edit(&omp_mcp, &command, false) {
+                Ok(Edit::Updated) => println!("✓ Updated browse in omp ({})", tilde(&omp_mcp.file)),
                 Ok(_) => {}
-                Err(error) => println!("! Couldn't update browse in {}: {error:#}", tilde(&mcp.file)),
+                Err(error) => println!("! Couldn't update browse in {}: {error:#}", tilde(&omp_mcp.file)),
             }
         }
     }
@@ -363,7 +365,10 @@ pub fn install(args: &[String]) -> anyhow::Result<i32> {
 
     let opencode = flags.opencode.clone().or_else(|| std::env::var_os("OPENCODE_BIN").map(PathBuf::from)).or_else(|| browsers::on_path("opencode"));
     let opencode_config = setup::opencode_config();
-    let locations = agents::locations(&opencode_config, opencode.as_deref());
+    let mut locations = agents::locations(&opencode_config, opencode.as_deref());
+    for location in locations.iter_mut().filter(|l| l.name == "omp") {
+        location.file = omp_mcp.file.clone();
+    }
     let mut saved = setup::settings();
     let remembered: Option<Vec<&'static str>> = saved.get("selectedAgents").and_then(Value::as_array).map(|list| list.iter().filter_map(|v| v.as_str().and_then(agents::agent_name)).collect());
     let (ask, initial) = plan(&locations, &flags, tty, caller, remembered);
