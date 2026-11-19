@@ -506,7 +506,7 @@ fn bun_update_moves_the_running_binary_aside_after_a_client_died_mid_call() {
 
     wait_for("the relay to restart on the new binary", Duration::from_secs(30), || scene.started.exists() && relay.try_wait().unwrap().is_some());
     assert!(relay.wait().unwrap().success());
-    assert_eq!(std::fs::read_to_string(&scene.started).unwrap().trim(), "serve 1");
+    assert_eq!(std::fs::read_to_string(&scene.started).unwrap().trim(), "serve");
     assert!(std::fs::read_to_string(&scene.calls).unwrap().contains(&format!("add --global --no-progress @opencode/browse@{NEXT}")));
     let log = std::fs::read_to_string(scene.home.join(".browse/logs/relay.log")).unwrap_or_default();
     assert!(log.matches("client.gone").count() <= 1, "{log}");
