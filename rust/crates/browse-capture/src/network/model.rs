@@ -339,6 +339,22 @@ mod tests {
         assert_eq!(value["response"]["body"]["text"], r#"{"url":"https://x/y?api_key=[redacted]","note":"signed [redacted]"}"#);
     }
 
+    /// Round 4: a quoted secret-named URL field keeps the URL-field exception for its value as captured and unquoted, so
+    /// a 10-character payload echoed in a JSON string (quoted or bare) is redacted under the 16-character body floor.
+    #[test]
+    fn quoted_url_field_values_are_redacted_in_body_strings() {
+        let entries = vec![entry(
+            "https://api.test/echo?api_key=%22k123456789%22",
+            vec![],
+            None,
+            Some(r#"{"echo":"api_key=\"k123456789\"","bare":"key k123456789"}"#),
+        )];
+        let (redacted, _) = finish(&entries);
+        let value = serde_json::to_value(&redacted[0]).unwrap();
+        assert_eq!(value["request"]["url"], "https://api.test/echo?api_key=[redacted]");
+        assert_eq!(value["response"]["body"]["text"], r#"{"echo":"api_key=[redacted]","bare":"key [redacted]"}"#);
+    }
+
     #[test]
     fn short_values_from_other_sources_stay_in_body_strings() {
         let entries = vec![entry(

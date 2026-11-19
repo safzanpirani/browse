@@ -92,10 +92,12 @@ fn header_names_credential(lower: &str) -> bool {
         || (is_secret_name(lower) && lower.split(['-', '_', '.']).any(|part| CREDENTIAL_ENDINGS.iter().any(|end| part.ends_with(end))))
 }
 
-/// A value without one pair of surrounding double quotes (`otp="1234"` holds `1234`): the bare credential is what
-/// reappears in JSON numbers and prose.
-fn unquote(value: &str) -> &str {
-    value.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).unwrap_or(value)
+/// The forms a captured value is remembered in: as captured and, when wrapped in one pair of double quotes, without
+/// them (`otp="1234"` holds `1234`, the bare credential that reappears in JSON numbers and prose). Empty forms are
+/// skipped.
+fn aliases(value: &str) -> impl Iterator<Item = &str> {
+    let bare = value.strip_prefix('"').and_then(|inner| inner.strip_suffix('"')).filter(|bare| !bare.is_empty());
+    std::iter::once(value).filter(|value| !value.is_empty()).chain(bare)
 }
 
 #[derive(Default)]
@@ -258,25 +260,24 @@ impl SecretRedactor {
         if value.is_empty() { String::new() } else { SENTINEL.to_string() }
     }
 
-    /// Remembers a scrubbed value without its surrounding quotes: `named` exempts it from the number floor, `always`
-    /// redacts it everywhere at any length.
+    /// Remembers a scrubbed value as captured and, when quoted, without its surrounding quotes too (`otp="1234"` also
+    /// catches a bare `1234`): `named` exempts it from the number floor, `always` redacts it everywhere at any length.
     fn remember(&mut self, value: &str, named: bool, always: bool) {
-        let value = unquote(value);
-        if value.is_empty() {
-            return;
-        }
-        self.known.insert(value.to_string());
-        if named {
-            self.named.insert(value.to_string());
-        }
-        if always {
-            self.always.insert(value.to_string());
+        for value in aliases(value) {
+            self.known.insert(value.to_string());
+            if named {
+                self.named.insert(value.to_string());
+            }
+            if always {
+                self.always.insert(value.to_string());
+            }
         }
     }
 
-    /// A secret-named URL query or fragment field value, remembered for the body-string pass too.
+    /// A secret-named URL query or fragment field value, remembered for the body-string pass too (as captured and
+    /// unquoted, like every remembered value).
     fn scrub_url_field(&mut self, value: &str, field: &str) -> String {
-        if !value.is_empty() {
+        for value in aliases(value) {
             self.named_fields.insert(value.to_string());
         }
         self.scrub(value, field)
